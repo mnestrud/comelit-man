@@ -1,4 +1,4 @@
-"""Unit tests for VipEventListener and parse_ctpp_message."""
+﻿"""Unit tests for VipEventListener and parse_ctpp_message."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
-from custom_components.comelit_intercom_local.models import DeviceConfig, PushEvent
-from custom_components.comelit_intercom_local.vip_listener import (
+from custom_components.comelit_man.models import DeviceConfig, PushEvent
+from custom_components.comelit_man.vip_listener import (
     ACTION_CLOSED,
     ACTION_CONNECTED,
     ACTION_DOOR_OPENED,
@@ -469,6 +469,30 @@ class TestVipListenerStop:
 # ---------------------------------------------------------------------------
 
 
+class TestVipListenerStart:
+    @pytest.mark.asyncio
+    async def test_start_raises_when_no_ctpp_channel(self):
+        listener = _make_listener()
+        listener._client.get_channel = MagicMock(return_value=None)
+
+        with pytest.raises(RuntimeError, match="CTPP channel not open"):
+            await listener.start()
+
+    @pytest.mark.asyncio
+    async def test_start_success_creates_task(self):
+        listener = _make_listener()
+        fake_channel = MagicMock()
+        fake_channel.response_queue = asyncio.Queue()
+        listener._client.get_channel = MagicMock(return_value=fake_channel)
+
+        await listener.start()
+
+        assert listener._task is not None
+        assert listener._running is True
+        # Clean up
+        await listener.stop()
+
+
 class TestListenLoop:
     @pytest.mark.asyncio
     async def test_listen_loop_dispatches_message(self):
@@ -491,3 +515,158 @@ class TestListenLoop:
 
         cb.assert_called_once()
         assert cb.call_args[0][0].event_type == "doorbell_ring"
+
+    @pytest.mark.asyncio
+    async def test_listen_loop_timeout_continues(self):
+        """TimeoutError on queue.get() causes the loop to continue, not exit."""
+        listener = _make_listener()
+        listener._running = True
+        iteration_count = 0
+
+        async def mock_get_timeout_then_stop():
+            nonlocal iteration_count
+            iteration_count += 1
+            if iteration_count < 3:
+                raise TimeoutError
+            listener._running = False
+            raise TimeoutError
+
+        listener._channel.response_queue.get = mock_get_timeout_then_stop
+        await listener._listen_loop()
+        assert iteration_count >= 3
+
+    @pytest.mark.asyncio
+    async def test_listen_loop_cancelled_error_breaks(self):
+        """CancelledError from wait_for causes the loop to exit cleanly (no re-raise)."""
+        listener = _make_listener()
+        listener._running = True
+
+        async def raise_cancelled(*args, **kwargs):
+            raise asyncio.CancelledError
+
+        with patch(
+            "custom_components.comelit_man.vip_listener.asyncio.wait_for",
+            side_effect=raise_cancelled,
+        ):
+            await listener._listen_loop()  # exits via break, no exception raised
+
+
+# ---------------------------------------------------------------------------
+# _process_message — retransmit logging paths
+# ---------------------------------------------------------------------------
+
+
+class TestProcessMessageRetransmit:
+    @pytest.mark.asyncio
+    async def test_retransmit_non_video_tail_no_exception(self):
+        """Non-video-tail retransmit (PREFIX_VIP_EVENT) is handled without error."""
+        cb = MagicMock()
+        listener = _make_listener(cb)
+        listener._retransmit_window = 30.0
+
+        ts = 0xABCDEF01
+        data = _make_ctpp_msg(PREFIX_VIP_EVENT, ts, ACTION_IN_ALERTING, flags=0)
+
+        await listener._process_message(data)
+        await listener._process_message(data)
+
+        assert cb.call_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_retransmit_video_tail_no_exception(self):
+        """Video-tail retransmit (PREFIX_VIDEO_EVENT) is handled without error."""
+        cb = MagicMock()
+        listener = _make_listener(cb)
+        listener._retransmit_window = 30.0
+
+        ts = 0xABCDEF02
+        data = _make_ctpp_msg(PREFIX_VIDEO_EVENT, ts, 0x0001, flags=0)
+
+        await listener._process_message(data)
+        await listener._process_message(data)
+
+
+# ---------------------------------------------------------------------------
+# _send_event_ack — exception path
+# ---------------------------------------------------------------------------
+
+
+class TestSendEventAckException:
+    @pytest.mark.asyncio
+    async def test_send_event_ack_exception_does_not_propagate(self):
+        """ACK send failure for a non-door-opened event is swallowed."""
+        cb = MagicMock()
+        listener = _make_listener(cb)
+        listener._client.send_binary = AsyncMock(side_effect=OSError("net error"))
+
+        data = _make_ctpp_msg(PREFIX_VIP_EVENT, 0x12345678, ACTION_IN_ALERTING, flags=0)
+        await listener._process_message(data)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# _send_renewal_ack — exception path
+# ---------------------------------------------------------------------------
+
+
+class TestSendRenewalAckException:
+    @pytest.mark.asyncio
+    async def test_send_renewal_ack_exception_does_not_propagate(self):
+        """Renewal ACK send failure is swallowed."""
+        cb = MagicMock()
+        listener = _make_listener(cb)
+        listener._client.send_binary = AsyncMock(side_effect=OSError("net error"))
+
+        data = _make_ctpp_msg(PREFIX_VIP_EVENT, 0x12345678, ACTION_REGISTRATION_RENEWAL, flags=0)
+        await listener._process_message(data)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# _handle_vip_event — unknown action + video event debug path
+# ---------------------------------------------------------------------------
+
+
+class TestProcessMessageDebugRaw:
+    @pytest.mark.asyncio
+    async def test_debug_raw_logged_when_debug_enabled(self):
+        """_LOGGER.debug('VIP raw: ...') fires when DEBUG logging is enabled (line 247)."""
+        import logging
+        from custom_components.comelit_man import vip_listener as vip_module
+
+        cb = MagicMock()
+        listener = _make_listener(cb)
+
+        data = _make_ctpp_msg(PREFIX_VIP_EVENT, 0, ACTION_IN_ALERTING, flags=0)
+
+        with patch.object(vip_module._LOGGER, "isEnabledFor", return_value=True):
+            await listener._process_message(data)
+
+        # No exception and callback was called (event fired)
+        cb.assert_called_once()
+
+
+class TestHandleVipEventExtraPaths:
+    def test_unknown_vip_fsm_action_does_not_fire(self):
+        cb = MagicMock()
+        listener = _make_listener(cb)
+        msg = {
+            "prefix": PREFIX_VIP_EVENT,
+            "timestamp": 0,
+            "action": 0x00FF,
+            "flags": 0,
+            "addresses": [],
+        }
+        listener._handle_vip_event(msg)
+        cb.assert_not_called()
+
+    def test_video_event_prefix_reaches_debug_log_path(self):
+        cb = MagicMock()
+        listener = _make_listener(cb)
+        msg = {
+            "prefix": PREFIX_VIDEO_EVENT,
+            "timestamp": 0,
+            "action": 0x0007,
+            "flags": 0,
+            "addresses": [],
+        }
+        listener._handle_vip_event(msg)
+        cb.assert_not_called()

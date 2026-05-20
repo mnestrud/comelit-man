@@ -1,4 +1,4 @@
-"""Integration test for the video call flow.
+﻿"""Integration test for the video call flow.
 
 Exercises VideoCallSession against a FakeComelitDevice (in-process asyncio TCP
 server) that speaks the real ICONA Bridge protocol. Only external network I/O
@@ -22,11 +22,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from custom_components.comelit_intercom_local.auth import authenticate
-from custom_components.comelit_intercom_local.client import IconaBridgeClient
-from custom_components.comelit_intercom_local.config_reader import get_device_config
-from custom_components.comelit_intercom_local.rtp_receiver import RtpReceiver
-from custom_components.comelit_intercom_local.video_call import VideoCallSession
+from custom_components.comelit_man.auth import authenticate
+from custom_components.comelit_man.client import IconaBridgeClient
+from custom_components.comelit_man.config_reader import get_device_config
+from custom_components.comelit_man.rtp_receiver import RtpReceiver
+from custom_components.comelit_man.video_call import VideoCallSession
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +375,7 @@ async def test_video_flow_start_renewal_stop():
 
         with (
             patch(
-                "custom_components.comelit_intercom_local.video_call.LocalRtspServer",
+                "custom_components.comelit_man.video_call.LocalRtspServer",
                 return_value=mock_rtsp,
             ),
             patch.object(RtpReceiver, "start_control", new_callable=AsyncMock),
@@ -436,7 +436,7 @@ async def test_video_flow_session_stops_cleanly_without_renewal():
 
         with (
             patch(
-                "custom_components.comelit_intercom_local.video_call.LocalRtspServer",
+                "custom_components.comelit_man.video_call.LocalRtspServer",
                 return_value=mock_rtsp,
             ),
             patch.object(RtpReceiver, "start_control", new_callable=AsyncMock),

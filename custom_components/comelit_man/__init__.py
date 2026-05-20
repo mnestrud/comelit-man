@@ -1,4 +1,4 @@
-"""Comelit Local integration for Home Assistant."""
+﻿"""Comelit Local integration for Home Assistant."""
 
 from __future__ import annotations
 
@@ -21,10 +21,10 @@ _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.BUTTON, Platform.CAMERA, Platform.EVENT]
 
-_CARD_URL = "/comelit_intercom_local/comelit-intercom-card.js"
+_CARD_URL = "/comelit_man/comelit-intercom-card.js"
 _CARD_PATH = str(Path(__file__).parent / "www" / "comelit-intercom-card.js")
 
-_DOORBELL_CARD_URL = "/comelit_intercom_local/comelit-doorbell-card.js"
+_DOORBELL_CARD_URL = "/comelit_man/comelit-doorbell-card.js"
 _DOORBELL_CARD_PATH = str(Path(__file__).parent / "www" / "comelit-doorbell-card.js")
 
 
@@ -138,3 +138,16 @@ async def async_unload_entry(
     if unload_ok:
         await entry.runtime_data.async_shutdown()
     return unload_ok
+
+
+async def async_remove_entry(
+    hass: HomeAssistant, entry: ComelitLocalConfigEntry
+) -> None:
+    """Clean up when a config entry is fully removed.
+
+    The device-side push registration (DEVICE_TOKEN) has no unregistration
+    protocol, so device-side cleanup is not possible. This hook exists to
+    satisfy HA's resource-lifecycle expectations and to allow future cleanup
+    if the protocol is extended.
+    """
+    _LOGGER.info("Comelit Man entry removed: %s (%s)", entry.title, entry.entry_id)

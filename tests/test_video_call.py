@@ -1,4 +1,4 @@
-"""Unit tests for VideoCallSession — no device needed."""
+﻿"""Unit tests for VideoCallSession — no device needed."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from custom_components.comelit_intercom_local.exceptions import VideoCallError
-from custom_components.comelit_intercom_local.video_call import (
+from custom_components.comelit_man.exceptions import VideoCallError
+from custom_components.comelit_man.video_call import (
     VideoCallSession,
     _CTR_INCR_BOTH,
     _CTR_INCR_BYTE4,
@@ -36,7 +36,7 @@ class TestCleanup:
         coordinator's shared client and must NOT disconnect it.  Instead it
         calls remove_channel() for each video channel name.
         """
-        from custom_components.comelit_intercom_local.video_call import VideoCallSession
+        from custom_components.comelit_man.video_call import VideoCallSession
 
         session = VideoCallSession.__new__(VideoCallSession)
         session._active = True
@@ -178,7 +178,7 @@ class TestCtppMonitorLoop:
     async def test_ctpp_keepalive_is_acked(self):
         """0x1840/0x0000 keepalive should be ACKed with 0x1800."""
         import struct
-        from custom_components.comelit_intercom_local.protocol import encode_call_response_ack
+        from custom_components.comelit_man.protocol import encode_call_response_ack
 
         session = self._make_session()
 
@@ -546,7 +546,7 @@ class TestInlineReestablish:
         by VIDEO_CONFIG (0x1840 prefix) to re-establish the media session.
         """
         import struct
-        from custom_components.comelit_intercom_local.protocol import (
+        from custom_components.comelit_man.protocol import (
             encode_rtpc_link,
             encode_video_config,
         )

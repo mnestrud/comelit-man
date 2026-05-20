@@ -1,4 +1,4 @@
-"""Minimal video stream test — skip CTPP call signaling.
+﻿"""Minimal video stream test — skip CTPP call signaling.
 
 Tests whether the device will stream video with just:
   Auth → UDPM → UDP pings → RTPC → video config
@@ -14,10 +14,10 @@ import logging
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from custom_components.comelit_intercom_local.auth import authenticate
-from custom_components.comelit_intercom_local.channels import ChannelType
-from custom_components.comelit_intercom_local.client import IconaBridgeClient
-from custom_components.comelit_intercom_local.rtp_receiver import RtpReceiver, _build_control_packet
+from custom_components.comelit_man.auth import authenticate
+from custom_components.comelit_man.channels import ChannelType
+from custom_components.comelit_man.client import IconaBridgeClient
+from custom_components.comelit_man.rtp_receiver import RtpReceiver, _build_control_packet
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(name)s %(message)s")
 _LOGGER = logging.getLogger(__name__)
@@ -55,7 +55,7 @@ async def main():
     await authenticate(client, TOKEN)
 
     # Get config to know our apt address
-    from custom_components.comelit_intercom_local.config_reader import get_device_config
+    from custom_components.comelit_man.config_reader import get_device_config
     config = await get_device_config(client)
     apt_addr = config.apt_address
     apt_sub = config.apt_subaddress
@@ -110,7 +110,7 @@ async def main():
     )
 
     # Step 5: Send video config directly on CTPP (skip call signaling)
-    from custom_components.comelit_intercom_local.protocol import encode_video_config
+    from custom_components.comelit_man.protocol import encode_video_config
     import time
     ts = int(time.time()) & 0xFFFFFFFF
     vid_config = encode_video_config(caller, CALLEE, rtpc2.request_id, ts)

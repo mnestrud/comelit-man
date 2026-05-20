@@ -1,4 +1,4 @@
-"""Unit tests for ctpp_init_sequence — no device needed."""
+﻿"""Unit tests for ctpp_init_sequence — no device needed."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
-from custom_components.comelit_intercom_local.ctpp import (
+from custom_components.comelit_man.ctpp import (
     _CTR_INCR_BOTH,
     ctpp_init_sequence,
 )
@@ -34,7 +34,7 @@ class TestCtppInitSequence:
         channel = MagicMock()
 
         with pytest.MonkeyPatch().context() as mp:
-            from custom_components.comelit_intercom_local import ctpp as ctpp_mod
+            from custom_components.comelit_man import ctpp as ctpp_mod
             sent = []
             client.send_binary = AsyncMock(side_effect=lambda ch, data: sent.append(data))
             await ctpp_init_sequence(client, channel, "SB000006", 1, "SB0000061", 0x12345678)

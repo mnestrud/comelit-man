@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.0.0
+
+First stable release. All Silver-tier HA integration quality-scale rules are met except test coverage (BL-023, tracked).
+
+### Integration quality improvements
+
+- **Reauthentication flow** — token rotation no longer requires deleting and re-adding the integration; use Settings → Integrations → Comelit Man → Re-authenticate
+- **Reconfigure flow** — change host, port, or token without removing the integration
+- **Entity availability** — camera and doorbell event entities now auto-mark unavailable when the coordinator loses connectivity (inherits `CoordinatorEntity`)
+- **Reconnect logging** — disconnected/reconnected transitions logged exactly once per event (edge-detected)
+- **Parallel updates** — `PARALLEL_UPDATES = 0` declared on all platform modules per HA quality scale
+- **Entity quality** — `EventDeviceClass.DOORBELL` on the doorbell event entity; Start/Stop Video buttons are `DIAGNOSTIC` category and disabled by default; icon translations moved to `icons.json`
+- **Shared entity base class** (`entity.py`) — eliminates boilerplate from button, camera, and event files
+
+### HA integration best practices
+
+- **Diagnostics** — `diagnostics.py` endpoint (token redacted)
+- **Repair issues** — authentication failures surface a repair prompt in the HA UI
+- **DHCP discovery** — device auto-discovered on the local network via hostname pattern
+- **Exception translations** — door-open and video-call failures produce translated user-facing messages
+- **HA-managed HTTP session** — `async_get_clientsession(hass)` used for token extraction
+- **Strict mypy type checking** — full strict mode with `py.typed` marker; enforced in CI
+- **FCM cleanup** — `async_remove_entry` unregisters push channel when integration is removed
+
+### CI
+
+- 570 tests, 85% coverage baseline; `pytest-cov` threshold gate in CI
+- mypy strict + ruff + hassfest + HACS validation on every push and PR
+
+## 0.1.4.3
+
+- **Rename**: integration domain changed from `comelit_local` to `comelit_man` — all entity IDs, domain references, and Lovelace card URLs updated
+- **Feature**: `door_opened` VIP event now exposed as an event type on `event.<name>_doorbell`
+- **Fix**: RTSP server binds to fixed port 8557 for static go2rtc configuration
+
 ## 0.1.4.2
 
 **Door open fixes:**

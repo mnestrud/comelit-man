@@ -1,4 +1,4 @@
-"""Unit tests for token extraction — no device needed."""
+﻿"""Unit tests for token extraction — no device needed."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from custom_components.comelit_intercom_local.exceptions import TokenExtractionError
-from custom_components.comelit_intercom_local.token import (
+from custom_components.comelit_man.exceptions import TokenExtractionError
+from custom_components.comelit_man.token import (
     _parse_token_from_archive,
     extract_token,
 )
@@ -91,10 +91,8 @@ def _make_mock_response(status: int = 200, text: str = "", content: bytes = b"")
 
 
 def _make_session(*responses):
-    """Build a mock aiohttp.ClientSession that returns responses in order."""
+    """Build a mock aiohttp session that returns responses in order."""
     session = MagicMock()
-    session.__aenter__ = AsyncMock(return_value=session)
-    session.__aexit__ = AsyncMock(return_value=False)
 
     response_iter = iter(responses)
 
@@ -104,6 +102,14 @@ def _make_session(*responses):
     session.post = MagicMock(side_effect=_get_next)
     session.get = MagicMock(side_effect=_get_next)
     return session
+
+
+def _patch_session(session):
+    """Patch async_get_clientsession to return the given mock session."""
+    return patch(
+        "custom_components.comelit_man.token.async_get_clientsession",
+        return_value=session,
+    )
 
 
 class TestExtractToken:
@@ -119,12 +125,9 @@ class TestExtractToken:
 
         session = _make_session(login_resp, backup_resp, list_resp, dl_resp)
 
-        with patch(
-            "custom_components.comelit_intercom_local.token.aiohttp.ClientSession",
-            return_value=session,
-        ):
+        with _patch_session(session):
             with patch("asyncio.sleep", AsyncMock()):
-                token = await extract_token("192.168.1.1", "comelit", 8080)
+                token = await extract_token("192.168.1.1", "comelit", 8080, MagicMock())
 
         assert token == "abcdef1234567890abcdef1234567890"
 
@@ -134,12 +137,9 @@ class TestExtractToken:
         login_resp = _make_mock_response(403, "Forbidden")
         session = _make_session(login_resp)
 
-        with patch(
-            "custom_components.comelit_intercom_local.token.aiohttp.ClientSession",
-            return_value=session,
-        ):
+        with _patch_session(session):
             with pytest.raises(TokenExtractionError, match="Login failed with status 403"):
-                await extract_token("192.168.1.1")
+                await extract_token("192.168.1.1", hass=MagicMock())
 
     @pytest.mark.asyncio
     async def test_extract_token_login_fails_wrong_content(self):
@@ -147,12 +147,9 @@ class TestExtractToken:
         login_resp = _make_mock_response(200, "Invalid password")
         session = _make_session(login_resp)
 
-        with patch(
-            "custom_components.comelit_intercom_local.token.aiohttp.ClientSession",
-            return_value=session,
-        ):
+        with _patch_session(session):
             with pytest.raises(TokenExtractionError, match="Login failed"):
-                await extract_token("192.168.1.1")
+                await extract_token("192.168.1.1", hass=MagicMock())
 
     @pytest.mark.asyncio
     async def test_extract_token_backup_creation_fails(self):
@@ -161,13 +158,10 @@ class TestExtractToken:
         backup_resp = _make_mock_response(200, "something unexpected")
         session = _make_session(login_resp, backup_resp)
 
-        with patch(
-            "custom_components.comelit_intercom_local.token.aiohttp.ClientSession",
-            return_value=session,
-        ):
+        with _patch_session(session):
             with patch("asyncio.sleep", AsyncMock()):
                 with pytest.raises(TokenExtractionError, match="Backup creation failed"):
-                    await extract_token("192.168.1.1")
+                    await extract_token("192.168.1.1", hass=MagicMock())
 
     @pytest.mark.asyncio
     async def test_extract_token_no_backup_files(self):
@@ -177,13 +171,10 @@ class TestExtractToken:
         list_resp = _make_mock_response(200, "<html>No backups here</html>")
         session = _make_session(login_resp, backup_resp, list_resp)
 
-        with patch(
-            "custom_components.comelit_intercom_local.token.aiohttp.ClientSession",
-            return_value=session,
-        ):
+        with _patch_session(session):
             with patch("asyncio.sleep", AsyncMock()):
                 with pytest.raises(TokenExtractionError, match="No backup files found"):
-                    await extract_token("192.168.1.1")
+                    await extract_token("192.168.1.1", hass=MagicMock())
 
     @pytest.mark.asyncio
     async def test_extract_token_download_fails(self):
@@ -194,13 +185,10 @@ class TestExtractToken:
         dl_resp = _make_mock_response(404)
         session = _make_session(login_resp, backup_resp, list_resp, dl_resp)
 
-        with patch(
-            "custom_components.comelit_intercom_local.token.aiohttp.ClientSession",
-            return_value=session,
-        ):
+        with _patch_session(session):
             with patch("asyncio.sleep", AsyncMock()):
                 with pytest.raises(TokenExtractionError, match="Backup download failed"):
-                    await extract_token("192.168.1.1")
+                    await extract_token("192.168.1.1", hass=MagicMock())
 
     @pytest.mark.asyncio
     async def test_extract_token_backup_page_fails(self):
@@ -210,10 +198,7 @@ class TestExtractToken:
         list_resp = _make_mock_response(500, "Server Error")
         session = _make_session(login_resp, backup_resp, list_resp)
 
-        with patch(
-            "custom_components.comelit_intercom_local.token.aiohttp.ClientSession",
-            return_value=session,
-        ):
+        with _patch_session(session):
             with patch("asyncio.sleep", AsyncMock()):
                 with pytest.raises(TokenExtractionError, match="Backup page returned status 500"):
-                    await extract_token("192.168.1.1")
+                    await extract_token("192.168.1.1", hass=MagicMock())

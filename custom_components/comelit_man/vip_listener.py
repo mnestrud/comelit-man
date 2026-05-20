@@ -380,8 +380,8 @@ class VipEventListener:
             elif action == ACTION_CLOSED:
                 # CLOSED: call ended
                 pass
-            elif action == ACTION_IDLE:
-                # IDLE: device returned to idle state
+            elif action == ACTION_IDLE:  # pragma: no cover
+                # IDLE: device returned to idle state (ACTION_IDLE=0, unreachable here)
                 pass
             else:
                 _LOGGER.debug(

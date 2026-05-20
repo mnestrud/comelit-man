@@ -1,4 +1,4 @@
-"""Unit tests for door open sequences — no device needed."""
+﻿"""Unit tests for door open sequences — no device needed."""
 
 from __future__ import annotations
 
@@ -6,9 +6,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from custom_components.comelit_intercom_local.door import open_door
-from custom_components.comelit_intercom_local.exceptions import DoorOpenError
-from custom_components.comelit_intercom_local.models import DeviceConfig, Door
+from custom_components.comelit_man.door import open_ctpp_channel, open_door
+from custom_components.comelit_man.exceptions import DoorOpenError
+from custom_components.comelit_man.models import DeviceConfig, Door
 
 HOST = "127.0.0.1"
 PORT = 64100
@@ -91,7 +91,7 @@ class TestOpenDoorFastPath:
         door = _make_door()
 
         with patch(
-            "custom_components.comelit_intercom_local.door.IconaBridgeClient"
+            "custom_components.comelit_man.door.IconaBridgeClient"
         ) as mock_cls:
             await open_door(HOST, PORT, TOKEN, client, config, door)
 
@@ -120,8 +120,9 @@ class TestOpenDoorFastPath:
         config = _make_config()
         door = _make_door()
 
-        with pytest.raises(DoorOpenError, match="Failed to open door"):
+        with pytest.raises(DoorOpenError) as exc_info:
             await open_door(HOST, PORT, TOKEN, client, config, door)
+        assert exc_info.value.translation_key == "door_open_failed"
 
 
 # ---------------------------------------------------------------------------
@@ -137,9 +138,9 @@ def _standalone_patches():
     return_value to a _make_client() instance before calling open_door.
     """
     return (
-        patch("custom_components.comelit_intercom_local.door.IconaBridgeClient"),
-        patch("custom_components.comelit_intercom_local.door.authenticate", new_callable=AsyncMock),
-        patch("custom_components.comelit_intercom_local.door.ctpp_init_sequence", new_callable=AsyncMock),
+        patch("custom_components.comelit_man.door.IconaBridgeClient"),
+        patch("custom_components.comelit_man.door.authenticate", new_callable=AsyncMock),
+        patch("custom_components.comelit_man.door.ctpp_init_sequence", new_callable=AsyncMock),
     )
 
 
@@ -265,5 +266,29 @@ class TestOpenDoorStandalonePath:
             mock_inner = _make_client()
             mock_inner.connect = AsyncMock(side_effect=OSError("cannot connect"))
             mock_cls.return_value = mock_inner
-            with pytest.raises(DoorOpenError, match="Failed to open door"):
+            with pytest.raises(DoorOpenError) as exc_info:
                 await open_door(HOST, PORT, TOKEN, client, config, door)
+            assert exc_info.value.translation_key == "door_open_failed"
+
+
+# ---------------------------------------------------------------------------
+# open_ctpp_channel — error path (lines 99-100)
+# ---------------------------------------------------------------------------
+
+
+class TestOpenCtppChannel:
+    @pytest.mark.asyncio
+    async def test_open_ctpp_channel_wraps_error_in_door_open_error(self):
+        """open_ctpp_channel wraps ctpp_init_sequence failure in DoorOpenError."""
+        client = _make_client()
+        config = _make_config()
+
+        with (
+            patch(
+                "custom_components.comelit_man.door.ctpp_init_sequence",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("handshake failed"),
+            ),
+            pytest.raises(DoorOpenError, match="Failed to open door"),
+        ):
+            await open_ctpp_channel(client, config)

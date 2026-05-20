@@ -14,10 +14,13 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .camera_utils import get_rtsp_url
 from .const import DOMAIN, MANUFACTURER, MODEL
 from .coordinator import ComelitLocalConfigEntry, ComelitLocalCoordinator
+from .entity import ComelitEntity
 from .models import Camera as CameraModel, PushEvent
 from .placeholder import PLACEHOLDER_JPEG
 
 _LOGGER = logging.getLogger(__name__)
+
+PARALLEL_UPDATES = 0
 
 
 async def async_setup_entry(
@@ -80,7 +83,7 @@ class ComelitCamera(Camera):
         return url or None
 
 
-class ComelitIntercomCamera(Camera):
+class ComelitIntercomCamera(ComelitEntity, Camera):
     """Camera entity for live intercom video and audio via go2rtc/WebRTC.
 
     Serves a persistent local RTSP stream (started at integration load) so
@@ -96,9 +99,7 @@ class ComelitIntercomCamera(Camera):
     connect at HA boot and freeze its codec context with pix_fmt=-1.
     """
 
-    _attr_has_entity_name = True
-    _attr_name = "Live Feed"
-    _attr_icon = "mdi:doorbell-video"
+    _attr_translation_key = "intercom_camera"
     _attr_supported_features = CameraEntityFeature.STREAM
 
     def __init__(
@@ -107,9 +108,7 @@ class ComelitIntercomCamera(Camera):
         entry_id: str,
     ) -> None:
         """Initialize the intercom camera entity."""
-        super().__init__()
-        self._coordinator = coordinator
-        self._entry_id = entry_id
+        super().__init__(coordinator, entry_id)
         self._attr_unique_id = f"{entry_id}_intercom_camera"
         self._remove_push_cb: Callable[[], None] | None = None
         self._remove_stop_video_cb: Callable[[], None] | None = None
@@ -125,17 +124,7 @@ class ComelitIntercomCamera(Camera):
         locks onto the transport it picked at first stream_source() call —
         MJPEG if the session wasn't ready yet — and never upgrades.
         """
-        return self._coordinator.video_session is not None
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        """Return device info linking this camera to the main intercom device."""
-        return DeviceInfo(
-            identifiers={(DOMAIN, self._entry_id)},
-            manufacturer=MANUFACTURER,
-            model=MODEL,
-            name=self._coordinator.device_name,
-        )
+        return self.coordinator.video_session is not None
 
     async def stream_source(self) -> str | None:
         """Return the RTSP URL, waiting briefly if a session is starting.
@@ -150,13 +139,13 @@ class ComelitIntercomCamera(Camera):
         If one is in flight, wait up to 5 s for it.  Return None if
         nothing is starting — HA falls back to JPEG polling in that case.
         """
-        if self._coordinator.video_session is not None:
-            return self._coordinator.rtsp_url
+        if self.coordinator.video_session is not None:
+            return self.coordinator.rtsp_url
         try:
             await asyncio.wait_for(
-                self._coordinator._video_ready_event.wait(), timeout=5.0
+                self.coordinator._video_ready_event.wait(), timeout=5.0
             )
-            return self._coordinator.rtsp_url
+            return self.coordinator.rtsp_url
         except TimeoutError:
             return None
 
@@ -164,18 +153,18 @@ class ComelitIntercomCamera(Camera):
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
         """Return the latest JPEG frame, or placeholder when video is off."""
-        session = self._coordinator.video_session
+        session = self.coordinator.video_session
         if not session or not session.active or not session.rtp_receiver:
             return PLACEHOLDER_JPEG
         return await session.rtp_receiver.get_jpeg_frame(timeout=2.0)
 
     async def async_added_to_hass(self) -> None:
         """Register for push events when entity is added."""
-        self._remove_push_cb = self._coordinator.add_push_callback(self._on_push)
-        self._remove_stop_video_cb = self._coordinator.add_stop_video_callback(
+        self._remove_push_cb = self.coordinator.add_push_callback(self._on_push)
+        self._remove_stop_video_cb = self.coordinator.add_stop_video_callback(
             self._async_stop_ha_stream
         )
-        self._remove_state_cb = self._coordinator.add_video_state_change_callback(
+        self._remove_state_cb = self.coordinator.add_video_state_change_callback(
             self._async_video_state_changed
         )
 
@@ -190,7 +179,7 @@ class ComelitIntercomCamera(Camera):
         if self._remove_state_cb:
             self._remove_state_cb()
             self._remove_state_cb = None
-        await self._coordinator.async_stop_video()
+        await self.coordinator.async_stop_video()
 
     async def _async_video_state_changed(self) -> None:
         """Push a fresh state to HA when video session starts or stops.

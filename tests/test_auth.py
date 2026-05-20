@@ -1,4 +1,4 @@
-"""Unit tests for authentication flow."""
+﻿"""Unit tests for authentication flow."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from custom_components.comelit_intercom_local.auth import authenticate
-from custom_components.comelit_intercom_local.exceptions import AuthenticationError
+from custom_components.comelit_man.auth import authenticate
+from custom_components.comelit_man.exceptions import AuthenticationError
 
 
 class TestAuthenticate:
@@ -74,7 +74,7 @@ class TestAuthenticate:
         client.open_channel = AsyncMock(return_value=channel)
         client.send_json = AsyncMock(return_value={"response-code": 200})
 
-        from custom_components.comelit_intercom_local.channels import ChannelType
+        from custom_components.comelit_man.channels import ChannelType
         await authenticate(client, "token")
 
         client.open_channel.assert_called_once_with("UAUT", ChannelType.UAUT)

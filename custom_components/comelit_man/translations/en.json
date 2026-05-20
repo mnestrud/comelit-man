@@ -1,0 +1,138 @@
+{
+  "entity": {
+    "button": {
+      "door": {
+        "name": "Door"
+      },
+      "video_start": {
+        "name": "Start Video Feed"
+      },
+      "video_stop": {
+        "name": "Stop Video Feed"
+      }
+    },
+    "camera": {
+      "intercom_camera": {
+        "name": "Live Feed"
+      }
+    },
+    "event": {
+      "doorbell": {
+        "name": "Doorbell"
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Comelit Intercom Options",
+        "data": {
+          "enable_notifications": "Enable doorbell notifications"
+        },
+        "data_description": {
+          "enable_notifications": "Receive doorbell ring and missed call events from the intercom"
+        }
+      }
+    }
+  },
+  "config": {
+    "step": {
+      "user": {
+        "title": "Comelit Man",
+        "description": "Connect to your Comelit 6701W intercom locally.",
+        "data": {
+          "name": "Name",
+          "host": "Host",
+          "port": "ICONA Bridge port",
+          "http_port": "HTTP port",
+          "token": "Authentication token (32-char hex)",
+          "password": "Device password (to auto-extract token)"
+        },
+        "data_description": {
+          "name": "Friendly name for this intercom (leave empty to use the host IP)",
+          "host": "IP address of your Comelit device",
+          "port": "TCP port for ICONA Bridge protocol (default: 64100)",
+          "http_port": "HTTP port for device web interface (default: 8080)",
+          "token": "Leave empty to auto-extract from device using password",
+          "password": "Only needed if token is not provided"
+        }
+      },
+      "dhcp_confirm": {
+        "title": "Comelit device found",
+        "description": "A Comelit device was discovered at {host}. Enter credentials to complete setup.",
+        "data": {
+          "token": "Authentication token (32-char hex)",
+          "password": "Device password (to auto-extract token)"
+        },
+        "data_description": {
+          "token": "Leave empty to auto-extract using the device password",
+          "password": "Only needed if token is not provided"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate Comelit Man",
+        "description": "Authentication failed. Enter a new token or password to reconnect.",
+        "data": {
+          "token": "Authentication token (32-char hex)",
+          "password": "Device password (to auto-extract token)"
+        },
+        "data_description": {
+          "token": "Leave empty to auto-extract from device using password",
+          "password": "Only needed if token is not provided"
+        }
+      },
+      "reconfigure": {
+        "title": "Reconfigure Comelit Man",
+        "data": {
+          "host": "Host",
+          "port": "ICONA Bridge port",
+          "http_port": "HTTP port",
+          "token": "Authentication token (32-char hex)",
+          "password": "Device password (to auto-extract token)"
+        },
+        "data_description": {
+          "host": "IP address of your Comelit device",
+          "port": "TCP port for ICONA Bridge protocol (default: 64100)",
+          "http_port": "HTTP port for device web interface (default: 8080)",
+          "token": "Leave empty to auto-extract from device using password",
+          "password": "Only needed if token is not provided"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the device",
+      "invalid_auth": "Authentication failed — check token or password",
+      "token_extraction_failed": "Could not extract token from device backup",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "Device is already configured",
+      "another_device": "This IP address belongs to a different device that is already configured."
+    }
+  },
+  "exceptions": {
+    "door_open_failed": {
+      "message": "Failed to open door '{door}'"
+    },
+    "video_call_failed": {
+      "message": "Failed to start video call"
+    },
+    "video_rtpc_not_received": {
+      "message": "Video channel not established — device did not respond"
+    }
+  },
+  "issues": {
+    "auth_failed": {
+      "title": "Authentication failed",
+      "description": "Comelit Man cannot connect to {name} — the token is invalid or expired. Re-authenticate to reconnect.",
+      "fix_flow": {
+        "step": {
+          "confirm": {
+            "title": "Re-authenticate",
+            "description": "Go to **Settings → Integrations → Comelit Man** and choose **Re-authenticate**."
+          }
+        }
+      }
+    }
+  }
+}

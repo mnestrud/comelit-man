@@ -1,4 +1,4 @@
-"""Unit tests for ComelitDoorbellEvent entity."""
+﻿"""Unit tests for ComelitDoorbellEvent entity."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from custom_components.comelit_intercom_local.event import ComelitDoorbellEvent
-from custom_components.comelit_intercom_local.models import PushEvent
+from custom_components.comelit_man.event import ComelitDoorbellEvent
+from custom_components.comelit_man.models import PushEvent
 
 
 # ---------------------------------------------------------------------------
@@ -20,7 +20,7 @@ def _make_entity() -> ComelitDoorbellEvent:
     coordinator = MagicMock()
     coordinator.add_push_callback = MagicMock(return_value=lambda: None)
     entity = ComelitDoorbellEvent.__new__(ComelitDoorbellEvent)
-    entity._coordinator = coordinator
+    entity.coordinator = coordinator
     entity._entry_id = "test_entry_id"
     entity._attr_unique_id = "test_entry_id_doorbell"
     entity._events = []  # from _EventEntity stub
@@ -42,7 +42,7 @@ class TestDoorbellEventMeta:
         assert entity._attr_unique_id == "test_entry_id_doorbell"
 
     def test_event_types(self):
-        from custom_components.comelit_intercom_local.event import EVENT_TYPES
+        from custom_components.comelit_man.event import EVENT_TYPES
         assert "doorbell_ring" in EVENT_TYPES
         assert "missed_call" in EVENT_TYPES
 
@@ -50,7 +50,7 @@ class TestDoorbellEventMeta:
         entity = _make_entity()
         info = entity.device_info
         assert isinstance(info, dict)
-        assert ("comelit_intercom_local", "test_entry_id") in info.get("identifiers", set())
+        assert ("comelit_man", "test_entry_id") in info.get("identifiers", set())
 
 
 # ---------------------------------------------------------------------------
@@ -75,9 +75,16 @@ class TestOnPush:
 
     def test_unknown_event_type_ignored(self):
         entity = _make_entity()
-        entity._on_push(_push_event("door_opened"))
+        entity._on_push(_push_event("some_unrecognized_type"))
 
         assert len(entity._events) == 0
+
+    def test_door_opened_event_fired(self):
+        entity = _make_entity()
+        entity._on_push(_push_event("door_opened"))
+
+        assert len(entity._events) == 1
+        assert entity._events[0]["event_type"] == "door_opened"
 
     def test_apt_address_included_in_event_data(self):
         entity = _make_entity()
@@ -100,6 +107,27 @@ class TestOnPush:
 # ---------------------------------------------------------------------------
 
 
+class TestDoorbellEventInit:
+    def test_init_sets_unique_id(self):
+        coordinator = MagicMock()
+        entity = ComelitDoorbellEvent(coordinator, "entry_abc")
+        assert entity._attr_unique_id == "entry_abc_doorbell"
+        assert entity._entry_id == "entry_abc"
+        assert entity.coordinator is coordinator
+
+    @pytest.mark.asyncio
+    async def test_async_setup_entry_adds_entity(self):
+        from custom_components.comelit_man.event import async_setup_entry
+        hass = MagicMock()
+        entry = MagicMock()
+        entry.runtime_data = MagicMock()
+        entry.entry_id = "entry_xyz"
+        added: list = []
+        await async_setup_entry(hass, entry, lambda ents: added.extend(ents))
+        assert len(added) == 1
+        assert isinstance(added[0], ComelitDoorbellEvent)
+
+
 class TestAsyncAddedToHass:
     @pytest.mark.asyncio
     async def test_registers_callback_with_coordinator(self):
@@ -111,7 +139,7 @@ class TestAsyncAddedToHass:
 
         await entity.async_added_to_hass()
 
-        entity._coordinator.add_push_callback.assert_called_once()
+        entity.coordinator.add_push_callback.assert_called_once()
         # async_on_remove should have been called with the unsubscribe function
         assert len(removed) == 1
 
@@ -127,7 +155,7 @@ class TestAsyncAddedToHass:
             captured_callback = cb
             return lambda: None
 
-        entity._coordinator.add_push_callback = fake_add_push_callback
+        entity.coordinator.add_push_callback = fake_add_push_callback
 
         await entity.async_added_to_hass()
 
@@ -146,7 +174,7 @@ class TestAsyncAddedToHass:
 class TestCoordinatorPushCallbacks:
     def _make_coordinator(self):
         """Build a minimal coordinator (without HA runtime)."""
-        from custom_components.comelit_intercom_local.coordinator import (
+        from custom_components.comelit_man.coordinator import (
             ComelitLocalCoordinator,
         )
 

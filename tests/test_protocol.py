@@ -1,8 +1,8 @@
-"""Unit tests for protocol encoding/decoding — no device needed."""
+﻿"""Unit tests for protocol encoding/decoding — no device needed."""
 
 import struct
 
-from custom_components.comelit_intercom_local.protocol import (
+from custom_components.comelit_man.protocol import (
     ACTION_CONFIG_ACK,
     ACTION_HANGUP,
     ACTION_PEER,
@@ -28,7 +28,7 @@ from custom_components.comelit_intercom_local.protocol import (
     is_json_body,
     parse_command_response,
 )
-from custom_components.comelit_intercom_local.channels import ChannelType
+from custom_components.comelit_man.channels import ChannelType
 
 
 class TestHeader:

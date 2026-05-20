@@ -1,6 +1,6 @@
-"""Constants for the Comelit Local integration."""
+﻿"""Constants for the Comelit Local integration."""
 
-DOMAIN = "comelit_intercom_local"
+DOMAIN = "comelit_man"
 MANUFACTURER = "Comelit"
 MODEL = "6701W"
 

@@ -1,4 +1,4 @@
-"""Unit tests for LocalRtspServer — no real network clients needed."""
+﻿"""Unit tests for LocalRtspServer — no real network clients needed."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from custom_components.comelit_intercom_local.rtsp_server import (
+from custom_components.comelit_man.rtsp_server import (
     LocalRtspServer,
     _TcpClient,
     _build_rtp,

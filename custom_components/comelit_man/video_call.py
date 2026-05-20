@@ -11,6 +11,7 @@ import time
 
 from .channels import Channel, ChannelType
 from .client import IconaBridgeClient
+from .const import DOMAIN
 from .ctpp import ctpp_init_sequence
 from .exceptions import VideoCallError
 from .models import DeviceConfig
@@ -413,7 +414,10 @@ class VideoCallSession:
                 )
             except TimeoutError:
                 _LOGGER.warning("Device RTPC channel not received within timeout")
-                raise VideoCallError("Device RTPC channel not received")
+                raise VideoCallError(
+                    translation_domain=DOMAIN,
+                    translation_key="video_rtpc_not_received",
+                )
 
             # Read and ACK device's CTPP RTPC link (0x1840/0x000A)
             call_counter = await self._ack_device_rtpc_link(
@@ -506,7 +510,8 @@ class VideoCallSession:
         except Exception as e:
             await self._cleanup()
             raise VideoCallError(
-                f"Failed to start video call: {e}"
+                translation_domain=DOMAIN,
+                translation_key="video_call_failed",
             ) from e
 
     async def stop(self, reason: str = "user request") -> None:

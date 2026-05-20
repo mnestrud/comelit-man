@@ -1,4 +1,4 @@
-# Comelit Intercom Local
+﻿# Comelit Man
 
 Home Assistant custom component for the **Comelit 6701W** WiFi video intercom. Communicates via the ICONA Bridge TCP protocol — no cloud required.
 
@@ -16,36 +16,68 @@ Home Assistant custom component for the **Comelit 6701W** WiFi video intercom. C
 - Device accessible on your local network
 - Home Assistant 2026.1+
 
+## Supported devices
+
+**Tested and confirmed working:**
+
+| Device | Firmware | Notes |
+|--------|----------|-------|
+| Comelit 6701W | 2.x | All features — door open, video, doorbell events |
+
+**Likely compatible (same ICONA Bridge protocol):**
+- Other Comelit WiFi video door panels using the ICONA Bridge protocol on port 64100
+- Compatibility is not guaranteed for devices with different firmware lines
+
+The integration communicates via the **ICONA Bridge TCP protocol** on port 64100. If your device accepts TCP connections on that port and responds to UAUT/UCFG/CTPP messages, it is likely compatible.
+
 ## Installation
 
 ### HACS (Recommended)
 
 1. Add this repository as a custom repository in HACS
-2. Install **Comelit Intercom Local**
+2. Install **Comelit Man**
 3. Restart Home Assistant
 
 ### Manual
 
-1. Copy the `custom_components/comelit_intercom_local/` folder to your HA `config/custom_components/` directory
+1. Copy the `custom_components/comelit_man/` folder to your HA `config/custom_components/` directory
 2. Restart Home Assistant
 
 ## Configuration
 
 1. Go to **Settings → Devices & Services → Add Integration**
-2. Search for **Comelit Intercom Local**
+2. Search for **Comelit Man**
 3. Enter your device IP and either:
    - Your device password (token will be extracted automatically), or
    - A pre-extracted 32-character hex token
 
 ### Notification settings
 
-After setup, you can configure the integration via **Settings → Integrations → Comelit Intercom Local → Configure**:
+After setup, you can configure the integration via **Settings → Integrations → Comelit Man → Configure**:
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | Enable notifications | On | Receive doorbell ring and door events. Disable if you only need video and door control, or to troubleshoot the notification connection. |
 
 Changing this setting reloads the integration automatically.
+
+## Known limitations
+
+- **Single concurrent video session** — only one video stream can be active at a time. Starting a second session stops the first.
+- **WiFi sleep** — the 6701W disconnects from WiFi when idle (no active call). Wake it physically (ring the bell, or press a button) before testing network connectivity. The integration reconnects automatically once the device wakes.
+- **No cloud** — requires direct LAN access to the device. Remote access via VPN or a reverse proxy is your responsibility.
+- **Fixed RTSP port** — the integration uses a fixed RTSP port (8557). If another process is using that port at HA startup, the video feed will not work. Change the port in HA configuration or free up 8557.
+- **Door open timing** — when video is active, pressing a door button opens the door then stops video after 10 seconds. This matches the Android app's behavior.
+
+## Removing the integration
+
+1. Go to **Settings → Devices & Services**
+2. Find **Comelit Man** and open it
+3. Click the three-dot menu → **Delete**
+4. Confirm deletion
+5. Restart Home Assistant
+
+The integration does not persist any state outside the config entry, so no manual cleanup is needed. The device's push-channel registration will lapse naturally once the keepalive probes stop.
 
 ## Entities
 
@@ -149,6 +181,19 @@ actions:
       entity_id: button.comelit_intercom_start_video_feed
 ```
 
+## Data update mechanism
+
+The integration uses a **push-first, poll-for-health** model:
+
+| Mechanism | What it does | Frequency |
+|-----------|-------------|-----------|
+| VIP event listener | Receives doorbell ring, missed call, and door-opened events as binary messages on the CTPP channel | Instant (device pushes) |
+| FCM keepalive probe | Re-sends push-info registration every 90 s; device ACKs, keeping the idle TCP connection alive | Every 90 s |
+| Health-check poll | Verifies the TCP connection is still alive; triggers reconnect if not | Every 30 s |
+| TCP disconnect callback | Schedules an immediate health-check when the client detects a TCP drop | Instant (on drop) |
+
+Entity availability mirrors coordinator connectivity: all entities become **unavailable** if the device is unreachable and recover automatically on reconnect.
+
 ## Protocol
 
 The ICONA Bridge protocol runs over raw TCP on port 64100. Every message has an 8-byte header:
@@ -165,6 +210,46 @@ Key operations:
 - **Door open (VIP listener active, no video)**: Reuse open CTPP, fire open+confirm directly — no init overhead (~30 ms)
 - **Door open (notifications disabled)**: Open transient CTPP channel → full init → 6-step binary sequence → close
 - **Push channel**: Registers FCM token; also used as a 90s keepalive probe — device ACKs with JSON, preventing false reconnect cycles
+
+## Troubleshooting
+
+### Enable debug logging
+
+Add to `configuration.yaml`:
+
+```yaml
+logger:
+  default: info
+  logs:
+    custom_components.comelit_man: debug
+```
+
+Then restart HA. Debug logs include TCP connection events, channel opens, keepalive probes, VIP events, and video session lifecycle.
+
+### Common problems
+
+**"Cannot connect" during setup**
+- Confirm the device is awake (ping it, or physically interact with it)
+- Verify the IP address and that port 64100 is reachable (`telnet <ip> 64100`)
+- Check your router's firewall isn't blocking local LAN traffic
+
+**Authentication failed**
+- If using a password, confirm it matches the device web interface password (default: `comelit`)
+- Re-extract the token via the web interface: `http://<device-ip>:8080`
+- After a firmware update, the token may change — delete and re-add the integration
+
+**Video doesn't start**
+- Ensure no other app is using the ICONA Bridge (the device accepts only one TCP client at a time)
+- Check HA logs for CTPP negotiation errors
+- Port 8557 conflict: check if another process is using it (`netstat -an | grep 8557`)
+
+**Doorbell events not firing**
+- Enable notifications in **Settings → Integrations → Comelit Man → Configure**
+- The VIP listener requires an active CTPP channel; check logs for "Failed to start VIP event listener"
+
+**Entities show as unavailable**
+- The integration is reconnecting to the device; wait 30–60 s
+- If it stays unavailable, check the device is on the network and debug logs for reconnect errors
 
 ## Changelog
 

@@ -12,6 +12,8 @@ from typing import TypeAlias
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .auth import authenticate
@@ -21,6 +23,7 @@ from .config_reader import get_device_config
 from .const import CONF_ENABLE_NOTIFICATIONS, DOMAIN
 from .ctpp import ctpp_init_sequence
 from .door import open_door
+from .exceptions import AuthenticationError, DoorOpenError
 from .models import DeviceConfig, Door, PushEvent
 from .push import register_push, send_push_keepalive
 from .rtsp_server import LocalRtspServer
@@ -74,6 +77,9 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         # (ack_ts = init_ts + 0x01010000, PCAP-verified).
         self._ctpp_init_ts: int = 0
         self._keepalive_task: asyncio.Task | None = None
+        # Tracks whether we were connected on the last health-check so
+        # disconnect / reconnect are logged exactly once per transition.
+        self._connection_lost: bool = False
         # Use an insertion-ordered dict to track callbacks (value is always None).
         # This avoids ValueError on removal and preserves iteration order.
         self._push_callbacks: dict[Callable[[PushEvent], None], None] = {}
@@ -237,6 +243,8 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 _LOGGER.warning("Failed to start VIP listener on reconnect", exc_info=True)
 
         self._start_keepalive()
+        self._connection_lost = False
+        ir.async_delete_issue(self.hass, DOMAIN, "auth_failed")
         _LOGGER.info("Comelit reconnected successfully")
 
     async def async_shutdown(self) -> None:
@@ -326,7 +334,12 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 our_addr, entrance_addr, door.output_index
             )
         else:
-            await open_door(self.host, self.port, self.token, self._client, self._config, door)
+            try:
+                await open_door(self.host, self.port, self.token, self._client, self._config, door)
+            except DoorOpenError as err:
+                if isinstance(err.__cause__, AuthenticationError):
+                    self.config_entry.async_start_reauth(self.hass)
+                raise
 
     async def async_start_video(
         self, auto_timeout: bool = True, by_user: bool = False
@@ -432,7 +445,9 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         if self._video_stopped_by_user:
             return
         _LOGGER.info("CALL_END received — scheduling session restart")
-        self.hass.async_create_task(self._auto_restart_video())
+        self.config_entry.async_create_background_task(
+            self.hass, self._auto_restart_video(), "comelit-auto-restart-video"
+        )
 
     async def _auto_restart_video(self) -> None:
         """Auto-restart video after CALL_END or timeout.
@@ -579,8 +594,12 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         """
         if self._client is None:
             return  # already shut down
-        _LOGGER.debug("TCP connection lost — scheduling immediate reconnect")
-        self.hass.async_create_task(self.async_request_refresh())
+        if not self._connection_lost:
+            _LOGGER.warning("Comelit device disconnected — attempting reconnect")
+            self._connection_lost = True
+        self.config_entry.async_create_background_task(
+            self.hass, self.async_request_refresh(), "comelit-reconnect-refresh"
+        )
 
     async def _async_update_data(self) -> DeviceConfig:
         """Health-check the connection; reconnect if needed."""
@@ -588,10 +607,27 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             if self._config:
                 return self._config
 
-        # Connection lost or no config — attempt reconnect
-        _LOGGER.warning("Comelit device disconnected, attempting reconnect")
+        # Connection lost or no config — attempt reconnect.
+        # One-shot warning: _on_client_disconnect may have already fired it;
+        # set the flag here too for cases where the socket died silently.
+        if not self._connection_lost:
+            _LOGGER.warning("Comelit device disconnected, attempting reconnect")
+            self._connection_lost = True
+
         try:
             await self._reconnect()
+        except AuthenticationError as err:
+            ir.async_create_issue(
+                self.hass,
+                DOMAIN,
+                "auth_failed",
+                is_fixable=True,
+                is_persistent=True,
+                severity=ir.IssueSeverity.ERROR,
+                translation_key="auth_failed",
+                translation_placeholders={"name": self.device_name},
+            )
+            raise ConfigEntryAuthFailed("Authentication failed — update the token") from err
         except Exception as err:
             raise UpdateFailed(f"Reconnect failed: {err}") from err
 

@@ -18,6 +18,7 @@ import logging
 from .auth import authenticate
 from .channels import Channel, ChannelType
 from .client import IconaBridgeClient
+from .const import DOMAIN
 from .ctpp import ctpp_init_sequence
 from .exceptions import DoorOpenError
 from .models import DeviceConfig, Door
@@ -42,6 +43,7 @@ async def open_door(
     config: DeviceConfig,
     door: Door,
 ) -> None:
+    opened_channel = False
     try:
         ctpp = client.get_channel("CTPP")
         opened_channel = ctpp is None
@@ -56,7 +58,11 @@ async def open_door(
             extra_message = "(fast path)"
         _LOGGER.info("Door '%s' opened successfully " + extra_message, door.name)
     except Exception as e:
-        raise DoorOpenError(f"Failed to open door '{door.name}': {e}") from e
+        raise DoorOpenError(
+            translation_domain=DOMAIN,
+            translation_key="door_open_failed",
+            translation_placeholders={"door": door.name},
+        ) from e
     finally:
         if opened_channel:
             client.remove_channel("CTPP")

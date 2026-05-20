@@ -1,0 +1,90 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  hacs:
+    name: HACS Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hacs/action@main
+        with:
+          category: integration
+
+  hassfest:
+    name: Hassfest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: home-assistant/actions/hassfest@master
+
+  lint:
+    name: Ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install ruff
+      - run: ruff check custom_components/
+
+  typecheck:
+    name: Mypy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: pip install mypy aiohttp av
+      - name: Run mypy
+        run: mypy custom_components/comelit_man/
+
+  test:
+    name: Pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: pip install pytest pytest-asyncio aiohttp av pytest-homeassistant-custom-component pytest-cov
+      - name: Run unit tests
+        run: |
+          PYTHONPATH=. pytest \
+            tests/test_protocol.py \
+            tests/test_client.py \
+            tests/test_rtp_receiver.py \
+            tests/test_rtsp_server.py \
+            tests/test_token.py \
+            tests/test_video_call.py \
+            tests/test_video_signaling.py \
+            tests/test_ctpp.py \
+            tests/test_door.py \
+            tests/test_camera.py \
+            tests/test_coordinator.py \
+            tests/test_vip_listener.py \
+            tests/test_event_entity.py \
+            tests/test_button.py \
+            tests/test_push.py \
+            tests/test_ha_component.py \
+            tests/test_auth.py \
+            tests/test_camera_utils.py \
+            tests/test_config_reader.py \
+            tests/test_models_exceptions.py \
+            tests/test_diagnostics_repairs.py \
+            tests/test_config_flow_extra.py \
+            tests/test_channels.py \
+            --cov=custom_components/comelit_man \
+            --cov-report=term-missing \
+            --cov-fail-under=79 \
+            -v
