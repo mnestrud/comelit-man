@@ -56,7 +56,7 @@ def _transform_device_ts(dev_ts: int) -> int:
     rb = bytearray(struct.pack("<I", dev_ts))
     rb[0] |= 0x80
     rb[2], rb[3] = rb[3], (rb[2] + 1) & 0xFF
-    return struct.unpack("<I", bytes(rb))[0]
+    return int(struct.unpack("<I", bytes(rb))[0])
 
 
 class VideoCallSession:
@@ -697,9 +697,7 @@ class VideoCallSession:
                             await self._answer_handoff.put(resp)
                         else:
                             ack_ts = _transform_device_ts(struct.unpack_from("<I", resp, 2)[0])
-                            await client.send_binary(
-                                ctpp, encode_call_response_ack(our_addr, entrance_addr, ack_ts)
-                            )
+                            await client.send_binary(ctpp, encode_call_response_ack(our_addr, entrance_addr, ack_ts))
                             _LOGGER.debug(
                                 "CTPP monitor: ACKed 0x1840/0x%04X (sub=0x%04X, transform)",
                                 action,
@@ -1112,9 +1110,7 @@ class VideoCallSession:
                     ctpp, encode_answer_peer(our_addr, our_base, self._call_counter, inbound=True)
                 )
                 self._call_counter = (self._call_counter + _CTR_INCR_BYTE4) & 0xFFFFFFFF
-                await self._client.send_binary(
-                    ctpp, encode_call_accepted(our_addr, our_base, self._call_counter)
-                )
+                await self._client.send_binary(ctpp, encode_call_accepted(our_addr, our_base, self._call_counter))
             _LOGGER.info("Answer: peer + call_accepted sent")
 
             # Drain 0x000A (rtpc_link) + 0x000E (peer) ACKs from the handoff
@@ -1147,9 +1143,7 @@ class VideoCallSession:
 
         if self._inbound_device_rtpc is not None:
             try:
-                await asyncio.wait_for(
-                    self._inbound_device_rtpc.open_event.wait(), timeout=VIDEO_RESPONSE_TIMEOUT
-                )
+                await asyncio.wait_for(self._inbound_device_rtpc.open_event.wait(), timeout=VIDEO_RESPONSE_TIMEOUT)
                 self._device_rtpc_req_id = self._inbound_device_rtpc.server_channel_id
                 _LOGGER.debug("Answer: device RTPC=0x%04X", self._device_rtpc_req_id)
             except TimeoutError:
