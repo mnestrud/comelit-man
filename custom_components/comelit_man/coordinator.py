@@ -552,9 +552,9 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             _LOGGER.info("Inbound video ready, ring fired (entrance=%s)", entrance_addr)
 
     async def async_answer_inbound(self) -> None:
-        """Start two-way audio for an active inbound call."""
+        """Answer an active passive inbound call — send answer signals, start audio."""
         if self._video_session and self._video_session.active:
-            self._video_session.answer_inbound()
+            await self._video_session.answer_inbound()
 
     async def _register_go2rtc_stream(self) -> None:
         """Register our RTSP stream with go2rtc, enabling backchannel support.
