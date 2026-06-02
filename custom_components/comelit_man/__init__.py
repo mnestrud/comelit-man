@@ -22,7 +22,7 @@ from .exceptions import (
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = [Platform.BUTTON, Platform.CAMERA, Platform.EVENT]
+PLATFORMS = [Platform.BUTTON, Platform.CAMERA, Platform.EVENT, Platform.IMAGE]
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 

@@ -84,6 +84,9 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         # Tracks whether we were connected on the last health-check so
         # disconnect / reconnect are logged exactly once per transition.
         self._connection_lost: bool = False
+        # Last JPEG snapshot captured when passive inbound video started.
+        # Set before the ring event fires; never overwritten by outbound video.
+        self._last_ring_snapshot: bytes | None = None
         # Use an insertion-ordered dict to track callbacks (value is always None).
         # This avoids ValueError on removal and preserves iteration order.
         self._push_callbacks: dict[Callable[[PushEvent], None], None] = {}
@@ -541,6 +544,15 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             if self._rtsp_server:
                 self._rtsp_server.mark_ready()
             await self._notify_video_state_change()
+            # Capture snapshot before firing ring so the image entity is ready
+            # when automations react to the event.
+            if session.rtp_receiver is not None:
+                snapshot = session.rtp_receiver.latest_frame
+                if snapshot is None:
+                    with contextlib.suppress(Exception):
+                        snapshot = await asyncio.wait_for(session.rtp_receiver.get_jpeg_frame(), timeout=2.0)
+                if snapshot is not None:
+                    self._last_ring_snapshot = snapshot
             # Fire ring AFTER video is flowing so automations see the stream
             self._on_push_event(
                 PushEvent(
@@ -589,6 +601,11 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                     timeout=aiohttp.ClientTimeout(total=5),
                 )
             _LOGGER.debug("Deregistered go2rtc stream: %s", name)
+
+    @property
+    def last_ring_snapshot(self) -> bytes | None:
+        """Return the JPEG snapshot from the most recent inbound ring."""
+        return self._last_ring_snapshot
 
     @property
     def video_stopped_by_user(self) -> bool:

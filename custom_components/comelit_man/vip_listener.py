@@ -33,6 +33,7 @@ from .client import IconaBridgeClient
 from .ctpp import _CTR_INCR_BOTH
 from .models import DeviceConfig, PushEvent
 from .protocol import encode_call_response_ack
+from .video_call import _transform_device_ts
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -208,11 +209,16 @@ class VipEventListener:
         )
         # 0x1840 retransmits after video stops are expected — we don't ACK them
         # (no valid counter) so the device retransmits briefly then stops on its own.
+        # 0x1860/0x0003 (door_opened) retransmits are also expected — we intentionally
+        # don't ACK door_opened, so the device retransmits briefly then stops.
         _is_video_tail = prefix == PREFIX_VIDEO_EVENT
+        _is_expected_retransmit = _is_video_tail or (
+            prefix == PREFIX_VIP_EVENT and action == ACTION_DOOR_OPENED
+        )
         if is_retransmit:
-            if _is_video_tail:
+            if _is_expected_retransmit:
                 _LOGGER.debug(
-                    "VIP: expected video-tail retransmit ignored (prefix=0x%04X action=0x%04X ts=0x%08X)",
+                    "VIP: expected retransmit ignored (prefix=0x%04X action=0x%04X ts=0x%08X)",
                     prefix,
                     action,
                     ts,
@@ -295,25 +301,26 @@ class VipEventListener:
     async def _send_event_ack(self, msg: dict[str, Any]) -> None:
         """Send a single ACK (0x1800) for a device-initiated VIP event.
 
-        Used for events like door_opened (0x1860/0x0003) where the device
-        expects acknowledgment to clear the channel state. Without it the
-        device stays "busy" for a few seconds, blocking subsequent rings.
+        Timestamp: _transform_device_ts(device_ts) — PCAP2-verified for all
+        0x18C0/0x1840/0x1860 non-renewal events. This is distinct from renewal
+        ACKs which use init_ts + 0x01010000.
 
-        Timestamp is `init_ts + 0x01010000` — see __init__ docstring.
+        Callee: apt_addr (base address without subaddress digit).
+        Caller: vip_address (apt_addr + subaddress digit).
         """
         apt_addr = self._config.apt_address
         apt_sub = self._config.apt_subaddress
         vip_address = f"{apt_addr}{apt_sub}"
-        entrance_addr = msg["addresses"][0] if msg["addresses"] else apt_addr
+        ack_ts = _transform_device_ts(msg["timestamp"])
         try:
             await self._client.send_binary(
                 self._channel,
-                encode_call_response_ack(vip_address, entrance_addr, self._ack_ts),
+                encode_call_response_ack(vip_address, apt_addr, ack_ts),
             )
             _LOGGER.debug(
                 "VIP: sent event ACK (action=0x%04X, ts=0x%08X)",
                 msg["action"],
-                self._ack_ts,
+                ack_ts,
             )
         except Exception:
             _LOGGER.warning("VIP: failed to send event ACK", exc_info=True)

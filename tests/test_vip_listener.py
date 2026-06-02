@@ -685,6 +685,117 @@ class TestSendEventAckException:
 
 
 # ---------------------------------------------------------------------------
+# _send_event_ack — payload-level: timestamp and callee correctness
+# ---------------------------------------------------------------------------
+
+
+class TestSendEventAckPayload:
+    """Verify _send_event_ack sends transform(device_ts) and apt_addr callee.
+
+    These tests decode the raw bytes sent to the wire and assert the correct
+    values — they would have failed before the fix that changed _ack_ts to
+    _transform_device_ts(msg["timestamp"]) and entrance_addr to apt_addr.
+    """
+
+    @pytest.mark.asyncio
+    async def test_call_init_ack_timestamp_is_transform_of_device_ts(self):
+        """PREFIX_CALL_INIT ACK timestamp == transform(device_ts), not init_ts+ctr."""
+        from custom_components.comelit_man.video_call import _transform_device_ts
+
+        init_ts = 0x12000000
+        device_ts = 0xA4C6B83B
+        listener = _make_listener(init_ts=init_ts)  # on_inbound_ring=None → ACK is sent
+
+        sent_payloads: list[bytes] = []
+
+        async def capture(channel, payload):
+            sent_payloads.append(payload)
+
+        listener._client.send_binary = AsyncMock(side_effect=capture)
+        data = _make_ctpp_msg(PREFIX_CALL_INIT, device_ts, 0, flags=0)
+        await listener._process_message(data)
+
+        assert len(sent_payloads) == 1
+        actual_ts = struct.unpack_from("<I", sent_payloads[0], 2)[0]
+        expected_ts = _transform_device_ts(device_ts)
+        wrong_ts = (init_ts + 0x01010000) & 0xFFFFFFFF
+        assert actual_ts == expected_ts
+        assert actual_ts != wrong_ts
+
+    @pytest.mark.asyncio
+    async def test_call_init_ack_callee_is_apt_addr_not_entrance_addr(self):
+        """PREFIX_CALL_INIT ACK callee == apt_addr (base), not the entrance address."""
+        apt_addr = "SB000006"
+        entrance_addr = "SB100001"
+        listener = _make_listener(apt_address=apt_addr, apt_subaddress=1)
+
+        sent_payloads: list[bytes] = []
+
+        async def capture(channel, payload):
+            sent_payloads.append(payload)
+
+        listener._client.send_binary = AsyncMock(side_effect=capture)
+        data = _make_ctpp_msg(PREFIX_CALL_INIT, 0xABCD1234, 0, flags=0, addresses=[entrance_addr])
+        await listener._process_message(data)
+
+        assert len(sent_payloads) == 1
+        # ACK format: prefix(2) + ts(4) + action(2) + 0xFFFFFFFF(4) = 12 bytes header
+        rest = sent_payloads[0][12:]
+        parts = rest.split(b"\x00")
+        callee = parts[1].decode("ascii")
+        assert callee == apt_addr
+        assert callee != entrance_addr
+
+    @pytest.mark.asyncio
+    async def test_vip_event_ack_timestamp_is_transform_of_device_ts(self):
+        """ACTION_IN_ALERTING ACK timestamp == transform(device_ts), not init_ts+ctr."""
+        from custom_components.comelit_man.video_call import _transform_device_ts
+
+        init_ts = 0x12000000
+        device_ts = 0xDEADBEEF
+        listener = _make_listener(init_ts=init_ts)
+
+        sent_payloads: list[bytes] = []
+
+        async def capture(channel, payload):
+            sent_payloads.append(payload)
+
+        listener._client.send_binary = AsyncMock(side_effect=capture)
+        data = _make_ctpp_msg(PREFIX_VIP_EVENT, device_ts, ACTION_IN_ALERTING, flags=0)
+        await listener._process_message(data)
+
+        assert len(sent_payloads) == 1
+        actual_ts = struct.unpack_from("<I", sent_payloads[0], 2)[0]
+        expected_ts = _transform_device_ts(device_ts)
+        wrong_ts = (init_ts + 0x01010000) & 0xFFFFFFFF
+        assert actual_ts == expected_ts
+        assert actual_ts != wrong_ts
+
+    @pytest.mark.asyncio
+    async def test_vip_event_ack_callee_is_apt_addr_not_entrance_addr(self):
+        """ACTION_IN_ALERTING ACK callee == apt_addr (base), not the entrance address."""
+        apt_addr = "SB000006"
+        entrance_addr = "SB100001"
+        listener = _make_listener(apt_address=apt_addr, apt_subaddress=1)
+
+        sent_payloads: list[bytes] = []
+
+        async def capture(channel, payload):
+            sent_payloads.append(payload)
+
+        listener._client.send_binary = AsyncMock(side_effect=capture)
+        data = _make_ctpp_msg(PREFIX_VIP_EVENT, 0x12345678, ACTION_IN_ALERTING, flags=0, addresses=[entrance_addr])
+        await listener._process_message(data)
+
+        assert len(sent_payloads) == 1
+        rest = sent_payloads[0][12:]
+        parts = rest.split(b"\x00")
+        callee = parts[1].decode("ascii")
+        assert callee == apt_addr
+        assert callee != entrance_addr
+
+
+# ---------------------------------------------------------------------------
 # _send_renewal_ack — exception path
 # ---------------------------------------------------------------------------
 
