@@ -23,10 +23,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from custom_components.comelit_man.auth import authenticate
+from custom_components.comelit_man.channels import ViperMessageId
 from custom_components.comelit_man.client import IconaBridgeClient
 from custom_components.comelit_man.config_reader import get_device_config
 from custom_components.comelit_man.rtp_receiver import RtpReceiver
 from custom_components.comelit_man.video_call import VideoCallSession
+
+pytestmark = pytest.mark.usefixtures("socket_enabled")
 
 # ---------------------------------------------------------------------------
 # Wire-protocol helpers (mirrors protocol.py without importing it)
@@ -212,7 +215,7 @@ class FakeComelitDevice:
             resp: dict = {
                 "message": "access",
                 "message-type": "response",
-                "message-id": 1,
+                "message-id": int(ViperMessageId.UAUT),
                 "response-code": 200,
                 "response-string": "Access Granted",
             }

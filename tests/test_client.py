@@ -1,11 +1,13 @@
 """Client tests with mocked TCP connection."""
 
 import asyncio
+import logging
 import struct
+from unittest.mock import AsyncMock
 
 import pytest
 
-from custom_components.comelit_man.channels import ChannelType
+from custom_components.comelit_man.channels import Channel, ChannelType
 from custom_components.comelit_man.client import IconaBridgeClient
 from custom_components.comelit_man.exceptions import ConnectionComelitError
 from custom_components.comelit_man.protocol import (
@@ -70,6 +72,112 @@ class FakeStreamWriter:
 
     async def wait_closed(self):
         pass
+
+
+@pytest.mark.asyncio
+async def test_read_packet_does_not_log_json_response_content(caplog):
+    """Raw JSON response fields must never be copied into debug logs."""
+    reader = FakeStreamReader()
+    marker = "PRIVATE-RESPONSE-MARKER"
+    reader.feed(_make_json_response(42, {"serial-code": marker}))
+
+    client = IconaBridgeClient("127.0.0.1")
+    client._reader = reader
+
+    with caplog.at_level(logging.DEBUG, logger="custom_components.comelit_man.client"):
+        request_id, body = await client._read_packet()
+
+    assert request_id == 42
+    assert marker.encode() in body
+    assert marker not in caplog.text
+    assert f"Read JSON body ({len(body)} bytes)" in caplog.text
+
+
+def test_dispatch_does_not_log_unsolicited_json_content(caplog):
+    """Late or unmatched JSON fields must never be copied into debug logs."""
+    import json
+
+    client = IconaBridgeClient("127.0.0.1")
+    marker = "PRIVATE-UNMATCHED-RESPONSE-MARKER"
+    body = json.dumps({"serial-code": marker}).encode()
+
+    with caplog.at_level(logging.DEBUG, logger="custom_components.comelit_man.client"):
+        client._dispatch(42, body)
+
+    assert marker not in caplog.text
+    assert f"Unsolicited JSON on channel 42 ({len(body)} bytes)" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_disconnect_resets_authenticated_state():
+    client = IconaBridgeClient("127.0.0.1")
+    client._connected = True
+    client._set_authenticated(True)
+    assert client.authenticated
+
+    await client.disconnect()
+
+    assert not client.authenticated
+
+
+def _open_test_channel(channel_id: int = 77) -> Channel:
+    """Return an open synthetic channel for send_json tests."""
+    channel = Channel(name="TEST", channel_type=ChannelType.UAUT, request_id=1)
+    channel.server_channel_id = channel_id
+    channel.is_open = True
+    return channel
+
+
+@pytest.mark.asyncio
+async def test_send_json_send_error_removes_callback():
+    client = IconaBridgeClient("127.0.0.1")
+    channel = _open_test_channel()
+    client._send = AsyncMock(side_effect=ConnectionComelitError("synthetic send failure"))
+
+    with pytest.raises(ConnectionComelitError, match="synthetic send failure"):
+        await client.send_json(channel, {"message": "synthetic"})
+
+    assert channel.server_channel_id not in client._callbacks
+
+
+@pytest.mark.asyncio
+async def test_send_json_cleanup_preserves_replacement_callback():
+    client = IconaBridgeClient("127.0.0.1")
+    channel = _open_test_channel()
+    replacement = asyncio.get_running_loop().create_future()
+
+    async def replace_callback_then_fail(data: bytes) -> None:
+        client._callbacks[channel.server_channel_id] = replacement
+        raise ConnectionComelitError("synthetic send failure")
+
+    client._send = AsyncMock(side_effect=replace_callback_then_fail)
+
+    with pytest.raises(ConnectionComelitError, match="synthetic send failure"):
+        await client.send_json(channel, {"message": "synthetic"})
+
+    assert client._callbacks[channel.server_channel_id] is replacement
+    client._callbacks.pop(channel.server_channel_id)
+    replacement.cancel()
+
+
+@pytest.mark.asyncio
+async def test_send_json_cancellation_removes_callback():
+    client = IconaBridgeClient("127.0.0.1")
+    channel = _open_test_channel()
+    client._send = AsyncMock()
+
+    send_task = asyncio.create_task(client.send_json(channel, {"message": "synthetic"}))
+    for _ in range(100):
+        if channel.server_channel_id in client._callbacks:
+            break
+        await asyncio.sleep(0)
+    assert channel.server_channel_id in client._callbacks
+
+    send_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await send_task
+
+    assert channel.server_channel_id not in client._callbacks
 
 
 @pytest.mark.asyncio
