@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from custom_components.comelit_man.rtp import rtp_payload_bounds
 from custom_components.comelit_man.rtp_receiver import (
     RtpReceiver,
     _build_control_packet,
@@ -369,6 +370,22 @@ def _make_rtp_packet(payload: bytes) -> bytes:
     return header + payload
 
 
+def _make_rtp_packet_with_options(payload: bytes, *, payload_type: int = 96) -> bytes:
+    """Build RTP with two CSRCs, a two-word extension, and four bytes of padding."""
+    fixed_header = struct.pack(
+        "!BBHII",
+        0xB2,  # V=2, P=1, X=1, CC=2
+        payload_type & 0x7F,
+        1,
+        0x01020304,
+        0x11223344,
+    )
+    csrcs = struct.pack("!II", 0x55667788, 0x99AABBCC)
+    extension = struct.pack("!HH", 0xBEDE, 2) + b"\x10\x20\x30\x40\x50\x60\x70\x80"
+    padding = b"\x00\x00\x00\x04"
+    return fixed_header + csrcs + extension + payload + padding
+
+
 def _make_icona_udp(rtp: bytes, req_id: int) -> bytes:
     """Wrap an RTP payload in an ICONA UDP header."""
     body_len = len(rtp)
@@ -376,6 +393,44 @@ def _make_icona_udp(rtp: bytes, req_id: int) -> bytes:
     header = struct.pack("<2sHH2s", b"\x00\x06", body_len, req_id, b"\x00\x00")
     # Append enough padding to satisfy HEADER_SIZE + 12 minimum
     return header + rtp
+
+
+class TestRtpPayloadBounds:
+    def test_minimal_header(self):
+        packet = _make_rtp_packet(b"\x65\x01\x02")
+
+        assert rtp_payload_bounds(packet) == (12, 15)
+
+    def test_csrc_extension_and_padding(self):
+        packet = _make_rtp_packet_with_options(b"\x65\x01\x02")
+
+        assert rtp_payload_bounds(packet) == (32, 35)
+        start, end = rtp_payload_bounds(packet) or (0, 0)
+        assert packet[start:end] == b"\x65\x01\x02"
+
+    @pytest.mark.parametrize(
+        "packet",
+        [
+            b"\x80" * 11,
+            b"\x40" + b"\x00" * 11,
+            struct.pack("!BBHII", 0x82, 96, 1, 1, 1) + b"\x00" * 4,
+            struct.pack("!BBHII", 0x90, 96, 1, 1, 1) + b"\xbe\xde\x00",
+            struct.pack("!BBHII", 0x90, 96, 1, 1, 1) + struct.pack("!HH", 0xBEDE, 2) + b"\x00" * 4,
+            struct.pack("!BBHII", 0xA0, 96, 1, 1, 1) + b"\x65\x00",
+            struct.pack("!BBHII", 0xA0, 96, 1, 1, 1) + b"\x65\x03",
+        ],
+        ids=[
+            "truncated-base-header",
+            "wrong-version",
+            "truncated-csrc-list",
+            "truncated-extension-header",
+            "truncated-extension-data",
+            "zero-padding-length",
+            "padding-exceeds-packet",
+        ],
+    )
+    def test_malformed_packet(self, packet: bytes):
+        assert rtp_payload_bounds(packet) is None
 
 
 class TestOnUdpPacket:
@@ -559,6 +614,26 @@ class TestProcessRtp:
         rtp = b"\x80" + b"\x00" * 11  # 12 bytes total, no payload
         receiver._process_rtp(rtp)
         assert receiver._nal_queue.empty()
+
+    def test_csrc_extension_and_padding_are_not_treated_as_video_payload(self):
+        receiver = RtpReceiver("127.0.0.1")
+        payload = b"\x67\x42\x00\x1f"
+        rtp = _make_rtp_packet_with_options(payload)
+
+        receiver._process_rtp(rtp)
+
+        _rtp_ts, nal = receiver._nal_queue.get_nowait()
+        assert nal == b"\x00\x00\x00\x01" + payload
+
+    def test_raw_rtp_passthrough_packet_is_unchanged(self):
+        receiver = RtpReceiver("127.0.0.1")
+        rtp_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        receiver.attach_rtsp_queues(asyncio.Queue(), asyncio.Queue(), rtp_queue)
+        rtp = _make_rtp_packet_with_options(b"\x65\x01\x02")
+
+        receiver._process_rtp(rtp)
+
+        assert rtp_queue.get_nowait() == rtp
 
 
 # ---------------------------------------------------------------------------
@@ -955,7 +1030,7 @@ class TestAudioRouting:
         assert receiver._nal_queue.empty()
 
     def test_audio_payload_content_correct(self):
-        """Audio payload in queue matches the RTP payload (strips 12-byte header)."""
+        """Audio payload in queue matches the RTP media payload."""
         receiver = RtpReceiver("127.0.0.1")
         audio_q = asyncio.Queue()
         receiver.attach_rtsp_queues(asyncio.Queue(), audio_q)
@@ -966,6 +1041,16 @@ class TestAudioRouting:
 
         queued = audio_q.get_nowait()
         assert queued == payload
+
+    def test_audio_excludes_csrc_extension_and_padding(self):
+        receiver = RtpReceiver("127.0.0.1")
+        audio_q: asyncio.Queue[bytes] = asyncio.Queue()
+        receiver.attach_rtsp_queues(asyncio.Queue(), audio_q)
+        payload = b"\xd5" * 160
+
+        receiver._process_rtp(_make_rtp_packet_with_options(payload, payload_type=8))
+
+        assert audio_q.get_nowait() == payload
 
     def test_audio_increments_packet_count(self):
         """Each audio packet increments _audio_packet_count."""
