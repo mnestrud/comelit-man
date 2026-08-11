@@ -4,8 +4,8 @@
 
 Run ALL of these before responding to any user message.
 
-1. `git -C "C:/Users/micha/code/comelit-man" status`
-2. `git -C "C:/Users/micha/code/comelit-man" log --oneline -5`
+1. `git -C /home/ataraxia/code/comelit-man status`
+2. `git -C /home/ataraxia/code/comelit-man log --oneline -5`
 3. Read `custom_components/comelit_man/manifest.json` → note version
 4. Read memory file `memory/comelit_man_audit.md` → note (a) quality tier, (b) `Last full sweep` date, (c) `**Stale rows:**` count from the summary block at the top.
 
@@ -58,26 +58,32 @@ Platforms: `BUTTON, CAMERA, EVENT` | Min HA: `2026.1.0` | Repo: `https://github.
 
 ## Running Tests Locally
 
-**Working directory: `C:/Users/micha/code/comelit-man`**
+**Working directory: `/home/ataraxia/code/comelit-man`**
 
 ```bash
-# First time — create venv (matches CI exactly)
-python -m venv .venv
-.venv\Scripts\pip install pytest pytest-asyncio aiohttp av pytest-cov pytest-homeassistant-custom-component pyturbojpeg
+# First time — create venv
+uv venv .venv
+uv pip install -p .venv/bin/python pytest pytest-asyncio aiohttp av pytest-cov pyturbojpeg homeassistant freezegun syrupy pytest-aiohttp
+```
 
+⚠️ Do NOT install `pytest-homeassistant-custom-component` — its bundled pytest-socket plugin
+blocks socket creation and fails the two `test_video_flow_integration.py` tests (verified
+2026-08-11). Install `homeassistant` directly instead, as above.
+
+```bash
 # All tests
-.venv\Scripts\pytest tests/ -v
+.venv/bin/pytest tests/ -v
 
 # Unit tests only (no device needed)
-.venv\Scripts\pytest tests/test_protocol.py tests/test_client.py tests/test_rtp_receiver.py tests/test_rtsp_server.py tests/test_token.py tests/test_video_call.py tests/test_video_signaling.py -v
+.venv/bin/pytest tests/test_protocol.py tests/test_client.py tests/test_rtp_receiver.py tests/test_rtsp_server.py tests/test_token.py tests/test_video_call.py tests/test_video_signaling.py -v
 
 # Stop on first failure
-.venv\Scripts\pytest tests/ -x --tb=short
+.venv/bin/pytest tests/ -x --tb=short
 ```
 
 Integration tests (real device required):
 ```bash
-COMELIT_HOST=192.168.113.12 COMELIT_TOKEN=<token> .venv\Scripts\pytest tests/test_integration.py -v -s
+COMELIT_HOST=192.168.113.12 COMELIT_TOKEN=<token> .venv/bin/pytest tests/test_integration.py -v -s
 ```
 
 ---
@@ -114,15 +120,15 @@ COMELIT_HOST=192.168.113.12 COMELIT_TOKEN=<token> .venv\Scripts\pytest tests/tes
 
 ## Development and Deploy Workflow
 
-**Source of truth: git repo. Test target: live HA via Samba. Two separate steps.**
+**Source of truth: git repo. Test target: live HA via the /mnt/ha-config mount. Two separate steps.**
 
 ### Step 1 — Edit and test locally
-1. Edit files in `C:/Users/micha/code/comelit-man/custom_components/comelit_man/`
+1. Edit files in `/home/ataraxia/code/comelit-man/custom_components/comelit_man/`
 2. Run `pytest tests/ --tb=short` to catch regressions
 
 ### Step 2 — Deploy to live HA for integration testing
 ```bash
-robocopy "C:\Users\micha\code\comelit-man\custom_components\comelit_man" "\\botworth\config\custom_components\comelit_man" /MIR /NFL /NDL
+rsync -a --delete /home/ataraxia/code/comelit-man/custom_components/comelit_man/ /mnt/ha-config/custom_components/comelit_man/
 ```
 - **Python changes** (any `.py` file): full HA restart required — use `ha_restart` MCP call; do NOT poll after, tell user to confirm when ready
 - **Non-Python changes** (strings.json, translations): reload only — `ha_reload_config component=core`
@@ -144,7 +150,7 @@ git push origin dev
 | When | Use |
 |------|-----|
 | HA entity API signatures, coordinator/flow patterns, HA breaking changes | `ha-dev` agent |
-| After robocopy deploy + restart confirmed | `ha-integration-validator` agent |
+| After rsync deploy + restart confirmed | `ha-integration-validator` agent |
 | General Python/testing questions | Answer directly |
 
 ---
