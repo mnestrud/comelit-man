@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from custom_components.comelit_man.rtp import rtp_payload_bounds
 from custom_components.comelit_man.rtsp_server import (
     LocalRtspServer,
     _build_rtcp_sr,
@@ -1813,6 +1814,27 @@ def _make_rtp_pkt(
     return struct.pack("!BBHII", 0x80, 0xE0, seq, ts, 0xDEADBEEF) + payload
 
 
+def _make_rtp_pkt_with_options(
+    payload: bytes,
+    *,
+    payload_type: int = 96,
+    ts: int = 1000,
+) -> bytes:
+    """Build RTP with one CSRC, a one-word extension, and four bytes of padding."""
+    fixed_header = struct.pack(
+        "!BBHII",
+        0xB1,  # V=2, P=1, X=1, CC=1
+        0x80 | payload_type,
+        1,
+        ts,
+        0xDEADBEEF,
+    )
+    csrc = struct.pack("!I", 0x01020304)
+    extension = struct.pack("!HH", 0xBEDE, 1) + b"\x10\x20\x30\x40"
+    padding = b"\x00\x00\x00\x04"
+    return fixed_header + csrc + extension + payload + padding
+
+
 class TestVideoRtpPassthroughLoop:
     @pytest.mark.asyncio
     async def test_happy_path_broadcasts_rewritten_rtp(self):
@@ -1873,6 +1895,62 @@ class TestVideoRtpPassthroughLoop:
         items: list[bytes] = [b"\x80\xe0" + b"\x00" * 10]  # 12 bytes exactly, no payload
 
         async def mock_wait_for(coro: object, timeout: float) -> bytes:
+            if asyncio.iscoroutine(coro):
+                coro.close()  # type: ignore[attr-defined]
+            if items:
+                return items.pop(0)
+            server._running = False
+            raise TimeoutError
+
+        with patch("custom_components.comelit_man.rtsp_server.asyncio.wait_for", mock_wait_for):
+            await server._video_rtp_passthrough_loop()
+
+        assert broadcasts == []
+
+    @pytest.mark.asyncio
+    async def test_preserves_variable_header_and_padding_while_extracting_payload(self):
+        server = LocalRtspServer()
+        server._running = True
+        broadcasts: list[bytes] = []
+        server._broadcast_rtp = lambda pkt, is_video: broadcasts.append(pkt)  # type: ignore[method-assign]
+
+        payload = b"\x67" + b"\x42" * 8
+        rtp = _make_rtp_pkt_with_options(payload)
+        items: list[bytes] = [rtp]
+
+        async def mock_wait_for(coro: object, **_kwargs: float) -> bytes:
+            if asyncio.iscoroutine(coro):
+                coro.close()  # type: ignore[attr-defined]
+            if items:
+                return items.pop(0)
+            server._running = False
+            raise TimeoutError
+
+        with patch("custom_components.comelit_man.rtsp_server.asyncio.wait_for", mock_wait_for):
+            await server._video_rtp_passthrough_loop()
+
+        assert len(broadcasts) == 1
+        rewritten = broadcasts[0]
+        assert rewritten[0] == rtp[0]
+        assert rewritten[12:] == rtp[12:]
+        payload_start, payload_end = rtp_payload_bounds(rewritten) or (0, 0)
+        assert rewritten[payload_start:payload_end] == payload
+        assert server._latest_sps == payload
+        assert server._video_octet_count == len(payload)
+
+    @pytest.mark.asyncio
+    async def test_malformed_extension_is_skipped(self):
+        server = LocalRtspServer()
+        server._running = True
+        broadcasts: list[bytes] = []
+        server._broadcast_rtp = lambda pkt, is_video: broadcasts.append(pkt)  # type: ignore[method-assign]
+
+        rtp = (
+            struct.pack("!BBHII", 0x90, 0xE0, 1, 1000, 0xDEADBEEF) + struct.pack("!HH", 0xBEDE, 2) + b"\x10\x20\x30\x40"
+        )
+        items: list[bytes] = [rtp]
+
+        async def mock_wait_for(coro: object, **_kwargs: float) -> bytes:
             if asyncio.iscoroutine(coro):
                 coro.close()  # type: ignore[attr-defined]
             if items:
@@ -2362,6 +2440,32 @@ class TestBackchannel:
         assert not server.backchannel_queue.empty()
         received = server.backchannel_queue.get_nowait()
         assert received == audio_payload
+
+    @pytest.mark.asyncio
+    async def test_receive_backchannel_rtp_strips_variable_header_and_padding(self):
+        server = LocalRtspServer()
+        server._running = True
+
+        audio_payload = bytes([0xAB] * 160)
+        rtp = _make_rtp_pkt_with_options(audio_payload, payload_type=8)
+        interleaved = struct.pack("!BBH", 0x24, 6, len(rtp)) + rtp
+
+        class _ExactReader:
+            def __init__(self, data: bytes) -> None:
+                self._data = bytearray(data)
+                self._pos = 0
+
+            async def readexactly(self, n: int) -> bytes:
+                end = self._pos + n
+                if end > len(self._data):
+                    raise asyncio.IncompleteReadError(b"", n)
+                result = bytes(self._data[self._pos : end])
+                self._pos = end
+                return result
+
+        await server._receive_backchannel_rtp(_ExactReader(interleaved))
+
+        assert server.backchannel_queue.get_nowait() == audio_payload
 
     @pytest.mark.asyncio
     async def test_receive_backchannel_rtp_ignores_short_rtp(self):

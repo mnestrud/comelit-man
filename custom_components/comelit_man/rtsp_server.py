@@ -41,6 +41,8 @@ import socket
 import struct
 import time
 
+from .rtp import RTP_FIXED_HEADER_SIZE, rtp_payload_bounds
+
 _LOGGER = logging.getLogger(__name__)
 
 _MAX_RTP_PAYLOAD = 1400  # bytes — safe MTU headroom
@@ -644,8 +646,10 @@ class LocalRtspServer:
             except (asyncio.IncompleteReadError, TimeoutError):
                 break
 
-            if len(rtp) >= 12:
-                payload = rtp[12:]
+            payload_bounds = rtp_payload_bounds(rtp)
+            if payload_bounds is not None:
+                payload_start, payload_end = payload_bounds
+                payload = rtp[payload_start:payload_end]
                 if payload:
                     with contextlib.suppress(asyncio.QueueFull):
                         self.backchannel_queue.put_nowait(payload)
@@ -796,11 +800,13 @@ class LocalRtspServer:
                     continue
 
                 fallback_count = 0
-                if len(rtp) < 12:
+                payload_bounds = rtp_payload_bounds(rtp)
+                if payload_bounds is None:
                     continue
 
+                payload_start, payload_end = payload_bounds
                 device_ts = struct.unpack_from("!I", rtp, 4)[0]
-                payload = rtp[12:]
+                payload = rtp[payload_start:payload_end]
                 if not payload:
                     continue
 
@@ -826,7 +832,9 @@ class LocalRtspServer:
                     self._video_ssrc,
                 )
                 self._video_seq = (self._video_seq + 1) & 0xFFFF
-                self._broadcast_rtp(new_header + payload, is_video=True)
+                # Preserve CSRCs, extension data, and padding from the device
+                # packet.  Only the fixed RTP header fields are rewritten.
+                self._broadcast_rtp(new_header + rtp[RTP_FIXED_HEADER_SIZE:], is_video=True)
                 self._video_pkt_count += 1
                 self._video_octet_count += len(payload)
                 self._last_video_rtp_ts = self._video_ts_out

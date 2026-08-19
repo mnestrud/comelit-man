@@ -150,6 +150,44 @@ class TestDecodeRtpHeader:
         _, payload = decode_rtp_header(pkt)
         assert isinstance(payload, bytes)
 
+    def test_returns_payload_excluding_csrc_extension_and_padding(self):
+        icona = b"\x00\x06" + b"\x00" * 6
+        fixed_header = struct.pack("!BBHII", 0xB1, 96, 1, 2, 3)
+        csrc = struct.pack("!I", 4)
+        extension = struct.pack("!HH", 0xBEDE, 1) + b"\x10\x20\x30\x40"
+        media_payload = b"\x65\x01\x02"
+        padding = b"\x00\x00\x00\x04"
+
+        header, payload = decode_rtp_header(icona + fixed_header + csrc + extension + media_payload + padding)
+
+        assert header.padding is True
+        assert header.extension is True
+        assert header.csrc_count == 1
+        assert payload == media_payload
+
+    def test_malformed_extension_raises(self):
+        icona = b"\x00\x06" + b"\x00" * 6
+        fixed_header = struct.pack("!BBHII", 0x90, 96, 1, 2, 3)
+        truncated_extension = struct.pack("!HH", 0xBEDE, 2) + b"\x10\x20\x30\x40"
+
+        with pytest.raises(ValueError, match="Malformed RTP"):
+            decode_rtp_header(icona + fixed_header + truncated_extension)
+
+    def test_non_v2_packet_raises(self):
+        icona = b"\x00\x06" + b"\x00" * 6
+        fixed_header = struct.pack("!BBHII", 0x40, 96, 1, 2, 3)
+
+        with pytest.raises(ValueError, match="Malformed RTP"):
+            decode_rtp_header(icona + fixed_header)
+
+    @pytest.mark.parametrize("padding", [b"\x65\x00", b"\x65\x03"])
+    def test_malformed_padding_raises(self, padding: bytes):
+        icona = b"\x00\x06" + b"\x00" * 6
+        fixed_header = struct.pack("!BBHII", 0xA0, 96, 1, 2, 3)
+
+        with pytest.raises(ValueError, match="Malformed RTP"):
+            decode_rtp_header(icona + fixed_header + padding)
+
     def test_too_short_raises(self):
         with pytest.raises(ValueError, match="too short"):
             decode_rtp_header(b"\x00" * 5)

@@ -9,6 +9,7 @@ from enum import IntEnum
 from typing import Any, cast
 
 from .const import VIDEO_FPS, VIDEO_HEIGHT, VIDEO_WIDTH
+from .rtp import RTP_FIXED_HEADER_SIZE, rtp_payload_bounds
 
 HEADER_SIZE = 8  # Fixed header size: magic(2) + length(2) + request_id(2) + padding(2)
 HEADER_MAGIC = b"\x00\x06"  # All messages start with these magic bytes
@@ -654,14 +655,18 @@ class RtpHeader:
 def decode_rtp_header(data: bytes) -> tuple[RtpHeader, bytes]:
     """Parse ICONA header + RTP header from a UDP video packet.
 
-    Strips the 8-byte ICONA header, parses 12-byte RTP header,
+    Strips the 8-byte ICONA header, parses the RTP header,
     returns (RtpHeader, payload).
     """
-    if len(data) < HEADER_SIZE + 12:
+    if len(data) < HEADER_SIZE + RTP_FIXED_HEADER_SIZE:
         raise ValueError(f"Packet too short for ICONA+RTP: {len(data)} bytes")
 
     # Skip ICONA 8-byte header
     rtp_data = data[HEADER_SIZE:]
+    payload_bounds = rtp_payload_bounds(rtp_data)
+    if payload_bounds is None:
+        raise ValueError("Malformed RTP packet")
+    payload_start, payload_end = payload_bounds
 
     byte0 = rtp_data[0]
     byte1 = rtp_data[1]
@@ -677,5 +682,5 @@ def decode_rtp_header(data: bytes) -> tuple[RtpHeader, bytes]:
         ssrc=struct.unpack(">I", rtp_data[8:12])[0],
     )
 
-    payload = rtp_data[12:]
+    payload = rtp_data[payload_start:payload_end]
     return header, payload

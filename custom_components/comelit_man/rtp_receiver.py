@@ -12,6 +12,7 @@ import time
 from typing import Any
 
 from .protocol import HEADER_SIZE, ICONA_BRIDGE_PORT
+from .rtp import rtp_payload_bounds
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -349,15 +350,15 @@ class RtpReceiver:
 
     def _process_rtp(self, rtp: bytes) -> None:
         """Parse RTP packet — route to audio or H.264 pipeline by payload type."""
-        byte0 = rtp[0]
-        version = (byte0 >> 6) & 0x03
-        if version != 2:
+        payload_bounds = rtp_payload_bounds(rtp)
+        if payload_bounds is None:
             return
+        payload_start, payload_end = payload_bounds
 
         payload_type = rtp[1] & 0x7F
         if payload_type in (0, 8):
             # G.711 audio: PT 0 = PCMU (μ-law), PT 8 = PCMA (A-law)
-            self._process_audio_rtp(rtp, payload_type)
+            self._process_audio_rtp(rtp[payload_start:payload_end], payload_type)
             return
 
         # RTP pass-through: forward raw video RTP to the RTSP server
@@ -377,7 +378,7 @@ class RtpReceiver:
         # instead of our invented timeline.
         rtp_ts = struct.unpack_from("!I", rtp, 4)[0]
 
-        nal_data = rtp[12:]  # Skip 12-byte RTP header
+        nal_data = rtp[payload_start:payload_end]
         if not nal_data:
             return
 
@@ -424,9 +425,8 @@ class RtpReceiver:
             self._queue_nal(self._current_fua_ts, bytes(self._current_fua_nal))
             self._current_fua_nal = bytearray()
 
-    def _process_audio_rtp(self, rtp: bytes, payload_type: int) -> None:
+    def _process_audio_rtp(self, audio_payload: bytes, payload_type: int) -> None:
         """Extract raw G.711 audio payload and push to RTSP fanout queue."""
-        audio_payload = rtp[12:]  # Skip 12-byte RTP header
         if not audio_payload:
             return
         self._audio_packet_count += 1
