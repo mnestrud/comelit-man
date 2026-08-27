@@ -202,10 +202,12 @@ All entities use `_attr_has_entity_name = True`. Entity IDs reflect the user-con
 | Entity | Description |
 |--------|-------------|
 | `button.<name>_<door_name>` | Press to open door/gate; stops video 10s after if active |
-| `event.<name>_doorbell` | Fires `doorbell_ring` and `missed_call` events |
+| `event.<name>_doorbell` | Fires `ring`, `missed_call`, and `door_opened` events |
 | `camera.<name>_live_feed` | Live video stream from intercom |
-| `button.<name>_start_video_feed` | Manually trigger video call |
-| `button.<name>_stop_video_feed` | Stop active video call |
+| `button.<name>_start_video_feed` | Manually trigger video call (disabled by default) |
+| `button.<name>_stop_video_feed` | Stop active video call (disabled by default) |
+| `button.<name>_answer_doorbell` | Answer an inbound call — starts two-way audio |
+| `image.<name>_last_ring_snapshot` | JPEG captured from video at the last ring |
 
 ---
 
@@ -227,7 +229,7 @@ Three code paths selected automatically by `coordinator.async_open_door`:
 - `rtp_receiver.py`: ICONA header → RTP → H.264 FU-A → PyAV → JPEG; PCMA audio routing
 - `rtsp_server.py`: H.264 over local RTSP (TCP interleaved); monotonic timestamps rebased across calls
 - **Persistent RTSP server** owned by coordinator — started at HA setup, never stopped between calls
-- **`_video_ready_event`** gates `stream_source()` and RTSP `PLAY` handler during CTPP handshake
+- **`_video_ready_event`** (coordinator) gates `camera.stream_source()` during CTPP handshake; RTSP `PLAY` responds immediately (the server's `_ready_event` only gates the audio silence keepalive)
 - **`_video_start_lock`** prevents concurrent `async_start_video` calls
 - RTCP Sender Reports every 5s for NTP/RTP sync
 - Inline re-establishment on CALL_END (~30s): ACK → refresh → no TCP reconnect
@@ -236,9 +238,10 @@ Three code paths selected automatically by `coordinator.async_open_door`:
 
 ## Audio Streaming
 
-- Audio does NOT auto-start — requires explicit "answer" sequence after video starts
+- Audio does NOT auto-start — requires an explicit answer after video starts
 - **Codec: PCMA G.711 A-law, PT=8, 20ms frames (160 bytes/frame)**
-- Answer sequence: `encode_answer_video_reconfig` → `encode_answer_peer` → `encode_answer_config_ack`
+- Inbound answer (`answer_inbound()`): `encode_answer_peer(inbound=True)` → `encode_call_accepted` → drain/ACK device responses → `start_audio_sender()`
+- Outbound calls: a single `0x1840/0x0070` peer/accept (`_send_answer_sequence`) after video flows; the device does not send PCMA on HA-initiated calls
 - Audio arrives on same UDP port as video, distinguished by RTP payload type (PT=8)
 
 ---
@@ -298,8 +301,8 @@ logger:
 
 ## Future Opportunities
 
-### Inbound call answer (complete)
-When a visitor presses the doorbell, the integration auto-answers via `_on_inbound_ring` → `async_start_inbound_video` (coordinator) → `VideoCallSession.start_inbound()` (video_call.py). An "Answer Doorbell" button entity triggers `answer_inbound()` for two-way audio. Live-tested on device 2026-05-30: 547 video frames + 676 audio frames received, 551 audio frames sent.
+### Inbound call answer (complete — passive video + Answer button)
+When a visitor presses the doorbell, the integration starts **passive** inbound video via `_on_inbound_ring` → `async_start_inbound_video` (coordinator) → `VideoCallSession.start_inbound()` (video_call.py). The call is NOT answered — other phones/intercoms keep ringing until the user acts. The "Answer Doorbell" button entity triggers `answer_inbound()` (peer/accept + `start_audio_sender()`) for two-way audio. Live-tested on device 2026-05-30: 547 video frames + 676 audio frames received, 551 audio frames sent.
 
 ### Face recognition via FRCG channel
 The device has a built-in face recognition pipeline. When a ring occurs, the device:
@@ -312,7 +315,7 @@ The device has a built-in face recognition pipeline. When a ring occurs, the dev
 The FRCG channel uses the same JSON-over-ICONA framing as UAUT/UCFG. The `rcg-detected-recognition` payload includes enough metadata (bounding box, existing similarity score) to know whether the device already matched the face against its own database.
 
 ### Full protocol reference
-See `memory/protocol_reference.md` for complete PCAP-derived wire format documentation (ICONA header, CTPP binary format, channel types, inbound/outbound call sequences, audio).
+A committed `docs/PROTOCOL.md` is planned (cherry-pick Phase 7) to replace the gitignored, no-longer-present `memory/protocol_reference.md`. Until then, the wire-format knowledge lives in `protocol.py` encoder docstrings and the sequence docs in `video_call.py`.
 
 ---
 
@@ -321,4 +324,4 @@ See `memory/protocol_reference.md` for complete PCAP-derived wire format documen
 - [Original fork source](https://github.com/antoiba86/hass-comelit-intercom-local) — antoiba86
 - [Protocol analysis Part 1](https://grdw.nl/2023/01/28/my-intercom-part-1.html) — grdw (reverse engineering ICONA)
 - [comelit-client](https://github.com/madchicken/comelit-client) — Pierpaolo Follia
-- `memory/protocol_reference.md` — full PCAP-derived protocol reference (this repo)
+- [simllll/hass-comelit-icona](https://github.com/simllll/hass-comelit-icona) — sibling fork; `docs/PROTOCOL.md` (6742W-verified), floor-call tag, backchannel SDP

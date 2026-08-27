@@ -170,11 +170,11 @@ class LocalRtspServer:
         self._feed_tasks: list[asyncio.Task[None]] = []
 
         # Gated by the coordinator: set when a video session is producing
-        # RTP, cleared during CTPP handshake and idle.  The PLAY handler
-        # awaits this event (with a short timeout) before responding 200
-        # OK, so HA's stream_worker stalls inside PLAY instead of erroring
-        # with "Stream ended; no additional packets" and taking a 10 s
-        # backoff when it reconnects into an in-flight handshake.
+        # RTP, cleared during CTPP handshake and idle.  PLAY responds
+        # immediately; this event only gates the audio feed loop's
+        # between-calls silence keepalive (real gating for stream start
+        # lives in the coordinator's _video_ready_event, consumed by
+        # camera.stream_source()).
         self._ready_event: asyncio.Event = asyncio.Event()
 
         # Set by _broadcast_rtp on the first packet of each call; cleared
@@ -885,85 +885,6 @@ class LocalRtspServer:
                 self._latest_pps = nal_data
             self._translate_video_ts(device_ts)
             self._send_h264(nal_data)
-
-    async def _video_feed_loop(self) -> None:
-        """Broadcast H.264 NALs to all registered clients.
-
-        Uses the device's own RTP timestamp directly — the rtp_receiver
-        extracts it from the RTP header and passes it through the queue.
-        On each new call the device restarts its timestamp from a low
-        value, which would look like a backwards jump to the persistent
-        HA stream worker; we detect that and adjust `_video_ts_offset` so
-        `output_ts = device_ts + offset` stays strictly monotonic and
-        preserves the device's exact inter-frame pacing.
-        """
-        try:
-            while self._running:
-                try:
-                    device_ts, nal = await asyncio.wait_for(self.nal_queue.get(), timeout=2.0)
-                except TimeoutError:
-                    continue
-
-                if nal[:4] == b"\x00\x00\x00\x01":
-                    nal_data = nal[4:]
-                elif nal[:3] == b"\x00\x00\x01":
-                    nal_data = nal[3:]
-                else:
-                    nal_data = nal
-
-                if not nal_data:
-                    continue
-
-                # Cache SPS/PPS for SDP sprop-parameter-sets.
-                nal_type = nal_data[0] & 0x1F
-                if nal_type == 7:
-                    self._latest_sps = nal_data
-                elif nal_type == 8:
-                    self._latest_pps = nal_data
-
-                # Translate device timestamp → output timestamp.
-                #
-                # Happy path (same call): output_ts = device_ts + offset.
-                # The device's 90 kHz clock increments naturally between
-                # frames so downstream sees the encoder's real pacing.
-                #
-                # Rebase triggers (recompute offset, then next output =
-                # previous _video_ts_out + 1):
-                #   1. First frame ever on this server instance.
-                #   2. reset() set `_video_ts_rebase_pending` because a
-                #      new call is starting — `_video_ts_out` has been
-                #      seeded from the audio clock for A/V alignment.
-                #   3. device_ts jumped backwards (device clock reset
-                #      mid-stream without our reset() being called).
-                if self._last_device_ts is None or self._video_ts_rebase_pending:
-                    self._video_ts_offset = (self._video_ts_out + 1 - device_ts) & 0xFFFFFFFF
-                    self._video_ts_rebase_pending = False
-                    _LOGGER.debug(
-                        "Video timestamp rebased (bootstrap): device_ts=0x%08X out=0x%08X offset=0x%08X",
-                        device_ts,
-                        self._video_ts_out + 1,
-                        self._video_ts_offset,
-                    )
-                else:
-                    forward = (device_ts - self._last_device_ts) & 0xFFFFFFFF
-                    if forward > 0x80000000:
-                        self._video_ts_offset = (self._video_ts_out + 1 - device_ts) & 0xFFFFFFFF
-                        _LOGGER.debug(
-                            "Video timestamp rebased (backward jump): device_ts=0x%08X out=0x%08X offset=0x%08X",
-                            device_ts,
-                            self._video_ts_out + 1,
-                            self._video_ts_offset,
-                        )
-
-                self._last_device_ts = device_ts
-                self._video_ts_out = (device_ts + self._video_ts_offset) & 0xFFFFFFFF
-
-                self._send_h264(nal_data)
-
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            _LOGGER.debug("Video feed loop error", exc_info=True)
 
     def _send_h264(self, nal_data: bytes) -> None:
         """Packetize one H.264 NAL unit and broadcast to all clients."""

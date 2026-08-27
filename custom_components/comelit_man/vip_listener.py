@@ -117,9 +117,10 @@ class VipEventListener:
         self._config = config
         self._callback = callback
         # init_ts is the LE32 counter the coordinator sent in encode_ctpp_init.
-        # All outgoing ACKs on this channel must use `init_ts + 0x01010000`
-        # (PCAP-verified: client never derives ACK ts from the device's
-        # renewal ts — using device_ts causes the device to reject the ACK).
+        # Renewal ACKs must use `init_ts + 0x01010000` (PCAP-verified: the
+        # client never derives a renewal ACK ts from the device's renewal ts —
+        # using device_ts causes the device to reject the ACK).  Event ACKs
+        # instead use _transform_device_ts(device_ts) — see _send_event_ack.
         self._init_ts = init_ts
         self._ack_ts = (init_ts + _CTR_INCR_BOTH) & 0xFFFFFFFF
         self._on_inbound_ring = on_inbound_ring
@@ -212,9 +213,7 @@ class VipEventListener:
         # 0x1860/0x0003 (door_opened) retransmits are also expected — we intentionally
         # don't ACK door_opened, so the device retransmits briefly then stops.
         _is_video_tail = prefix == PREFIX_VIDEO_EVENT
-        _is_expected_retransmit = _is_video_tail or (
-            prefix == PREFIX_VIP_EVENT and action == ACTION_DOOR_OPENED
-        )
+        _is_expected_retransmit = _is_video_tail or (prefix == PREFIX_VIP_EVENT and action == ACTION_DOOR_OPENED)
         if is_retransmit:
             if _is_expected_retransmit:
                 _LOGGER.debug(
@@ -393,7 +392,7 @@ class VipEventListener:
                 ring_ts,
             )
             if self._on_inbound_ring is not None:
-                # Coordinator handles doorbell_ring after video is ready
+                # Coordinator fires the ring event after video is ready
                 try:
                     self._on_inbound_ring(entrance_addr, ring_ts)
                 except Exception:

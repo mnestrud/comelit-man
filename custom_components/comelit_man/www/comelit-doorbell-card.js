@@ -4,8 +4,9 @@
  * Idle:     Camera thumbnail with a doorbell icon overlay.
  * Ringing:  Live video + pulsing icon overlay + "Answer" / "Dismiss" buttons.
  *           Auto-dismisses after `dismiss_after` seconds (default 30).
- *           Video starts automatically via the integration's auto-answer sequence.
- * Answered: Live video + stop button only. Answer pressed two-way audio.
+ *           Video starts automatically (passive inbound — the call is not
+ *           answered; other stations keep ringing until Answer is pressed).
+ * Answered: Live video + stop button only. Answer starts two-way audio.
  *
  * Install:
  *   The Lovelace resource is registered automatically on HA startup.
@@ -138,7 +139,7 @@ class ComelitDoorbellCard extends HTMLElement {
     this._state = "answered";
     this._updateView();
 
-    // Audio only — video is already streaming via auto-answer
+    // Audio only — passive video is already streaming from the ring
     if (this._config.answer_entity) {
       this._hass.callService("button", "press", {
         entity_id: this._config.answer_entity,

@@ -491,10 +491,11 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         )
 
     async def async_start_inbound_video(self, entrance_addr: str, ring_ts: int) -> None:
-        """Answer a device-initiated ring: run inbound signaling and start video.
+        """Start passive video for a device-initiated ring (does not answer).
 
-        On success, fires doorbell_ring after video is ready so automations
-        see the camera stream already flowing when the event triggers.
+        On success, fires the ring event after video is ready so automations
+        see the camera stream already flowing when the event triggers. Other
+        stations keep ringing until answer_inbound() runs (Answer button).
         On failure, fires missed_call and restores the VIP listener.
         """
         if not self._config:
