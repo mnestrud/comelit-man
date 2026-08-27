@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import struct
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -173,6 +174,7 @@ class TestCtppMonitorLoop:
         session._ctpp_lock = asyncio.Lock()
         session._call_counter = 0
         session._answer_handoff = None
+        session._on_ring = None
         return session
 
     @pytest.mark.asyncio
@@ -913,6 +915,7 @@ class TestCtppMonitorLoopRarePaths:
         session._ctpp_lock = asyncio.Lock()
         session._call_counter = 0
         session._answer_handoff = None
+        session._on_ring = None
         session._on_call_end = on_call_end
         return session
 
@@ -1546,6 +1549,7 @@ class TestStartInbound:
         session._on_timeout = None
         session._inbound_device_rtpc = None
         session._answer_handoff = None
+        session._on_ring = None
         return session
 
     @pytest.mark.asyncio
@@ -1674,6 +1678,7 @@ class TestAnswerInbound:
         session._call_counter = 0x00100000
         session._inbound_device_rtpc = inbound_device_rtpc
         session._answer_handoff = None
+        session._on_ring = None
         return session, mock_client, mock_receiver, ctpp_ch, inbound_device_rtpc
 
     @pytest.mark.asyncio
@@ -1765,3 +1770,137 @@ class TestAnswerInbound:
         await inject_task
 
         mock_receiver.start_audio_sender.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _forward_ring — mid-call ring forwarding (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+class TestForwardRing:
+    def _make_session(self, on_ring=None) -> VideoCallSession:
+        session = VideoCallSession.__new__(VideoCallSession)
+        session._active = True
+        session._client = None
+        session._rtp_receiver = None
+        session._rtsp_server = None
+        session._external_rtsp = False
+        session._ctpp_lock = asyncio.Lock()
+        session._call_counter = 0
+        session._answer_handoff = None
+        session._on_ring = on_ring
+        return session
+
+    @staticmethod
+    def _ring_frame(ring_ts: int = 0x27EEAB1C, addresses: tuple[str, ...] = ("SB100001", "SB000003")) -> bytes:
+        buf = bytearray()
+        buf += struct.pack("<H", 0x18C0)
+        buf += struct.pack("<I", ring_ts)
+        buf += struct.pack(">H", 0x0028)
+        buf += struct.pack(">H", 0x0001)
+        buf += b"\xff\xff\xff\xff"
+        for addr in addresses:
+            buf += addr.encode("ascii") + b"\x00"
+        return bytes(buf)
+
+    def test_forwards_entrance_and_ring_ts(self):
+        rings = []
+        session = self._make_session(on_ring=lambda addr, ts: rings.append((addr, ts)))
+        session._forward_ring(self._ring_frame())
+        assert rings == [("SB100001", 0x27EEAB1C)]
+
+    def test_no_callback_is_noop(self):
+        session = self._make_session(on_ring=None)
+        session._forward_ring(self._ring_frame())  # must not raise
+
+    def test_unparseable_frame_ignored(self):
+        rings = []
+        session = self._make_session(on_ring=lambda addr, ts: rings.append((addr, ts)))
+        session._forward_ring(b"\x00\x01")
+        assert rings == []
+
+    def test_no_addresses_forwards_empty_entrance(self):
+        rings = []
+        session = self._make_session(on_ring=lambda addr, ts: rings.append((addr, ts)))
+        session._forward_ring(self._ring_frame(addresses=()))
+        assert rings == [("", 0x27EEAB1C)]
+
+    def test_callback_exception_swallowed(self):
+        def boom(addr, ts):
+            raise RuntimeError("boom")
+
+        session = self._make_session(on_ring=boom)
+        session._forward_ring(self._ring_frame())  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_monitor_forwards_18c0_without_ack(self):
+        """0x18C0 in the monitor loop forwards the ring and sends NO ACK."""
+        rings = []
+        session = self._make_session(on_ring=lambda addr, ts: rings.append((addr, ts)))
+
+        sent_data: list[bytes] = []
+        mock_client = MagicMock()
+        mock_client.send_binary = AsyncMock(side_effect=lambda ch, data: sent_data.append(data))
+        frames = [self._ring_frame()]
+
+        async def mock_read_response(channel):
+            if frames:
+                return frames.pop(0)
+            session._active = False
+            return b""
+
+        mock_client.read_response = mock_read_response
+
+        await session._ctpp_monitor_loop(
+            mock_client,
+            MagicMock(),
+            "SB0000031",
+            "SB100001",
+            0x10000000,
+            rtpc1_server_id=0xABCD,
+            media_req_id=0x1234,
+        )
+
+        assert rings == [("SB100001", 0x27EEAB1C)]
+        assert sent_data == []  # no ACK for the new ring
+
+    @pytest.mark.asyncio
+    async def test_monitor_forwards_1860_in_alerting_and_still_acks(self):
+        """0x1860/0x0001 (IN_ALERTING) forwards the ring AND keeps its normal ACK."""
+        rings = []
+        session = self._make_session(on_ring=lambda addr, ts: rings.append((addr, ts)))
+
+        buf = bytearray()
+        buf += struct.pack("<H", 0x1860)
+        buf += struct.pack("<I", 0x11223344)
+        buf += struct.pack(">H", 0x0001)
+        buf += struct.pack(">H", 0x0000)
+        buf += b"\xff\xff\xff\xff"
+        buf += b"SB100001\x00"
+
+        sent_data: list[bytes] = []
+        mock_client = MagicMock()
+        mock_client.send_binary = AsyncMock(side_effect=lambda ch, data: sent_data.append(data))
+        frames = [bytes(buf)]
+
+        async def mock_read_response(channel):
+            if frames:
+                return frames.pop(0)
+            session._active = False
+            return b""
+
+        mock_client.read_response = mock_read_response
+
+        await session._ctpp_monitor_loop(
+            mock_client,
+            MagicMock(),
+            "SB0000031",
+            "SB100001",
+            0x10000000,
+            rtpc1_server_id=0xABCD,
+            media_req_id=0x1234,
+        )
+
+        assert rings == [("SB100001", 0x11223344)]
+        assert len(sent_data) == 1  # existing transform ACK unchanged
+        assert struct.unpack_from("<H", sent_data[0], 0)[0] == 0x1800

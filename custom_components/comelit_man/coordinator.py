@@ -436,6 +436,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 rtsp_server=self._rtsp_server,
                 on_call_end=self._on_video_call_end,
                 on_timeout=self._on_video_call_end,
+                on_ring=self._on_ring_during_video,
             )
             # Publish the session ONLY after start() has completed its
             # readiness gate (first real NAL queued).  Publishing earlier
@@ -521,6 +522,37 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             "comelit-inbound-video",
         )
 
+    def _on_ring_during_video(self, entrance_addr: str, ring_ts: int) -> None:
+        """Ring forwarded by the video session's CTPP monitor (listener stopped).
+
+        Fires the ring event without touching the running session — passive
+        behavior: video keeps flowing, other stations keep ringing. Shares
+        the (entrance, ring_ts) dedup with _on_inbound_ring so device
+        retransmits fire at most once.
+        """
+        now = time.monotonic()
+        key = (entrance_addr, ring_ts)
+        seen = self._recent_rings.get(key)
+        if seen is not None and now - seen < RING_DEDUP_WINDOW:
+            return
+        self._recent_rings[key] = now
+        self._last_ring_mono = now
+        self._inbound_answered = False
+        # Video is already flowing, so a warm frame makes the snapshot free.
+        session = self._video_session
+        if session is not None and session.rtp_receiver is not None:
+            frame = session.rtp_receiver.latest_frame
+            if frame is not None:
+                self._last_ring_snapshot = frame
+        _LOGGER.info("Ring during active video (entrance=%s ring_ts=0x%08X)", entrance_addr, ring_ts)
+        self._on_push_event(
+            PushEvent(
+                event_type="ring",
+                apt_address=entrance_addr,
+                timestamp=time.time(),
+            )
+        )
+
     def _on_call_idle(self, addresses: list[str]) -> None:
         """Called by VIP listener on a device 0x1840/0x0000 (idle) frame.
 
@@ -577,6 +609,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 rtsp_server=self._rtsp_server,
                 on_call_end=self._on_video_call_end,
                 on_timeout=self._on_video_call_end,
+                on_ring=self._on_ring_during_video,
             )
             try:
                 renewal_ack_ts = (self._ctpp_init_ts + _CTR_INCR_BOTH) & 0xFFFFFFFF

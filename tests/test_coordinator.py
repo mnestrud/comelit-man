@@ -1423,3 +1423,67 @@ class TestOnCallIdle:
         await coord.async_answer_inbound()
         session.answer_inbound.assert_awaited_once()
         assert coord._inbound_answered is True
+
+
+# ---------------------------------------------------------------------------
+# _on_ring_during_video (Phase 2: mid-call ring event)
+# ---------------------------------------------------------------------------
+
+
+class TestOnRingDuringVideo:
+    def _coord_with_events(self):
+        coord = _make_coordinator()
+        events = []
+        coord._push_callbacks[events.append] = None
+        return coord, events
+
+    def test_fires_ring_event(self):
+        coord, events = self._coord_with_events()
+        coord._on_ring_during_video("SB100001", 0x27EEAB1C)
+        assert len(events) == 1
+        assert events[0].event_type == "ring"
+        assert events[0].apt_address == "SB100001"
+
+    def test_retransmit_deduped(self):
+        coord, events = self._coord_with_events()
+        coord._on_ring_during_video("SB100001", 0x27EEAB1C)
+        coord._on_ring_during_video("SB100001", 0x27EEAB1C)
+        assert len(events) == 1
+
+    def test_shares_dedup_with_inbound_ring(self):
+        """A ring already handled by _on_inbound_ring is not re-fired mid-call."""
+        coord, events = self._coord_with_events()
+        coord._on_inbound_ring("SB100001", 0x27EEAB1C)
+        coord._on_ring_during_video("SB100001", 0x27EEAB1C)
+        assert events == []  # inbound path fires its event later, after video is ready
+
+    def test_records_ring_recency_and_clears_answered(self):
+        coord, events = self._coord_with_events()
+        coord._inbound_answered = True
+        coord._on_ring_during_video("SB100001", 0x27EEAB1C)
+        assert coord._last_ring_mono is not None
+        assert coord._inbound_answered is False
+
+    def test_warm_frame_updates_snapshot(self):
+        coord, events = self._coord_with_events()
+        session = MagicMock()
+        session.rtp_receiver.latest_frame = b"\xff\xd8warm"
+        coord._video_session = session
+        coord._on_ring_during_video("SB100001", 0x27EEAB1C)
+        assert coord._last_ring_snapshot == b"\xff\xd8warm"
+
+    def test_no_frame_leaves_snapshot(self):
+        coord, events = self._coord_with_events()
+        coord._last_ring_snapshot = b"\xff\xd8old"
+        session = MagicMock()
+        session.rtp_receiver.latest_frame = None
+        coord._video_session = session
+        coord._on_ring_during_video("SB100001", 0x27EEAB1C)
+        assert coord._last_ring_snapshot == b"\xff\xd8old"
+
+    def test_no_session_still_fires(self):
+        """Session may have just torn down — event still fires."""
+        coord, events = self._coord_with_events()
+        coord._video_session = None
+        coord._on_ring_during_video("SB100001", 0x27EEAB1C)
+        assert len(events) == 1
