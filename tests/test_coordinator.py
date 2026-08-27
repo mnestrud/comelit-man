@@ -78,6 +78,7 @@ def _make_coordinator(*, with_client: bool = False) -> ComelitLocalCoordinator:
     coordinator._recent_rings = {}
     coordinator._last_ring_mono = None
     coordinator._inbound_answered = False
+    coordinator._pending_inbound_ring = None
     coordinator.async_request_refresh = AsyncMock()
     coordinator.async_set_updated_data = MagicMock()
     coordinator.logger = MagicMock()
@@ -1487,3 +1488,79 @@ class TestOnRingDuringVideo:
         coord._video_session = None
         coord._on_ring_during_video("SB100001", 0x27EEAB1C)
         assert len(events) == 1
+
+
+# ---------------------------------------------------------------------------
+# Outcome-based missed call (passive session ends unanswered)
+# ---------------------------------------------------------------------------
+
+
+class TestOutcomeMissedCall:
+    def _coord_with_events(self):
+        coord = _make_coordinator()
+        events = []
+        coord._push_callbacks[events.append] = None
+        mock_session = MagicMock()
+        mock_session.stop = AsyncMock()
+        coord._video_session = mock_session
+        return coord, events
+
+    @pytest.mark.asyncio
+    async def test_unanswered_session_end_fires_missed_call(self):
+        coord, events = self._coord_with_events()
+        coord._pending_inbound_ring = "SB100001"
+        coord._inbound_answered = False
+
+        await coord.async_stop_video()
+
+        assert [e.event_type for e in events] == ["missed_call"]
+        assert events[0].apt_address == "SB100001"
+        assert coord._pending_inbound_ring is None
+
+    @pytest.mark.asyncio
+    async def test_answered_session_end_no_missed_call(self):
+        coord, events = self._coord_with_events()
+        coord._pending_inbound_ring = None  # cleared by async_answer_inbound
+        coord._inbound_answered = True
+
+        await coord.async_stop_video()
+
+        assert events == []
+
+    @pytest.mark.asyncio
+    async def test_outbound_session_end_no_missed_call(self):
+        """User-initiated video (no pending ring) never fires missed_call."""
+        coord, events = self._coord_with_events()
+
+        await coord.async_stop_video()
+
+        assert events == []
+
+    @pytest.mark.asyncio
+    async def test_second_stop_does_not_refire(self):
+        coord, events = self._coord_with_events()
+        coord._pending_inbound_ring = "SB100001"
+
+        await coord.async_stop_video()
+        # a second stop with no session is a no-op
+        await coord.async_stop_video()
+
+        assert len(events) == 1
+
+    @pytest.mark.asyncio
+    async def test_answer_clears_pending_ring(self):
+        coord, events = self._coord_with_events()
+        coord._pending_inbound_ring = "SB100001"
+        coord._video_session.active = True
+        coord._video_session.answer_inbound = AsyncMock()
+
+        await coord.async_answer_inbound()
+
+        assert coord._pending_inbound_ring is None
+        assert coord._inbound_answered is True
+
+    def test_mid_call_ring_sets_pending(self):
+        coord, events = self._coord_with_events()
+        coord._video_session.rtp_receiver = None
+        coord._on_ring_during_video("SB100001", 0x27EEAB1C)
+        assert coord._pending_inbound_ring == "SB100001"

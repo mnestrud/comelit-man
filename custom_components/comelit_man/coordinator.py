@@ -101,6 +101,12 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         self._recent_rings: dict[tuple[str, int], float] = {}
         self._last_ring_mono: float | None = None
         self._inbound_answered: bool = False
+        # Caller of the passive inbound session's ring; when the session
+        # ends with _inbound_answered still False, missed_call fires
+        # (outcome-based — the device-signal path in _on_call_idle can't
+        # cover the standard flow because passive video holds the CTPP
+        # channel far past the 45s window).
+        self._pending_inbound_ring: str | None = None
         # Use an insertion-ordered dict to track callbacks (value is always None).
         # This avoids ValueError on removal and preserves iteration order.
         self._push_callbacks: dict[Callable[[PushEvent], None], None] = {}
@@ -538,6 +544,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         self._recent_rings[key] = now
         self._last_ring_mono = now
         self._inbound_answered = False
+        self._pending_inbound_ring = entrance_addr
         # Video is already flowing, so a warm frame makes the snapshot free.
         session = self._video_session
         if session is not None and session.rtp_receiver is not None:
@@ -646,6 +653,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 if snapshot is not None:
                     self._last_ring_snapshot = snapshot
             # Fire ring AFTER video is flowing so automations see the stream
+            self._pending_inbound_ring = entrance_addr
             self._on_push_event(
                 PushEvent(
                     event_type="ring",
@@ -660,6 +668,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         if self._video_session and self._video_session.active:
             await self._video_session.answer_inbound()
             self._inbound_answered = True
+            self._pending_inbound_ring = None
 
     async def _register_go2rtc_stream(self) -> None:
         """Register our RTSP stream with go2rtc, enabling backchannel support.
@@ -795,6 +804,22 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             return
         self._video_session = None
         self._video_ready_event.clear()
+
+        # Outcome-based missed call: a passive inbound session is ending and
+        # the Answer button was never pressed — the call was missed. Fires
+        # here because every session teardown path (timeout, auto-restart,
+        # user stop, replacement by a new ring) funnels through this method.
+        pending = self._pending_inbound_ring
+        self._pending_inbound_ring = None
+        if pending is not None and not self._inbound_answered:
+            _LOGGER.info("Missed call: passive session ended unanswered (caller=%s)", pending)
+            self._on_push_event(
+                PushEvent(
+                    event_type="missed_call",
+                    apt_address=pending,
+                    timestamp=time.time(),
+                )
+            )
 
         # Tear HA's Stream worker down gracefully FIRST, before any
         # forced RTSP client disconnect.  Stream.stop() joins the
