@@ -38,6 +38,13 @@ _LOGGER = logging.getLogger(__name__)
 
 UPDATE_INTERVAL = timedelta(seconds=30)
 
+# Retransmits of the same 0x18C0 ring carry the same ring_ts; a genuine new
+# ring gets a fresh ts, so exact-key dedup never suppresses a real ring.
+RING_DEDUP_WINDOW = 120.0
+# A device 0x1840/0x0000 (idle) counts as a missed call only when it follows
+# a ring this recently; otherwise it is video-teardown / CTPP-init tail.
+MISSED_CALL_WINDOW = 45.0
+
 
 class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
     """Coordinator that manages the persistent connection and push notifications."""
@@ -87,6 +94,13 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         # Last JPEG snapshot captured when passive inbound video started.
         # Set before the ring event fires; never overwritten by outbound video.
         self._last_ring_snapshot: bytes | None = None
+        # Ring dedup + missed-call state.  Lives here (not in the VIP
+        # listener) because the listener is recreated after every video
+        # session — listener-local state would be wiped while the device
+        # is still retransmitting the ring.
+        self._recent_rings: dict[tuple[str, int], float] = {}
+        self._last_ring_mono: float | None = None
+        self._inbound_answered: bool = False
         # Use an insertion-ordered dict to track callbacks (value is always None).
         # This avoids ValueError on removal and preserves iteration order.
         self._push_callbacks: dict[Callable[[PushEvent], None], None] = {}
@@ -174,6 +188,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                     self._on_push_event,
                     init_ts=init_ts,
                     on_inbound_ring=self._on_inbound_ring,
+                    on_call_idle=self._on_call_idle,
                 )
                 await vip.start()
                 self._vip_listener = vip
@@ -252,6 +267,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                     self._on_push_event,
                     init_ts=init_ts,
                     on_inbound_ring=self._on_inbound_ring,
+                    on_call_idle=self._on_call_idle,
                 )
                 await vip.start()
                 self._vip_listener = vip
@@ -480,14 +496,53 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
     def _on_inbound_ring(self, entrance_addr: str, ring_ts: int) -> None:
         """Called by VIP listener when device initiates a ring (PREFIX_CALL_INIT).
 
-        Schedules async_start_inbound_video as a background task so the
-        full 20-step answer sequence runs without blocking the VIP listener loop.
+        Dedups device retransmits by (entrance, ring_ts), then schedules
+        async_start_inbound_video as a background task so the inbound
+        signaling sequence runs without blocking the VIP listener loop.
         """
+        now = time.monotonic()
+        key = (entrance_addr, ring_ts)
+        seen = self._recent_rings.get(key)
+        if seen is not None and now - seen < RING_DEDUP_WINDOW:
+            _LOGGER.debug(
+                "Inbound ring retransmit ignored (entrance=%s ring_ts=0x%08X)",
+                entrance_addr,
+                ring_ts,
+            )
+            return
+        self._recent_rings = {k: t for k, t in self._recent_rings.items() if now - t < RING_DEDUP_WINDOW}
+        self._recent_rings[key] = now
+        self._last_ring_mono = now
+        self._inbound_answered = False
         _LOGGER.debug("Inbound ring: entrance=%s ring_ts=0x%08X", entrance_addr, ring_ts)
         self.config_entry.async_create_background_task(  # type: ignore[union-attr]
             self.hass,
             self.async_start_inbound_video(entrance_addr, ring_ts),
             "comelit-inbound-video",
+        )
+
+    def _on_call_idle(self, addresses: list[str]) -> None:
+        """Called by VIP listener on a device 0x1840/0x0000 (idle) frame.
+
+        Fires missed_call only when the frame follows a recent unanswered
+        ring and no video session is running — the same frame also arrives
+        as a video-teardown tail and at CTPP init after a device reboot.
+        """
+        if self._video_session is not None:
+            return
+        if self._inbound_answered:
+            return
+        if self._last_ring_mono is None or time.monotonic() - self._last_ring_mono > MISSED_CALL_WINDOW:
+            return
+        self._last_ring_mono = None
+        caller = addresses[0] if addresses else ""
+        _LOGGER.info("Missed call detected (caller=%s)", caller)
+        self._on_push_event(
+            PushEvent(
+                event_type="missed_call",
+                apt_address=caller,
+                timestamp=time.time(),
+            )
         )
 
     async def async_start_inbound_video(self, entrance_addr: str, ring_ts: int) -> None:
@@ -528,6 +583,9 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 await session.start_inbound(entrance_addr, ring_ts, renewal_ack_ts=renewal_ack_ts)
             except Exception:
                 _LOGGER.warning("Inbound call answer failed", exc_info=True)
+                # This path fires its own missed_call — clear the ring
+                # recency so a later device idle frame doesn't double-fire.
+                self._last_ring_mono = None
                 self._on_push_event(
                     PushEvent(
                         event_type="missed_call",
@@ -568,6 +626,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         """Answer an active passive inbound call — send answer signals, start audio."""
         if self._video_session and self._video_session.active:
             await self._video_session.answer_inbound()
+            self._inbound_answered = True
 
     async def _register_go2rtc_stream(self) -> None:
         """Register our RTSP stream with go2rtc, enabling backchannel support.
@@ -681,6 +740,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 self._on_push_event,
                 init_ts=self._ctpp_init_ts,
                 on_inbound_ring=self._on_inbound_ring,
+                on_call_idle=self._on_call_idle,
             )
             await vip.start()
             self._vip_listener = vip

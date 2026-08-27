@@ -74,6 +74,10 @@ def _make_coordinator(*, with_client: bool = False) -> ComelitLocalCoordinator:
     coordinator._keepalive_task = None
     coordinator._connection_lost = False
     coordinator._ctpp_init_ts = 0
+    coordinator._last_ring_snapshot = None
+    coordinator._recent_rings = {}
+    coordinator._last_ring_mono = None
+    coordinator._inbound_answered = False
     coordinator.async_request_refresh = AsyncMock()
     coordinator.async_set_updated_data = MagicMock()
     coordinator.logger = MagicMock()
@@ -1292,3 +1296,130 @@ class TestGo2RtcRegistration:
         with patch("custom_components.comelit_man.coordinator.aiohttp.ClientSession") as mock_cls:
             await coord._register_go2rtc_stream()
         mock_cls.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _on_inbound_ring dedup (Phase 1: ring retransmit suppression)
+# ---------------------------------------------------------------------------
+
+
+class TestInboundRingDedup:
+    def test_first_ring_schedules_task(self):
+        coord = _make_coordinator()
+        coord._on_inbound_ring("SB100001", 0x12345678)
+        assert coord.config_entry.async_create_background_task.call_count == 1
+
+    def test_retransmit_same_key_ignored(self):
+        """Same (entrance, ring_ts) within the window schedules only once."""
+        coord = _make_coordinator()
+        coord._on_inbound_ring("SB100001", 0x12345678)
+        coord._on_inbound_ring("SB100001", 0x12345678)
+        coord._on_inbound_ring("SB100001", 0x12345678)
+        assert coord.config_entry.async_create_background_task.call_count == 1
+
+    def test_new_ring_ts_not_deduped(self):
+        """A genuine new ring (fresh ring_ts) is never suppressed."""
+        coord = _make_coordinator()
+        coord._on_inbound_ring("SB100001", 0x12345678)
+        coord._on_inbound_ring("SB100001", 0x12345679)
+        assert coord.config_entry.async_create_background_task.call_count == 2
+
+    def test_different_entrance_not_deduped(self):
+        coord = _make_coordinator()
+        coord._on_inbound_ring("SB100001", 0x12345678)
+        coord._on_inbound_ring("SB100002", 0x12345678)
+        assert coord.config_entry.async_create_background_task.call_count == 2
+
+    def test_retransmit_after_window_allowed(self):
+        """The same key is accepted again once the dedup window has passed."""
+        coord = _make_coordinator()
+        coord._on_inbound_ring("SB100001", 0x12345678)
+        key = ("SB100001", 0x12345678)
+        coord._recent_rings[key] -= 121.0  # age the entry past RING_DEDUP_WINDOW
+        coord._on_inbound_ring("SB100001", 0x12345678)
+        assert coord.config_entry.async_create_background_task.call_count == 2
+
+    def test_stale_entries_pruned(self):
+        coord = _make_coordinator()
+        coord._recent_rings[("SB100009", 0x1)] = -1000.0
+        coord._on_inbound_ring("SB100001", 0x12345678)
+        assert ("SB100009", 0x1) not in coord._recent_rings
+
+    def test_ring_records_recency_and_clears_answered(self):
+        coord = _make_coordinator()
+        coord._inbound_answered = True
+        coord._on_inbound_ring("SB100001", 0x12345678)
+        assert coord._last_ring_mono is not None
+        assert coord._inbound_answered is False
+
+
+# ---------------------------------------------------------------------------
+# _on_call_idle (Phase 1: device-signal missed-call detection)
+# ---------------------------------------------------------------------------
+
+
+class TestOnCallIdle:
+    def _coord_with_events(self):
+        import time as _time
+
+        coord = _make_coordinator()
+        events = []
+        coord._push_callbacks[events.append] = None
+        coord._last_ring_mono = _time.monotonic()
+        return coord, events
+
+    def test_recent_unanswered_ring_fires_missed_call(self):
+        coord, events = self._coord_with_events()
+        coord._on_call_idle(["SB100001", "SB000006"])
+        assert len(events) == 1
+        assert events[0].event_type == "missed_call"
+        assert events[0].apt_address == "SB100001"
+
+    def test_no_recent_ring_ignored(self):
+        coord, events = self._coord_with_events()
+        coord._last_ring_mono = None
+        coord._on_call_idle(["SB100001"])
+        assert events == []
+
+    def test_stale_ring_ignored(self):
+        coord, events = self._coord_with_events()
+        coord._last_ring_mono -= 46.0  # older than MISSED_CALL_WINDOW
+        coord._on_call_idle(["SB100001"])
+        assert events == []
+
+    def test_active_video_session_ignored(self):
+        """The same frame arrives as a video-teardown tail — must not fire."""
+        coord, events = self._coord_with_events()
+        coord._video_session = MagicMock()
+        coord._on_call_idle(["SB100001"])
+        assert events == []
+
+    def test_answered_ring_ignored(self):
+        coord, events = self._coord_with_events()
+        coord._inbound_answered = True
+        coord._on_call_idle(["SB100001"])
+        assert events == []
+
+    def test_second_idle_frame_does_not_double_fire(self):
+        """Recency is cleared on fire so a retransmitted idle frame is a no-op."""
+        coord, events = self._coord_with_events()
+        coord._on_call_idle(["SB100001"])
+        coord._on_call_idle(["SB100001"])
+        assert len(events) == 1
+
+    def test_empty_addresses_uses_blank_caller(self):
+        coord, events = self._coord_with_events()
+        coord._on_call_idle([])
+        assert len(events) == 1
+        assert events[0].apt_address == ""
+
+    @pytest.mark.asyncio
+    async def test_answer_inbound_sets_answered_flag(self):
+        coord = _make_coordinator()
+        session = MagicMock()
+        session.active = True
+        session.answer_inbound = AsyncMock()
+        coord._video_session = session
+        await coord.async_answer_inbound()
+        session.answer_inbound.assert_awaited_once()
+        assert coord._inbound_answered is True

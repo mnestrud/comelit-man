@@ -64,12 +64,20 @@ def _make_listener(
     apt_subaddress: int = 1,
     init_ts: int = 0x12000000,
     on_inbound_ring=None,
+    on_call_idle=None,
 ) -> VipEventListener:
     client = MagicMock()
     client.send_binary = AsyncMock()
     config = _make_config(apt_address, apt_subaddress)
     cb = callback or MagicMock()
-    listener = VipEventListener(client, config, cb, init_ts=init_ts, on_inbound_ring=on_inbound_ring)
+    listener = VipEventListener(
+        client,
+        config,
+        cb,
+        init_ts=init_ts,
+        on_inbound_ring=on_inbound_ring,
+        on_call_idle=on_call_idle,
+    )
     # Attach a fake open channel so send_binary works
     listener._channel = MagicMock()
     listener._channel.response_queue = asyncio.Queue()
@@ -861,3 +869,67 @@ class TestHandleVipEventExtraPaths:
         }
         listener._handle_vip_event(msg)
         cb.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# on_call_idle dispatch (Phase 1: missed-call signal forwarding)
+# ---------------------------------------------------------------------------
+
+
+class TestOnCallIdleDispatch:
+    def test_idle_frame_invokes_callback_with_addresses(self):
+        """0x1840/0x0000 goes to on_call_idle with the parsed address list."""
+        idle_calls = []
+        listener = _make_listener(on_call_idle=idle_calls.append)
+        msg = parse_ctpp_message(
+            _make_ctpp_msg(PREFIX_VIDEO_EVENT, 0x1000, ACTION_IDLE, flags=0, addresses=["SB100001", "SB000006"])
+        )
+        listener._handle_vip_event(msg)
+        assert idle_calls == [["SB100001", "SB000006"]]
+
+    def test_idle_frame_without_callback_logs_only(self):
+        """No on_call_idle configured — frame falls through to the log path."""
+        cb = MagicMock()
+        listener = _make_listener(callback=cb)
+        msg = parse_ctpp_message(_make_ctpp_msg(PREFIX_VIDEO_EVENT, 0x1000, ACTION_IDLE, flags=0))
+        listener._handle_vip_event(msg)  # must not raise
+        cb.assert_not_called()
+
+    def test_non_idle_video_event_not_forwarded(self):
+        """Other 0x1840 actions (codec etc.) do not hit on_call_idle."""
+        idle_calls = []
+        listener = _make_listener(on_call_idle=idle_calls.append)
+        msg = parse_ctpp_message(_make_ctpp_msg(PREFIX_VIDEO_EVENT, 0x1000, 0x0008, flags=0))
+        listener._handle_vip_event(msg)
+        assert idle_calls == []
+
+    def test_vip_idle_not_forwarded(self):
+        """0x1860 with action 0 is not a video-idle frame — not forwarded."""
+        idle_calls = []
+        listener = _make_listener(on_call_idle=idle_calls.append)
+        msg = parse_ctpp_message(_make_ctpp_msg(PREFIX_VIP_EVENT, 0x1000, ACTION_IDLE, flags=0))
+        listener._handle_vip_event(msg)
+        assert idle_calls == []
+
+    def test_callback_exception_swallowed(self):
+        """An exception inside on_call_idle is logged, not raised."""
+
+        def boom(addresses):
+            raise RuntimeError("boom")
+
+        listener = _make_listener(on_call_idle=boom)
+        msg = parse_ctpp_message(_make_ctpp_msg(PREFIX_VIDEO_EVENT, 0x1000, ACTION_IDLE, flags=0))
+        listener._handle_vip_event(msg)  # must not raise
+
+    def test_ring_event_not_affected(self):
+        """CALL_INIT still goes to on_inbound_ring, untouched by on_call_idle."""
+        rings = []
+        idle_calls = []
+        listener = _make_listener(
+            on_inbound_ring=lambda addr, ts: rings.append((addr, ts)),
+            on_call_idle=idle_calls.append,
+        )
+        msg = parse_ctpp_message(_make_ctpp_msg(PREFIX_CALL_INIT, 0x2000, 0x0028, flags=0, addresses=["SB100001"]))
+        listener._handle_vip_event(msg)
+        assert rings == [("SB100001", 0x2000)]
+        assert idle_calls == []

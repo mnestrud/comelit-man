@@ -112,6 +112,7 @@ class VipEventListener:
         callback: Callable[[PushEvent], None],
         init_ts: int,
         on_inbound_ring: Callable[[str, int], None] | None = None,
+        on_call_idle: Callable[[list[str]], None] | None = None,
     ) -> None:
         self._client = client
         self._config = config
@@ -124,6 +125,9 @@ class VipEventListener:
         self._init_ts = init_ts
         self._ack_ts = (init_ts + _CTR_INCR_BOTH) & 0xFFFFFFFF
         self._on_inbound_ring = on_inbound_ring
+        # Invoked on 0x1840/0x0000 (idle) frames; the coordinator gates
+        # these into missed_call events (recent unanswered ring, no video).
+        self._on_call_idle = on_call_idle
         self._task: asyncio.Task[None] | None = None
         # Timestamp of the last fired event per type — used to deduplicate
         # repeated transmissions (device retransmits call init every ~1-2s).
@@ -431,8 +435,19 @@ class VipEventListener:
                 _LOGGER.debug("VIP FSM event ignored (unknown action=0x%04X)", action)
             return
 
-        # 0x1840 events are call-related but may be codec negotiation, config
-        # acks, etc. Only log them for now — don't fire events.
+        # 0x1840/0x0000 (idle) is the device's ring-timeout / call-teardown
+        # signal. The coordinator decides whether it means a missed call
+        # (recent unanswered ring, no active video) — state that must
+        # survive listener recreation lives there, not here.
+        if prefix == PREFIX_VIDEO_EVENT and action == ACTION_IDLE and self._on_call_idle is not None:
+            try:
+                self._on_call_idle(addresses)
+            except Exception:
+                _LOGGER.exception("Error in call-idle callback")
+            return
+
+        # Other 0x1840 events are call-related but may be codec negotiation,
+        # config acks, etc. Only log them — don't fire events.
         _LOGGER.debug(
             "VIP event (not doorbell): prefix=0x%04X action=0x%04X addrs=%s",
             prefix,
