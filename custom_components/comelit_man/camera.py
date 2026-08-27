@@ -258,11 +258,16 @@ class ComelitIntercomCamera(ComelitEntity, Camera):
                     mtype = data.get("type")
                     value = data.get("value")
                     if mtype == "webrtc/answer":
+                        _LOGGER.debug("WebRTC %s: answer from go2rtc (%d bytes)", session_id, len(value or ""))
                         send_message(WebRTCAnswer(answer=value))
                     elif mtype == "webrtc/candidate" and value:
+                        _LOGGER.debug("WebRTC %s: candidate from go2rtc: %.60s", session_id, value)
                         send_message(WebRTCCandidate(candidate=RTCIceCandidateInit(value)))
                     elif mtype == "error":
+                        _LOGGER.debug("WebRTC %s: go2rtc error: %s", session_id, value)
                         send_message(WebRTCError(code="go2rtc_error", message=str(value)))
+                    else:
+                        _LOGGER.debug("WebRTC %s: unhandled go2rtc message type=%s", session_id, mtype)
             except Exception:
                 _LOGGER.debug("go2rtc signaling session %s ended", session_id, exc_info=True)
 
@@ -282,6 +287,7 @@ class ComelitIntercomCamera(ComelitEntity, Camera):
             return
         ws, _task = entry
         try:
+            _LOGGER.debug("WebRTC %s: candidate from client: %.60s", session_id, candidate.candidate)
             await ws.send_json({"type": "webrtc/candidate", "value": candidate.candidate})
         except Exception:
             _LOGGER.debug("Failed to forward candidate for session %s", session_id, exc_info=True)

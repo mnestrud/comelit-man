@@ -264,29 +264,52 @@ class ComelitDoorbellCard extends HTMLElement {
 
       pc.onconnectionstatechange = () => {
         if (!this._pc) return;
+        console.info("comelit-doorbell: connectionState", pc.connectionState);
         if (["failed", "closed"].includes(pc.connectionState)) {
           this._scheduleRetry();
         }
       };
+      pc.oniceconnectionstatechange = () => {
+        if (!this._pc) return;
+        console.info("comelit-doorbell: iceConnectionState", pc.iceConnectionState);
+        if (["checking", "disconnected", "failed"].includes(pc.iceConnectionState)) {
+          this._setStatus(`ICE: ${pc.iceConnectionState}`);
+        } else if (["connected", "completed"].includes(pc.iceConnectionState)) {
+          this._setStatus("");
+        }
+      };
 
-      // Trickle ICE: candidates are forwarded through camera/webrtc/candidate
-      // once the session id arrives; queue any that beat it.
+      // Mirror ha-web-rtc-player: early candidates are appended into the
+      // offer SDP; later ones trickle via camera/webrtc/candidate once the
+      // session id arrives.
       this._sessionId = null;
       this._candQueue = [];
+      const earlyCandidates = [];
+      let offerSent = false;
       pc.onicecandidate = (ev) => {
         if (!ev.candidate?.candidate) return;
-        this._sendCandidate(ev.candidate);
+        if (!offerSent) {
+          earlyCandidates.push(ev.candidate.candidate);
+        } else {
+          this._sendCandidate(ev.candidate);
+        }
       };
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
+      // Give the browser a beat to gather host candidates for the offer SDP.
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const inline = earlyCandidates.map((c) => `a=${c}\r\n`).join("");
+      const offerSdp = pc.localDescription.sdp + inline;
+      offerSent = true;
+      console.info("comelit-doorbell: sending offer,", earlyCandidates.length, "inline candidates");
 
       this._unsub = await this._hass.connection.subscribeMessage(
         (msg) => this._onSignal(msg),
         {
           type: "camera/webrtc/offer",
           entity_id: entityId,
-          offer: pc.localDescription.sdp,
+          offer: offerSdp,
         }
       );
     } catch (err) {
@@ -305,11 +328,23 @@ class ComelitDoorbellCard extends HTMLElement {
       const queued = this._candQueue.splice(0);
       queued.forEach((c) => this._sendCandidate(c));
     } else if (msg.type === "answer") {
+      console.info("comelit-doorbell: answer received");
       pc.setRemoteDescription({ type: "answer", sdp: msg.answer }).catch(
         (err) => this._setStatus(`Stream error: ${err?.message ?? err}`)
       );
     } else if (msg.type === "candidate" && msg.candidate) {
-      pc.addIceCandidate(msg.candidate).catch(() => {});
+      const c = msg.candidate;
+      const init =
+        typeof c === "string"
+          ? { candidate: c, sdpMid: "0" }
+          : {
+              candidate: c.candidate,
+              sdpMid: c.sdpMid ?? "0",
+              sdpMLineIndex: c.sdpMLineIndex ?? 0,
+            };
+      pc.addIceCandidate(init).catch((err) =>
+        console.warn("comelit-doorbell: addIceCandidate failed", err)
+      );
     } else if (msg.type === "error") {
       this._setStatus(`Stream error: ${msg.message ?? msg.code}`);
       this._scheduleRetry();
