@@ -468,7 +468,9 @@ class ComelitDoorbellCard extends HTMLElement {
 
     const isActive = this._state !== "idle";
     idle.style.display = isActive ? "none" : "";
-    active.style.display = isActive ? "" : "none";
+    // "block", not "" — the stylesheet defaults #active to display:none, so
+    // clearing the inline style would re-hide it (the card vanished on ring).
+    active.style.display = isActive ? "block" : "none";
     ringOverlay.style.display = this._state === "ringing" ? "" : "none";
     answeredOverlay.style.display = this._state === "answered" ? "" : "none";
     this._updateMicChip();
