@@ -254,17 +254,26 @@ class RtpReceiver:
         _SILENCE = bytes([0xD5] * 160)  # G.711 A-law silence (near-zero signal)
         _BODY_LEN = 12 + 160  # 12-byte RTP header + 160-byte payload
         icona_prefix = struct.pack("<BBHH2s", 0x00, 0x06, _BODY_LEN, device_rtpc_req_id, b"\x00\x00")
+        tx_buf = bytearray()
         try:
             while self._running:
-                payload = _SILENCE
+                # Drain the whole queue into a smoothing buffer, then emit
+                # exactly one 160-byte frame per 20ms tick.  go2rtc delivers
+                # backchannel audio in TCP bursts of arbitrary payload sizes;
+                # consuming one packet per tick both interleaved silence
+                # between real frames and truncated oversize payloads —
+                # audible as scratchiness at the entrance speaker.
                 if self._backchannel_queue is not None:
-                    with contextlib.suppress(asyncio.QueueEmpty):
-                        payload = self._backchannel_queue.get_nowait()
-                # Distinguish real mic audio from silence filler so the E2E
-                # audit can prove mic audio reached the TX loop from logs.
-                if payload is _SILENCE:
-                    self.audio_tx_silence_count += 1
-                else:
+                    while True:
+                        try:
+                            tx_buf += self._backchannel_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                    if len(tx_buf) > 6400:  # bound talk latency to ~800ms
+                        del tx_buf[:-3200]
+                if len(tx_buf) >= 160:
+                    payload = bytes(tx_buf[:160])
+                    del tx_buf[:160]
                     self.audio_tx_real_count += 1
                     if self.audio_tx_real_count % 250 == 1:
                         _LOGGER.debug(
@@ -272,6 +281,9 @@ class RtpReceiver:
                             self.audio_tx_real_count,
                             self.audio_tx_silence_count,
                         )
+                else:
+                    payload = _SILENCE
+                    self.audio_tx_silence_count += 1
                 rtp_header = struct.pack(
                     ">BBHII",
                     0x80,  # V=2, P=0, X=0, CC=0

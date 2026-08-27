@@ -75,6 +75,39 @@ _DEFAULT_SPS = bytes.fromhex("6742001fe90283f402c4084a")
 _DEFAULT_PPS = bytes.fromhex("68ce3880")
 
 
+# G.711 µ-law → A-law translation table (Sun g711.c reference math).  The
+# device speaks A-law only; a PCMU backchannel payload passed through
+# unconverted plays as static.  audioop is gone in Python 3.13, so the
+# 256-entry table is computed once here (µ-law 0xFF and A-law 0xD5 are the
+# respective digital-silence codes — the table maps one to the other).
+_SEG_AEND = (0x1F, 0x3F, 0x7F, 0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF)
+
+
+def _ulaw2linear(u_val: int) -> int:
+    u_val = ~u_val & 0xFF
+    t = ((u_val & 0x0F) << 3) + 0x84
+    t <<= (u_val & 0x70) >> 4
+    return 0x84 - t if u_val & 0x80 else t - 0x84
+
+
+def _linear2alaw(pcm_val: int) -> int:
+    pcm_val = pcm_val >> 3  # 16-bit → 13-bit magnitude domain
+    if pcm_val >= 0:
+        mask = 0xD5
+    else:
+        mask = 0x55
+        pcm_val = max(-pcm_val - 1, 0)
+    seg = next((i for i, end in enumerate(_SEG_AEND) if pcm_val <= end), 8)
+    if seg >= 8:
+        return 0x7F ^ mask
+    aval = seg << 4
+    aval |= (pcm_val >> 1) & 0xF if seg < 2 else (pcm_val >> seg) & 0xF
+    return aval ^ mask
+
+
+_ULAW_TO_ALAW = bytes(_linear2alaw(_ulaw2linear(i)) for i in range(256))
+
+
 @dataclasses.dataclass
 class _TcpClient:
     """Per-connection state for one RTSP/TCP client."""
@@ -628,7 +661,12 @@ class LocalRtspServer:
                         return
 
     def _on_backchannel_rtp(self, rtp: bytes) -> None:
-        """Strip the RTP header off a backchannel packet and queue the G.711."""
+        """Strip the RTP header off a backchannel packet and queue the G.711.
+
+        The payload is normalized to A-law before queueing: the device speaks
+        PCMA only, and go2rtc may deliver PCMU (PT 0) depending on what the
+        browser negotiated — µ-law bytes played as A-law sound like static.
+        """
         if len(rtp) < 12:
             return
         cc = rtp[0] & 0x0F
@@ -645,9 +683,16 @@ class LocalRtspServer:
         payload = rtp[offset:]
         if not payload:
             return
+        if pt == 0:
+            payload = payload.translate(_ULAW_TO_ALAW)
         self.backchannel_rx_count += 1
         if self.backchannel_rx_count % 250 == 1:
-            _LOGGER.debug("Backchannel mic RTP flowing: %d frames received", self.backchannel_rx_count)
+            _LOGGER.debug(
+                "Backchannel mic RTP flowing: %d frames received (pt=%d, %d bytes/frame)",
+                self.backchannel_rx_count,
+                pt,
+                len(payload),
+            )
         try:
             self.backchannel_queue.put_nowait(payload)
         except asyncio.QueueFull:

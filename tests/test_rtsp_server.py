@@ -2325,3 +2325,18 @@ class TestOnBackchannelRtp:
         server._on_backchannel_rtp(_rtp(payload=b"\x03" * 160))
         assert server.backchannel_queue.get_nowait() == b"\x02" * 160
         assert server.backchannel_queue.get_nowait() == b"\x03" * 160
+
+
+class TestBackchannelPcmuConversion:
+    def test_pcmu_payload_converted_to_alaw(self):
+        from custom_components.comelit_man.rtsp_server import _ULAW_TO_ALAW
+
+        server = LocalRtspServer()
+        server._on_backchannel_rtp(_rtp(pt=0, payload=b"\xff" * 160))  # µ-law silence
+        assert server.backchannel_queue.get_nowait() == b"\xd5" * 160  # A-law silence
+        assert _ULAW_TO_ALAW[0xFF] == 0xD5
+
+    def test_pcma_payload_passthrough(self):
+        server = LocalRtspServer()
+        server._on_backchannel_rtp(_rtp(pt=8, payload=b"\xd5" * 160))
+        assert server.backchannel_queue.get_nowait() == b"\xd5" * 160

@@ -1243,3 +1243,68 @@ class TestTxAuditCounters:
         await self._run_loop(receiver, 2)
         assert receiver.audio_tx_silence_count == 2
         assert receiver.audio_tx_real_count == 0
+
+
+class TestTxSmoothingBuffer:
+    async def _run_loop(self, receiver, iterations: int) -> None:
+        remaining = iterations
+
+        async def fake_sleep(_t: float) -> None:
+            nonlocal remaining
+            remaining -= 1
+            if remaining <= 0:
+                receiver._running = False
+
+        with patch("custom_components.comelit_man.rtp_receiver.asyncio.sleep", side_effect=fake_sleep):
+            await receiver._audio_send_loop(0x1234)
+
+    @pytest.mark.asyncio
+    async def test_oversize_payload_rechunked_not_truncated(self):
+        """A 320-byte burst becomes two full 160-byte real frames."""
+        receiver = RtpReceiver("127.0.0.1")
+        receiver._running = True
+        sent: list[bytes] = []
+        transport = MagicMock()
+        transport.sendto = lambda data, **kw: sent.append(data)
+        receiver._transport = transport
+        q: asyncio.Queue[bytes] = asyncio.Queue()
+        await q.put(bytes([0xAB] * 160) + bytes([0xCD] * 160))
+        receiver.attach_backchannel_queue(q)
+
+        await self._run_loop(receiver, 3)
+
+        assert receiver.audio_tx_real_count == 2
+        assert receiver.audio_tx_silence_count == 1
+        assert sent[0][20:] == bytes([0xAB] * 160)
+        assert sent[1][20:] == bytes([0xCD] * 160)
+
+    @pytest.mark.asyncio
+    async def test_burst_of_packets_no_silence_interleaved(self):
+        """Three packets arriving in one burst play back-to-back."""
+        receiver = RtpReceiver("127.0.0.1")
+        receiver._running = True
+        receiver._transport = MagicMock()
+        q: asyncio.Queue[bytes] = asyncio.Queue()
+        for b in (0x01, 0x02, 0x03):
+            await q.put(bytes([b] * 160))
+        receiver.attach_backchannel_queue(q)
+
+        await self._run_loop(receiver, 3)
+
+        assert receiver.audio_tx_real_count == 3
+        assert receiver.audio_tx_silence_count == 0
+
+    @pytest.mark.asyncio
+    async def test_latency_bound_drops_stale_audio(self):
+        """Buffer beyond ~800ms is trimmed to the freshest 400ms."""
+        receiver = RtpReceiver("127.0.0.1")
+        receiver._running = True
+        receiver._transport = MagicMock()
+        q: asyncio.Queue[bytes] = asyncio.Queue()
+        await q.put(bytes(7000))
+        receiver.attach_backchannel_queue(q)
+
+        await self._run_loop(receiver, 1)
+
+        # 7000 bytes trimmed to 3200, one frame consumed
+        assert receiver.audio_tx_real_count == 1
