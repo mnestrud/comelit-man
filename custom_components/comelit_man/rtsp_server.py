@@ -53,6 +53,14 @@ _NTP_EPOCH_OFFSET = 2208988800
 # reference clock within the first SR.
 _RTCP_SR_INTERVAL_S = 5.0
 
+# G.711 sample rate — RTP timestamp units per second of wall clock (RFC 3551).
+_AUDIO_CLOCK_RATE = 8000
+# A send-to-send gap at or beyond this is a transmission pause (silence
+# suppression), not network jitter: re-derive the RTP timestamp from the
+# wall clock and set the marker bit on the resumed packet (RFC 3550 §5.1,
+# RFC 3551 §4.1).  Below it, the smooth +160/frame cadence absorbs jitter.
+_AUDIO_DISCONTINUITY_S = 0.1
+
 # H.264 parameter sets captured from the Comelit 6701W (baseline profile,
 # level 3.1, 800x480 yuv420p — identical across every pcap we have).  Used as
 # a fallback sprop-parameter-sets in the SDP so that clients which DESCRIBE
@@ -133,6 +141,11 @@ class LocalRtspServer:
         self._video_seq: int = 0
         self._audio_seq: int = 0
         self._audio_ts: int = 0
+        # Wall-clock instant and RTP ts of the last audio packet sent —
+        # used to encode transmission pauses per RFC 3550/3551 (timestamp
+        # advances through silence; marker bit set on resume).
+        self._last_audio_send_mono: float | None = None
+        self._last_audio_send_ts: int = 0
 
         # Video timestamp translation: the device resets its RTP timestamp
         # per call, but the persistent HA stream worker stays connected
@@ -940,9 +953,14 @@ class LocalRtspServer:
 
         Between calls (_ready_event clear), sends silent PCMA (0xD5) at the
         correct 20 ms cadence so go2rtc's WebRTC session stays alive in the
-        browser.  Silence is suppressed during live calls (_ready_event set)
-        to avoid glitches; if no real audio arrives within 20 ms in that case,
-        the loop iterates without sending.
+        browser.  Silence is never sent during live calls (_ready_event set).
+
+        Transmission pauses are encoded per RFC 3550/3551: the RTP timestamp
+        reflects the sampling instant, which keeps advancing through silence
+        — so after a send-to-send gap >= _AUDIO_DISCONTINUITY_S the timestamp
+        is re-derived from the wall clock and the resumed packet carries the
+        marker bit.  Receivers then see a real pause instead of
+        time-compressed audio that drifts against the video track.
         """
         _silence = b"\xd5" * 160
         try:
@@ -955,15 +973,30 @@ class LocalRtspServer:
                     else:
                         continue
 
+                now = time.monotonic()
+                marker = False
+                if self._last_audio_send_mono is not None:
+                    elapsed = now - self._last_audio_send_mono
+                    if elapsed >= _AUDIO_DISCONTINUITY_S:
+                        self._audio_ts = (self._last_audio_send_ts + int(elapsed * _AUDIO_CLOCK_RATE)) & 0xFFFFFFFF
+                        marker = True
+                        _LOGGER.debug(
+                            "Audio resumed after %.2fs pause: ts advanced to 0x%08X (marker set)",
+                            elapsed,
+                            self._audio_ts,
+                        )
+
                 pkt = _build_rtp(
                     pt=8,
                     seq=self._audio_seq,
                     ts=self._audio_ts,
                     ssrc=self._audio_ssrc,
                     payload=payload,
-                    marker=False,
+                    marker=marker,
                 )
                 self._audio_seq = (self._audio_seq + 1) & 0xFFFF
+                self._last_audio_send_mono = now
+                self._last_audio_send_ts = self._audio_ts
                 self._audio_ts = (self._audio_ts + len(payload)) & 0xFFFFFFFF
                 self._broadcast_rtp(pkt, is_video=False)
                 self._audio_pkt_count += 1

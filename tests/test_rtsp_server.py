@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import struct
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -2134,3 +2135,132 @@ class TestBackchannel:
         await server._handle_client(reader, writer)
         # ANNOUNCE must be answered with 200 OK
         assert b"RTSP/1.0 200 OK" in writer.data
+
+
+# ---------------------------------------------------------------------------
+# RFC 3550/3551 audio pause encoding (wall-clock ts advance + marker bit)
+# ---------------------------------------------------------------------------
+
+
+class TestAudioPauseEncoding:
+    def _run_one_frame(self, server: LocalRtspServer, payload: bytes) -> list[bytes]:
+        """Push one payload through _audio_feed_loop, return broadcast packets."""
+        broadcasts: list[bytes] = []
+        server._broadcast_rtp = lambda pkt, is_video: broadcasts.append(pkt)  # type: ignore[method-assign]
+        items = [payload]
+
+        async def mock_wait_for(coro: object, timeout: float) -> bytes:
+            if asyncio.iscoroutine(coro):
+                coro.close()  # type: ignore[attr-defined]
+            if items:
+                return items.pop(0)
+            server._running = False
+            raise TimeoutError
+
+        with patch("custom_components.comelit_man.rtsp_server.asyncio.wait_for", mock_wait_for):
+            asyncio.get_event_loop().run_until_complete(server._audio_feed_loop())
+        return broadcasts
+
+    @pytest.mark.asyncio
+    async def test_gap_advances_ts_by_wall_clock_and_sets_marker(self):
+        server = LocalRtspServer()
+        server._running = True
+        server._audio_ts = 1160  # would-be contiguous ts (stale)
+        server._last_audio_send_ts = 1000
+        server._last_audio_send_mono = time.monotonic() - 0.5  # 0.5s pause
+
+        broadcasts: list[bytes] = []
+        server._broadcast_rtp = lambda pkt, is_video: broadcasts.append(pkt)  # type: ignore[method-assign]
+        items = [b"\xaa" * 160]
+
+        async def mock_wait_for(coro, timeout):
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            if items:
+                return items.pop(0)
+            server._running = False
+            raise TimeoutError
+
+        with patch("custom_components.comelit_man.rtsp_server.asyncio.wait_for", mock_wait_for):
+            await server._audio_feed_loop()
+
+        assert len(broadcasts) == 1
+        pkt = broadcasts[0]
+        assert pkt[1] & 0x80  # marker bit set on resume
+        ts = struct.unpack_from("!I", pkt, 4)[0]
+        # ~0.5s * 8000 = ~4000 ticks past the last sent packet's ts
+        assert 1000 + 3800 <= ts <= 1000 + 4600
+
+    @pytest.mark.asyncio
+    async def test_small_jitter_keeps_smooth_cadence_no_marker(self):
+        server = LocalRtspServer()
+        server._running = True
+        server._audio_ts = 1160
+        server._last_audio_send_ts = 1000
+        server._last_audio_send_mono = time.monotonic() - 0.03  # 30ms < threshold
+
+        broadcasts: list[bytes] = []
+        server._broadcast_rtp = lambda pkt, is_video: broadcasts.append(pkt)  # type: ignore[method-assign]
+        items = [b"\xaa" * 160]
+
+        async def mock_wait_for(coro, timeout):
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            if items:
+                return items.pop(0)
+            server._running = False
+            raise TimeoutError
+
+        with patch("custom_components.comelit_man.rtsp_server.asyncio.wait_for", mock_wait_for):
+            await server._audio_feed_loop()
+
+        pkt = broadcasts[0]
+        assert not (pkt[1] & 0x80)  # no marker
+        assert struct.unpack_from("!I", pkt, 4)[0] == 1160  # contiguous ts kept
+
+    @pytest.mark.asyncio
+    async def test_first_packet_ever_has_no_marker(self):
+        server = LocalRtspServer()
+        server._running = True
+        assert server._last_audio_send_mono is None
+
+        broadcasts: list[bytes] = []
+        server._broadcast_rtp = lambda pkt, is_video: broadcasts.append(pkt)  # type: ignore[method-assign]
+        items = [b"\xaa" * 160]
+
+        async def mock_wait_for(coro, timeout):
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            if items:
+                return items.pop(0)
+            server._running = False
+            raise TimeoutError
+
+        with patch("custom_components.comelit_man.rtsp_server.asyncio.wait_for", mock_wait_for):
+            await server._audio_feed_loop()
+
+        assert not (broadcasts[0][1] & 0x80)
+        assert server._last_audio_send_mono is not None  # bookkeeping recorded
+
+    @pytest.mark.asyncio
+    async def test_send_updates_bookkeeping(self):
+        server = LocalRtspServer()
+        server._running = True
+        server._audio_ts = 5000
+
+        server._broadcast_rtp = lambda pkt, is_video: None  # type: ignore[method-assign]
+        items = [b"\xaa" * 160]
+
+        async def mock_wait_for(coro, timeout):
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            if items:
+                return items.pop(0)
+            server._running = False
+            raise TimeoutError
+
+        with patch("custom_components.comelit_man.rtsp_server.asyncio.wait_for", mock_wait_for):
+            await server._audio_feed_loop()
+
+        assert server._last_audio_send_ts == 5000  # ts of the packet actually sent
+        assert server._audio_ts == 5160  # advanced for the next contiguous frame
