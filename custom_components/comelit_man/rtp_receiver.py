@@ -126,6 +126,9 @@ class RtpReceiver:
         self._keepalive_task: asyncio.Task[None] | None = None
         self._audio_sender_task: asyncio.Task[None] | None = None
         self._audio_sent_count: int = 0
+        # TX audit counters: real mic frames vs silence filler (E2E validation).
+        self.audio_tx_real_count: int = 0
+        self.audio_tx_silence_count: int = 0
 
         # Fires as soon as the first video NAL has been queued — callers can
         # await this to know that video is actually flowing before reporting
@@ -242,6 +245,18 @@ class RtpReceiver:
                 if self._backchannel_queue is not None:
                     with contextlib.suppress(asyncio.QueueEmpty):
                         payload = self._backchannel_queue.get_nowait()
+                # Distinguish real mic audio from silence filler so the E2E
+                # audit can prove mic audio reached the TX loop from logs.
+                if payload is _SILENCE:
+                    self.audio_tx_silence_count += 1
+                else:
+                    self.audio_tx_real_count += 1
+                    if self.audio_tx_real_count % 250 == 1:
+                        _LOGGER.debug(
+                            "TX audio: %d real mic frames, %d silence frames sent",
+                            self.audio_tx_real_count,
+                            self.audio_tx_silence_count,
+                        )
                 rtp_header = struct.pack(
                     ">BBHII",
                     0x80,  # V=2, P=0, X=0, CC=0

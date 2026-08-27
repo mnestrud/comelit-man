@@ -59,7 +59,9 @@ _AUDIO_CLOCK_RATE = 8000
 # suppression), not network jitter: re-derive the RTP timestamp from the
 # wall clock and set the marker bit on the resumed packet (RFC 3550 §5.1,
 # RFC 3551 §4.1).  Below it, the smooth +160/frame cadence absorbs jitter.
-_AUDIO_DISCONTINUITY_S = 0.1
+# 0.5s, not 0.1s: the 6701W's TCP burst delivery shows legitimate 0.11-0.21s
+# inter-burst gaps mid-call (observed live 2026-08-27).
+_AUDIO_DISCONTINUITY_S = 0.5
 
 # H.264 parameter sets captured from the Comelit 6701W (baseline profile,
 # level 3.1, 800x480 yuv420p — identical across every pcap we have).  Used as
@@ -80,6 +82,7 @@ class _TcpClient:
     writer: asyncio.StreamWriter
     video_ch: int | None = None  # interleaved channel for video RTP
     audio_ch: int | None = None  # interleaved channel for audio RTP
+    backchannel_ch: int | None = None  # interleaved channel for mic RTP (client → us)
 
 
 class LocalRtspServer:
@@ -115,6 +118,8 @@ class LocalRtspServer:
         # input (via ANNOUNCE/RECORD).  rtp_receiver reads from this queue
         # to replace silence with real audio in _audio_send_loop.
         self.backchannel_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=500)
+        # Mic RTP frames received from clients — audited during E2E validation.
+        self.backchannel_rx_count: int = 0
 
         # UDP sockets — fallback for clients that request UDP transport
         self._video_sock: socket.socket | None = None
@@ -390,12 +395,16 @@ class LocalRtspServer:
                 _LOGGER.debug("RTSP %s from %s", method, client_host)
 
                 if method == "OPTIONS":
-                    self._send(
-                        writer, cseq, extra=("Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, ANNOUNCE, RECORD\r\n")
-                    )
+                    self._send(writer, cseq, extra=("Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n"))
 
                 elif method == "DESCRIBE":
-                    sdp = self._build_sdp().encode()
+                    # go2rtc requests the ONVIF backchannel for a bare rtsp://
+                    # URL via this header; only then do we advertise the
+                    # sendonly mic track, so plain clients get clean video
+                    # (an always-on extra PT8 m-line breaks go2rtc's WebRTC
+                    # track mapping — simllll's 1.11.0 regression).
+                    want_backchannel = "backchannel" in headers.get("require", "").lower()
+                    sdp = self._build_sdp(backchannel=want_backchannel).encode()
                     writer.write(
                         f"RTSP/1.0 200 OK\r\n"
                         f"CSeq: {cseq}\r\n"
@@ -408,8 +417,9 @@ class LocalRtspServer:
 
                 elif method == "SETUP":
                     transport_hdr = headers.get("transport", "")
-                    is_audio = "/audio" in url or "track2" in url
-                    transport_resp = self._parse_setup(transport_hdr, is_audio, client, client_host)
+                    is_backchannel = "backchannel" in url
+                    is_audio = not is_backchannel and ("/audio" in url or "track2" in url)
+                    transport_resp = self._parse_setup(transport_hdr, is_audio, client, client_host, is_backchannel)
                     self._send(writer, cseq, extra=(f"Session: {self._session_id}\r\n{transport_resp}\r\n"))
 
                 elif method == "PLAY":
@@ -417,10 +427,11 @@ class LocalRtspServer:
                     self._active_clients.append(client)
                     registered = True
                     _LOGGER.info(
-                        "RTSP streaming → %s (video_ch=%s audio_ch=%s) [%d client(s) total]",
+                        "RTSP streaming → %s (video_ch=%s audio_ch=%s backchannel_ch=%s) [%d client(s) total]",
                         client_host,
                         client.video_ch,
                         client.audio_ch,
+                        client.backchannel_ch,
                         len(self._active_clients),
                     )
                     # Immediately send in-band SPS + PPS to this client so
@@ -430,23 +441,11 @@ class LocalRtspServer:
                     # enough — recent libavformat only reliably sets pix_fmt
                     # from in-band NAL units seen in the actual RTP stream.
                     self._prime_client_with_parameter_sets(client)
-                    await self._wait_for_teardown(reader)
+                    await self._read_client_stream(reader, client)
                     break
 
                 elif method == "TEARDOWN":
                     self._send(writer, cseq, extra=f"Session: {self._session_id}\r\n")
-                    break
-
-                elif method == "ANNOUNCE":
-                    # go2rtc backchannel: drain the SDP body then hand off
-                    content_len = int(headers.get("content-length", 0))
-                    if content_len > 0:
-                        with contextlib.suppress(asyncio.IncompleteReadError):
-                            await reader.readexactly(content_len)
-                    self._send(writer, cseq)
-                    await writer.drain()
-                    _LOGGER.debug("Backchannel ANNOUNCE from %s", client_host)
-                    await self._handle_backchannel(reader, writer, client_host)
                     break
 
                 else:
@@ -499,6 +498,7 @@ class LocalRtspServer:
         is_audio: bool,
         client: _TcpClient,
         client_host: str,
+        is_backchannel: bool = False,
     ) -> str:
         """Parse SETUP Transport header, update client state, return response."""
         use_tcp = "RTP/AVP/TCP" in transport_hdr or "interleaved" in transport_hdr
@@ -508,7 +508,9 @@ class LocalRtspServer:
             for part in transport_hdr.split(";"):
                 if "interleaved" in part:
                     channel = int(part.split("=", 1)[1].split("-")[0])
-            if is_audio:
+            if is_backchannel:
+                client.backchannel_ch = channel
+            elif is_audio:
                 client.audio_ch = channel
             else:
                 client.video_ch = channel
@@ -540,12 +542,12 @@ class LocalRtspServer:
                 return int(ports.split("-")[0])
         return 0
 
-    def _build_sdp(self) -> str:
+    def _build_sdp(self, backchannel: bool = False) -> str:
         sps_b64 = base64.b64encode(self._latest_sps).decode()
         pps_b64 = base64.b64encode(self._latest_pps).decode()
         # profile-level-id = first 3 bytes of SPS (profile_idc, constraints, level_idc)
         profile_level_id = self._latest_sps[1:4].hex()
-        return (
+        sdp = (
             "v=0\r\n"
             f"o=- 0 0 IN IP4 {self._bind_host}\r\n"
             "s=Comelit Intercom\r\n"
@@ -557,111 +559,103 @@ class LocalRtspServer:
             f"profile-level-id={profile_level_id};"
             f"sprop-parameter-sets={sps_b64},{pps_b64}\r\n"
             "a=control:video\r\n"
+            # Forward audio (entrance → client).  NO direction attribute:
+            # RTSP clients read directions ONVIF-style from the client's
+            # perspective, so `a=sendonly` here means "the CLIENT sends" —
+            # go2rtc then treats the track as a mic backchannel and never
+            # SETUPs it (observed live 2026-08-27: audio_ch=None on every
+            # client, zero RTP while idle, 5s i/o timeout, spinning card).
             "m=audio 0 RTP/AVP 8\r\n"
             "c=IN IP4 0.0.0.0\r\n"
             "a=rtpmap:8 PCMA/8000\r\n"
-            "a=sendonly\r\n"
             "a=control:audio\r\n"
-            "m=audio 0 RTP/AVP 8\r\n"
-            "c=IN IP4 0.0.0.0\r\n"
-            "a=rtpmap:8 PCMA/8000\r\n"
-            "a=recvonly\r\n"
-            "a=control:backchannel\r\n"
         )
+        # ONVIF backchannel (client mic → entrance), advertised ONLY when the
+        # client asked via `Require: ...backchannel`.  Marked a=sendonly —
+        # ONVIF convention for "the client may SEND audio on this media".
+        if backchannel:
+            sdp += (
+                "m=audio 0 RTP/AVP 8\r\n"
+                "c=IN IP4 0.0.0.0\r\n"
+                "a=rtpmap:8 PCMA/8000\r\n"
+                "a=sendonly\r\n"
+                "a=control:backchannel\r\n"
+            )
+        return sdp
 
-    async def _wait_for_teardown(self, reader: asyncio.StreamReader) -> None:
-        """Hold client connection open until TEARDOWN or disconnect."""
+    async def _read_client_stream(self, reader: asyncio.StreamReader, client: _TcpClient) -> None:
+        """Hold the client connection open after PLAY, consuming inbound bytes.
+
+        Two kinds of data may arrive from the client:
+        - RTSP text (TEARDOWN) — ends the session.
+        - Interleaved binary frames ($ ch len ...) — the ONVIF backchannel
+          RTP (client mic) on ``client.backchannel_ch``.  The RTP header is
+          stripped and the G.711 payload queued; rtp_receiver's audio send
+          loop drains ``backchannel_queue`` toward the device.  With no
+          answered call active the payloads just age out of the bounded
+          queue — harmless.
+        """
+        buf = bytearray()
         while self._running:
             try:
-                data = await asyncio.wait_for(reader.read(256), timeout=10.0)
-                if not data or b"TEARDOWN" in data:
-                    break
-            except TimeoutError:
-                pass
-
-    async def _handle_backchannel(
-        self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-        client_host: str,
-    ) -> None:
-        """Handle SETUP + RECORD for a backchannel connection (after ANNOUNCE accepted)."""
-        backchannel_ch = 0
-        try:
-            while self._running:
-                parsed = await self._read_rtsp_request(reader)
-                if parsed is None:
-                    break
-                method, _url, hdrs, cseq = parsed
-                _LOGGER.debug("Backchannel %s from %s", method, client_host)
-
-                if method == "SETUP":
-                    transport_hdr = hdrs.get("transport", "")
-                    for part in transport_hdr.split(";"):
-                        if "interleaved" in part:
-                            backchannel_ch = int(part.split("=", 1)[1].split("-")[0])
-                    self._send(
-                        writer,
-                        cseq,
-                        extra=f"Session: {self._session_id}\r\nTransport: RTP/AVP/TCP;unicast;interleaved={backchannel_ch}-{backchannel_ch + 1}\r\n",
-                    )
-                    await writer.drain()
-
-                elif method == "RECORD":
-                    self._send(writer, cseq, extra=f"Session: {self._session_id}\r\n")
-                    await writer.drain()
-                    _LOGGER.info("Backchannel RECORD from %s — mic audio flowing", client_host)
-                    await self._receive_backchannel_rtp(reader)
-                    break
-
-                elif method == "TEARDOWN":
-                    self._send(writer, cseq, extra=f"Session: {self._session_id}\r\n")
-                    await writer.drain()
-                    break
-
-                else:
-                    writer.write(f"RTSP/1.0 405 Method Not Allowed\r\nCSeq: {cseq}\r\n\r\n".encode())
-                    await writer.drain()
-        except (TimeoutError, ConnectionError, asyncio.IncompleteReadError):
-            pass
-        except Exception:
-            _LOGGER.debug("Backchannel error", exc_info=True)
-        _LOGGER.debug("Backchannel connection from %s closed", client_host)
-
-    async def _receive_backchannel_rtp(self, reader: asyncio.StreamReader) -> None:
-        """Read interleaved RTP from backchannel connection and queue audio payloads."""
-        while self._running:
-            try:
-                header = await asyncio.wait_for(reader.readexactly(4), timeout=30.0)
-            except asyncio.IncompleteReadError:
-                break
-            except ConnectionError:
-                break
+                data = await asyncio.wait_for(reader.read(4096), timeout=30.0)
             except TimeoutError:
                 continue
-
-            if header[0] != 0x24:
-                # Non-interleaved data (e.g. TEARDOWN) — drain and exit
-                rest = header
-                with contextlib.suppress(Exception):
-                    while b"\r\n\r\n" not in rest:
-                        chunk = await asyncio.wait_for(reader.read(256), timeout=5.0)
-                        if not chunk:
-                            break
-                        rest += chunk
+            if not data:
                 break
+            buf += data
+            while buf:
+                if buf[0] == 0x24:  # '$' interleaved binary frame
+                    if len(buf) < 4:
+                        break
+                    ch = buf[1]
+                    length = (buf[2] << 8) | buf[3]
+                    if len(buf) < 4 + length:
+                        break
+                    frame = bytes(buf[4 : 4 + length])
+                    del buf[: 4 + length]
+                    if client.backchannel_ch is not None and ch == client.backchannel_ch:
+                        self._on_backchannel_rtp(frame)
+                else:
+                    # RTSP text (e.g. TEARDOWN).  Consume up to the next line;
+                    # wait for more bytes if a full line isn't buffered yet.
+                    nl = buf.find(b"\n")
+                    if nl == -1:
+                        break
+                    line = bytes(buf[: nl + 1])
+                    del buf[: nl + 1]
+                    if b"TEARDOWN" in line:
+                        return
 
-            length = struct.unpack("!H", header[2:4])[0]
-            try:
-                rtp = await asyncio.wait_for(reader.readexactly(length), timeout=5.0)
-            except (asyncio.IncompleteReadError, TimeoutError):
-                break
-
-            if len(rtp) >= 12:
-                payload = rtp[12:]
-                if payload:
-                    with contextlib.suppress(asyncio.QueueFull):
-                        self.backchannel_queue.put_nowait(payload)
+    def _on_backchannel_rtp(self, rtp: bytes) -> None:
+        """Strip the RTP header off a backchannel packet and queue the G.711."""
+        if len(rtp) < 12:
+            return
+        cc = rtp[0] & 0x0F
+        has_ext = (rtp[0] >> 4) & 0x01
+        pt = rtp[1] & 0x7F
+        if pt not in (0, 8):  # only G.711 PCMU/PCMA
+            return
+        offset = 12 + 4 * cc
+        if has_ext:
+            if len(rtp) < offset + 4:
+                return
+            ext_words = (rtp[offset + 2] << 8) | rtp[offset + 3]
+            offset += 4 + 4 * ext_words
+        payload = rtp[offset:]
+        if not payload:
+            return
+        self.backchannel_rx_count += 1
+        if self.backchannel_rx_count % 250 == 1:
+            _LOGGER.debug("Backchannel mic RTP flowing: %d frames received", self.backchannel_rx_count)
+        try:
+            self.backchannel_queue.put_nowait(payload)
+        except asyncio.QueueFull:
+            # Stay live: drop the oldest frame and enqueue the newest.
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self.backchannel_queue.get_nowait()
+            with contextlib.suppress(asyncio.QueueFull):
+                self.backchannel_queue.put_nowait(payload)
 
     # ------------------------------------------------------------------
     # RTP broadcast

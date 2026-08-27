@@ -1192,3 +1192,54 @@ class TestBackchannelAudio:
         silence = bytes([0xD5] * 160)
         second_payload = sent[1][20:] if len(sent) > 1 else silence
         assert second_payload == silence
+
+
+# ---------------------------------------------------------------------------
+# TX audit counters: real mic frames vs silence filler (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+class TestTxAuditCounters:
+    async def _run_loop(self, receiver, iterations: int) -> None:
+        remaining = iterations
+
+        async def fake_sleep(_t: float) -> None:
+            nonlocal remaining
+            remaining -= 1
+            if remaining <= 0:
+                receiver._running = False
+
+        with patch("custom_components.comelit_man.rtp_receiver.asyncio.sleep", side_effect=fake_sleep):
+            await receiver._audio_send_loop(0x1234)
+
+    @pytest.mark.asyncio
+    async def test_silence_counted_when_no_backchannel(self):
+        receiver = RtpReceiver("127.0.0.1")
+        receiver._running = True
+        receiver._transport = MagicMock()
+        await self._run_loop(receiver, 3)
+        assert receiver.audio_tx_silence_count == 3
+        assert receiver.audio_tx_real_count == 0
+
+    @pytest.mark.asyncio
+    async def test_real_frames_counted_from_backchannel(self):
+        receiver = RtpReceiver("127.0.0.1")
+        receiver._running = True
+        receiver._transport = MagicMock()
+        q: asyncio.Queue[bytes] = asyncio.Queue()
+        await q.put(bytes([0xAB] * 160))
+        await q.put(bytes([0xCD] * 160))
+        receiver.attach_backchannel_queue(q)
+        await self._run_loop(receiver, 3)
+        assert receiver.audio_tx_real_count == 2
+        assert receiver.audio_tx_silence_count == 1
+
+    @pytest.mark.asyncio
+    async def test_empty_backchannel_counts_silence(self):
+        receiver = RtpReceiver("127.0.0.1")
+        receiver._running = True
+        receiver._transport = MagicMock()
+        receiver.attach_backchannel_queue(asyncio.Queue())
+        await self._run_loop(receiver, 2)
+        assert receiver.audio_tx_silence_count == 2
+        assert receiver.audio_tx_real_count == 0

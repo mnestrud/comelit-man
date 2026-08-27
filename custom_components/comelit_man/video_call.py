@@ -755,7 +755,9 @@ class VideoCallSession:
             return
         addresses = msg.get("addresses", [])
         entrance_addr = addresses[0] if addresses else ""
-        _LOGGER.info(
+        # DEBUG: fires once per device retransmit (~5x per ring); the
+        # coordinator logs the deduped ring once at INFO.
+        _LOGGER.debug(
             "Ring during active video call (entrance=%s ring_ts=0x%08X)",
             entrance_addr,
             msg["timestamp"],

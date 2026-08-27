@@ -680,15 +680,29 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         if not self._rtsp_url:
             return
         name = f"comelit_man_{self.config_entry.entry_id}"  # type: ignore[union-attr]
-        src = f"{self._rtsp_url}#backchannel=1"
+        # Bare URL — go2rtc negotiates the backchannel itself via the
+        # `Require: ...backchannel` header on DESCRIBE; the old #backchannel=1
+        # source flag is unnecessary with that negotiation in place.
+        src = self._rtsp_url
         try:
             async with aiohttp.ClientSession() as session:
-                await session.put(
+                resp = await session.put(
                     "http://127.0.0.1:1984/api/streams",
                     params={"name": name, "src": src},
                     timeout=aiohttp.ClientTimeout(total=5),
                 )
-            _LOGGER.debug("Registered go2rtc stream: %s -> %s", name, src)
+                if resp.status >= 400:
+                    # e.g. 401 when go2rtc's API has auth configured — a
+                    # static entry in go2rtc.yaml then has to provide the
+                    # stream; say so instead of logging false success.
+                    _LOGGER.warning(
+                        "go2rtc stream registration failed (HTTP %d) — add a static entry '%s: %s' to go2rtc.yaml",
+                        resp.status,
+                        name,
+                        src,
+                    )
+                else:
+                    _LOGGER.debug("Registered go2rtc stream: %s -> %s", name, src)
         except Exception:
             _LOGGER.debug("go2rtc unavailable — backchannel inactive (RTSP/HLS still works)")
 

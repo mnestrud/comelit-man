@@ -1238,12 +1238,14 @@ class TestNotifyVideoStateChange:
 
 class TestGo2RtcRegistration:
     @pytest.mark.asyncio
-    async def test_register_puts_stream_with_backchannel_flag(self):
-        """_register_go2rtc_stream PUTs to go2rtc API with #backchannel=1."""
+    async def test_register_puts_bare_rtsp_url(self):
+        """_register_go2rtc_stream PUTs the bare RTSP URL (backchannel is
+        negotiated via the Require header, not a source flag)."""
         coord = _make_coordinator()
         coord._rtsp_url = "rtsp://127.0.0.1:8557/intercom"
 
         mock_response = MagicMock()
+        mock_response.status = 200
         mock_session = AsyncMock()
         mock_session.put = AsyncMock(return_value=mock_response)
         mock_session.__aenter__ = AsyncMock(return_value=mock_session)
@@ -1255,9 +1257,29 @@ class TestGo2RtcRegistration:
         mock_session.put.assert_called_once()
         call_kwargs = mock_session.put.call_args
         params = call_kwargs[1]["params"]
-        assert params["src"].endswith("#backchannel=1")
-        assert params["src"].startswith("rtsp://127.0.0.1:8557/intercom")
+        assert params["src"] == "rtsp://127.0.0.1:8557/intercom"
         assert "comelit_man_" in params["name"]
+
+    @pytest.mark.asyncio
+    async def test_register_warns_on_http_error(self):
+        """A 401/4xx from go2rtc logs a warning instead of false success."""
+        coord = _make_coordinator()
+        coord._rtsp_url = "rtsp://127.0.0.1:8557/intercom"
+
+        mock_response = MagicMock()
+        mock_response.status = 401
+        mock_session = AsyncMock()
+        mock_session.put = AsyncMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch("custom_components.comelit_man.coordinator.aiohttp.ClientSession", return_value=mock_session),
+            patch("custom_components.comelit_man.coordinator._LOGGER") as mock_logger,
+        ):
+            await coord._register_go2rtc_stream()
+
+        mock_logger.warning.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_register_graceful_when_go2rtc_unavailable(self):

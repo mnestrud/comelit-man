@@ -669,52 +669,6 @@ class TestSendStaticMethod:
         assert b"CSeq: 5" in written
 
 
-class TestWaitForTeardown:
-    @pytest.mark.asyncio
-    async def test_exits_on_teardown(self):
-        server = LocalRtspServer()
-        server._running = True
-        reader = AsyncMock()
-        reader.read.return_value = b"TEARDOWN /intercom RTSP/1.0\r\n"
-        await server._wait_for_teardown(reader)
-
-    @pytest.mark.asyncio
-    async def test_exits_on_empty_data(self):
-        server = LocalRtspServer()
-        server._running = True
-        reader = AsyncMock()
-        reader.read.return_value = b""
-        await server._wait_for_teardown(reader)
-
-    @pytest.mark.asyncio
-    async def test_not_running_exits_immediately(self):
-        server = LocalRtspServer()
-        server._running = False
-        reader = AsyncMock()
-        await server._wait_for_teardown(reader)
-        reader.read.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_timeout_continues_then_teardown(self):
-        server = LocalRtspServer()
-        server._running = True
-        call_count = 0
-
-        async def mock_wait_for(coro, timeout):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                coro.close()
-                raise TimeoutError()
-            return await coro
-
-        reader = AsyncMock()
-        reader.read.return_value = b"TEARDOWN"
-        with patch("custom_components.comelit_man.rtsp_server.asyncio.wait_for", mock_wait_for):
-            await server._wait_for_teardown(reader)
-        assert call_count == 2
-
-
 class TestBroadcastRtpUdpPath:
     def test_udp_video_sendto(self):
         server = LocalRtspServer()
@@ -2027,116 +1981,6 @@ class TestHandleClient:
 # ---------------------------------------------------------------------------
 
 
-class TestBackchannel:
-    """Tests for RTSP backchannel support (go2rtc mic audio path)."""
-
-    def test_backchannel_sdp_has_recvonly_track(self):
-        """SDP DESCRIBE response advertises a recvonly backchannel audio track."""
-        server = LocalRtspServer()
-        sdp = server._build_sdp()
-        assert "a=recvonly" in sdp
-        assert "a=control:backchannel" in sdp
-
-    def test_main_audio_sdp_has_sendonly(self):
-        """Main audio track is marked sendonly so clients don't try to push on it."""
-        server = LocalRtspServer()
-        sdp = server._build_sdp()
-        assert "a=sendonly" in sdp
-        assert "a=control:audio" in sdp
-
-    @pytest.mark.asyncio
-    async def test_options_includes_announce_record(self):
-        """OPTIONS response Public header includes ANNOUNCE and RECORD."""
-        server = LocalRtspServer()
-        server._running = True
-        reader = _RequestReader(
-            [
-                b"OPTIONS rtsp://127.0.0.1/intercom RTSP/1.0\r\nCSeq: 1\r\n\r\n",
-                b"",
-            ]
-        )
-        writer = _ResponseWriter()
-        await server._handle_client(reader, writer)
-        assert b"ANNOUNCE" in writer.data
-        assert b"RECORD" in writer.data
-
-    @pytest.mark.asyncio
-    async def test_receive_backchannel_rtp_populates_queue(self):
-        """Interleaved RTP received during RECORD lands in backchannel_queue."""
-        server = LocalRtspServer()
-        server._running = True
-
-        audio_payload = bytes([0xAB] * 160)
-        rtp = struct.pack(">BBHII", 0x80, 0x08, 0, 0, 0x12345678) + audio_payload
-        interleaved = struct.pack("!BBH", 0x24, 6, len(rtp)) + rtp
-
-        class _ExactReader:
-            def __init__(self, data: bytes) -> None:
-                self._data = bytearray(data)
-                self._pos = 0
-
-            async def readexactly(self, n: int) -> bytes:
-                end = self._pos + n
-                if end > len(self._data):
-                    raise asyncio.IncompleteReadError(b"", n)
-                result = bytes(self._data[self._pos : end])
-                self._pos = end
-                return result
-
-        await server._receive_backchannel_rtp(_ExactReader(interleaved))
-
-        assert not server.backchannel_queue.empty()
-        received = server.backchannel_queue.get_nowait()
-        assert received == audio_payload
-
-    @pytest.mark.asyncio
-    async def test_receive_backchannel_rtp_ignores_short_rtp(self):
-        """RTP packets shorter than 12 bytes are silently dropped."""
-        server = LocalRtspServer()
-        server._running = True
-
-        # Malformed RTP: only 8 bytes (header incomplete)
-        short_rtp = bytes(8)
-        interleaved = struct.pack("!BBH", 0x24, 0, len(short_rtp)) + short_rtp
-
-        class _ExactReader:
-            def __init__(self, data: bytes) -> None:
-                self._data = bytearray(data)
-                self._pos = 0
-
-            async def readexactly(self, n: int) -> bytes:
-                end = self._pos + n
-                if end > len(self._data):
-                    raise asyncio.IncompleteReadError(b"", n)
-                result = bytes(self._data[self._pos : end])
-                self._pos = end
-                return result
-
-        await server._receive_backchannel_rtp(_ExactReader(interleaved))
-        assert server.backchannel_queue.empty()
-
-    @pytest.mark.asyncio
-    async def test_announce_flow_through_handle_client(self):
-        """ANNOUNCE through _handle_client reads body and sends 200 OK."""
-        server = LocalRtspServer()
-        server._running = True
-
-        sdp_body = b"v=0\r\nm=audio 0 RTP/AVP 8\r\n"
-        announce = (
-            f"ANNOUNCE rtsp://127.0.0.1/intercom/backchannel RTSP/1.0\r\n"
-            f"CSeq: 1\r\n"
-            f"Content-Type: application/sdp\r\n"
-            f"Content-Length: {len(sdp_body)}\r\n"
-            f"\r\n"
-        ).encode()
-
-        reader = _RequestReader([announce + sdp_body, b""])
-        writer = _ResponseWriter()
-        await server._handle_client(reader, writer)
-        # ANNOUNCE must be answered with 200 OK
-        assert b"RTSP/1.0 200 OK" in writer.data
-
-
 # ---------------------------------------------------------------------------
 # RFC 3550/3551 audio pause encoding (wall-clock ts advance + marker bit)
 # ---------------------------------------------------------------------------
@@ -2264,3 +2108,220 @@ class TestAudioPauseEncoding:
 
         assert server._last_audio_send_ts == 5000  # ts of the packet actually sent
         assert server._audio_ts == 5160  # advanced for the next contiguous frame
+
+
+# ---------------------------------------------------------------------------
+# Require-header backchannel negotiation (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+class TestBackchannelNegotiation:
+    def test_sdp_without_require_has_two_mlines(self):
+        """Plain DESCRIBE: video + one audio m-line, no direction attributes."""
+        server = LocalRtspServer()
+        sdp = server._build_sdp()
+        assert sdp.count("m=video") == 1
+        assert sdp.count("m=audio") == 1
+        assert "a=sendonly" not in sdp
+        assert "a=recvonly" not in sdp
+        assert "a=control:audio" in sdp
+        assert "backchannel" not in sdp
+
+    def test_sdp_with_backchannel_adds_sendonly_mline(self):
+        """Require-header DESCRIBE: third m-line, sendonly, control:backchannel."""
+        server = LocalRtspServer()
+        sdp = server._build_sdp(backchannel=True)
+        assert sdp.count("m=audio") == 2
+        # sendonly appears exactly once, inside the backchannel m-line block
+        assert sdp.count("a=sendonly") == 1
+        backchannel_block = sdp.split("m=audio")[2]
+        assert "a=sendonly" in backchannel_block
+        assert "a=control:backchannel" in backchannel_block
+        # the main audio m-line stays direction-free
+        main_audio_block = sdp.split("m=audio")[1]
+        assert "sendonly" not in main_audio_block
+        assert "recvonly" not in main_audio_block
+
+    @pytest.mark.asyncio
+    async def test_describe_with_require_header_gates_sdp(self):
+        server = LocalRtspServer()
+        server._running = True
+        req = (
+            b"DESCRIBE rtsp://127.0.0.1/intercom RTSP/1.0\r\n"
+            b"CSeq: 1\r\n"
+            b"Require: www.onvif.org/ver20/backchannel\r\n\r\n"
+        )
+        reader = _RequestReader([req, b""])
+        writer = _ResponseWriter()
+        await server._handle_client(reader, writer)
+        assert b"a=control:backchannel" in writer.data
+
+    @pytest.mark.asyncio
+    async def test_describe_without_require_header_omits_backchannel(self):
+        server = LocalRtspServer()
+        server._running = True
+        req = b"DESCRIBE rtsp://127.0.0.1/intercom RTSP/1.0\r\nCSeq: 1\r\n\r\n"
+        reader = _RequestReader([req, b""])
+        writer = _ResponseWriter()
+        await server._handle_client(reader, writer)
+        assert b"backchannel" not in writer.data
+
+    def test_setup_backchannel_url_routes_to_backchannel_ch(self):
+        server = LocalRtspServer()
+        client = _TcpClient(writer=MagicMock())
+        resp = server._parse_setup(
+            "RTP/AVP/TCP;unicast;interleaved=4-5",
+            False,
+            client,
+            "127.0.0.1",
+            is_backchannel=True,
+        )
+        assert client.backchannel_ch == 4
+        assert client.audio_ch is None
+        assert client.video_ch is None
+        assert "interleaved=4-5" in resp
+
+    @pytest.mark.asyncio
+    async def test_announce_now_rejected(self):
+        """ANNOUNCE is no longer supported — 405."""
+        server = LocalRtspServer()
+        server._running = True
+        req = b"ANNOUNCE rtsp://127.0.0.1/intercom RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n"
+        reader = _RequestReader([req, b""])
+        writer = _ResponseWriter()
+        await server._handle_client(reader, writer)
+        assert b"405 Method Not Allowed" in writer.data
+
+    @pytest.mark.asyncio
+    async def test_options_no_longer_advertises_announce_record(self):
+        server = LocalRtspServer()
+        server._running = True
+        req = b"OPTIONS rtsp://127.0.0.1/intercom RTSP/1.0\r\nCSeq: 1\r\n\r\n"
+        reader = _RequestReader([req, b""])
+        writer = _ResponseWriter()
+        await server._handle_client(reader, writer)
+        assert b"ANNOUNCE" not in writer.data
+        assert b"RECORD" not in writer.data
+        assert b"PLAY" in writer.data
+
+
+# ---------------------------------------------------------------------------
+# _read_client_stream + _on_backchannel_rtp (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+def _rtp(pt: int = 8, payload: bytes = b"\xaa" * 160, cc: int = 0, ext: bool = False) -> bytes:
+    b0 = 0x80 | (0x10 if ext else 0) | cc
+    hdr = struct.pack("!BBHII", b0, pt, 1, 160, 0xDEADBEEF)
+    hdr += b"\x00\x00\x00\x00" * cc
+    if ext:
+        hdr += struct.pack("!HH", 0xBEDE, 1) + b"\x00\x00\x00\x00"
+    return hdr + payload
+
+
+def _interleave(ch: int, frame: bytes) -> bytes:
+    return struct.pack("!BBH", 0x24, ch, len(frame)) + frame
+
+
+class TestReadClientStream:
+    class _ChunkReader:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self._chunks = list(chunks)
+
+        async def read(self, n: int) -> bytes:
+            if self._chunks:
+                return self._chunks.pop(0)
+            return b""
+
+    @pytest.mark.asyncio
+    async def test_backchannel_frame_lands_in_queue(self):
+        server = LocalRtspServer()
+        server._running = True
+        client = _TcpClient(writer=MagicMock(), backchannel_ch=4)
+        reader = self._ChunkReader([_interleave(4, _rtp())])
+        await server._read_client_stream(reader, client)
+        assert server.backchannel_queue.get_nowait() == b"\xaa" * 160
+        assert server.backchannel_rx_count == 1
+
+    @pytest.mark.asyncio
+    async def test_other_channel_ignored(self):
+        server = LocalRtspServer()
+        server._running = True
+        client = _TcpClient(writer=MagicMock(), backchannel_ch=4)
+        reader = self._ChunkReader([_interleave(2, _rtp())])
+        await server._read_client_stream(reader, client)
+        assert server.backchannel_queue.empty()
+
+    @pytest.mark.asyncio
+    async def test_no_backchannel_setup_ignores_frames(self):
+        server = LocalRtspServer()
+        server._running = True
+        client = _TcpClient(writer=MagicMock())  # backchannel_ch=None
+        reader = self._ChunkReader([_interleave(0, _rtp())])
+        await server._read_client_stream(reader, client)
+        assert server.backchannel_queue.empty()
+
+    @pytest.mark.asyncio
+    async def test_teardown_text_ends_stream(self):
+        server = LocalRtspServer()
+        server._running = True
+        client = _TcpClient(writer=MagicMock(), backchannel_ch=4)
+        reader = self._ChunkReader([b"TEARDOWN rtsp://x RTSP/1.0\r\n", _interleave(4, _rtp())])
+        await server._read_client_stream(reader, client)
+        assert server.backchannel_queue.empty()  # returned before the frame
+
+    @pytest.mark.asyncio
+    async def test_split_frame_across_reads_reassembled(self):
+        server = LocalRtspServer()
+        server._running = True
+        client = _TcpClient(writer=MagicMock(), backchannel_ch=4)
+        frame = _interleave(4, _rtp())
+        reader = self._ChunkReader([frame[:10], frame[10:]])
+        await server._read_client_stream(reader, client)
+        assert server.backchannel_queue.get_nowait() == b"\xaa" * 160
+
+
+class TestOnBackchannelRtp:
+    def test_pcma_payload_queued(self):
+        server = LocalRtspServer()
+        server._on_backchannel_rtp(_rtp(pt=8))
+        assert server.backchannel_queue.get_nowait() == b"\xaa" * 160
+
+    def test_pcmu_payload_queued(self):
+        server = LocalRtspServer()
+        server._on_backchannel_rtp(_rtp(pt=0))
+        assert not server.backchannel_queue.empty()
+
+    def test_non_g711_rejected(self):
+        server = LocalRtspServer()
+        server._on_backchannel_rtp(_rtp(pt=96))
+        assert server.backchannel_queue.empty()
+
+    def test_short_packet_rejected(self):
+        server = LocalRtspServer()
+        server._on_backchannel_rtp(b"\x80\x08\x00")
+        assert server.backchannel_queue.empty()
+
+    def test_csrc_skipped(self):
+        server = LocalRtspServer()
+        server._on_backchannel_rtp(_rtp(pt=8, cc=2))
+        assert server.backchannel_queue.get_nowait() == b"\xaa" * 160
+
+    def test_extension_header_skipped(self):
+        server = LocalRtspServer()
+        server._on_backchannel_rtp(_rtp(pt=8, ext=True))
+        assert server.backchannel_queue.get_nowait() == b"\xaa" * 160
+
+    def test_empty_payload_rejected(self):
+        server = LocalRtspServer()
+        server._on_backchannel_rtp(_rtp(pt=8, payload=b""))
+        assert server.backchannel_queue.empty()
+
+    def test_queue_full_drops_oldest(self):
+        server = LocalRtspServer()
+        server.backchannel_queue = asyncio.Queue(maxsize=2)
+        server._on_backchannel_rtp(_rtp(payload=b"\x01" * 160))
+        server._on_backchannel_rtp(_rtp(payload=b"\x02" * 160))
+        server._on_backchannel_rtp(_rtp(payload=b"\x03" * 160))
+        assert server.backchannel_queue.get_nowait() == b"\x02" * 160
+        assert server.backchannel_queue.get_nowait() == b"\x03" * 160
