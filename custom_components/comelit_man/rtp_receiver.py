@@ -9,7 +9,10 @@ import logging
 import secrets
 import struct
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
 
 from .protocol import HEADER_SIZE, ICONA_BRIDGE_PORT
 
@@ -211,24 +214,36 @@ class RtpReceiver:
         self._keepalive_task = asyncio.create_task(self._keepalive_loop())
         _LOGGER.debug("UDP keepalive loop started")
 
-    def start_audio_sender(self, device_rtpc_req_id: int) -> None:
-        """Start sending blank PCMA audio frames to the device.
+    def start_audio_sender(
+        self,
+        device_rtpc_req_id: int,
+        tcp_send: Callable[[bytes], Awaitable[None]] | None = None,
+    ) -> None:
+        """Start sending PCMA audio frames to the device.
 
         Uses the req_id from the device's own RTPC channel open in the ICONA
         header (captured after the device opens its RTPC post-video-config).
-        Sends 160-byte G.711 A-law silence at 20 ms intervals (8 kHz, PT=8).
-        Callers can replace silence with real audio in a future implementation
-        by writing to an injected queue; for now blank frames keep the audio
-        path alive even when no microphone source is available.
+        Sends 160-byte G.711 A-law frames at 20 ms intervals (8 kHz, PT=8):
+        real mic audio when a backchannel queue is attached, silence otherwise.
+
+        Transport matches the session's media transport (PCAP-verified
+        2026-08-27): the Android app's UDP-media calls answer with UDP from
+        the media port; our inbound calls run media over TCP, where UDP TX
+        went unheard — pass tcp_send to deliver frames on the device's TCP
+        RTPC channel instead.
         """
         if self._audio_sender_task and not self._audio_sender_task.done():
             _LOGGER.debug("Audio sender already running — skipping duplicate start")
             return
-        self._audio_sender_task = asyncio.create_task(self._audio_send_loop(device_rtpc_req_id))
+        self._audio_sender_task = asyncio.create_task(self._audio_send_loop(device_rtpc_req_id, tcp_send))
         _LOGGER.debug("Audio sender started (device_rtpc_req_id=0x%04X)", device_rtpc_req_id)
 
-    async def _audio_send_loop(self, device_rtpc_req_id: int) -> None:
-        """Send PCMA audio frames every 20 ms on the existing UDP socket.
+    async def _audio_send_loop(
+        self,
+        device_rtpc_req_id: int,
+        tcp_send: Callable[[bytes], Awaitable[None]] | None = None,
+    ) -> None:
+        """Send PCMA audio frames every 20 ms, transport-matched to the media.
 
         When a backchannel queue is attached (go2rtc mic audio), real frames
         are sent; otherwise silence (0xD5) fills each 20 ms slot.
@@ -265,7 +280,16 @@ class RtpReceiver:
                     ts & 0xFFFFFFFF,
                     ssrc,
                 )
-                if self._transport:
+                # Transport-match the session's media path: TCP-media calls
+                # take TX on the device's TCP RTPC channel; UDP-media calls
+                # take UDP from the media socket (app-PCAP-verified).
+                if tcp_send is not None and self._tcp_media_packet_count > self._udp_media_packet_count:
+                    try:
+                        await tcp_send(rtp_header + payload[:160])
+                        self._audio_sent_count += 1
+                    except Exception:
+                        _LOGGER.debug("TCP audio TX failed", exc_info=True)
+                elif self._transport:
                     self._transport.sendto(icona_prefix + rtp_header + payload[:160])
                     self._audio_sent_count += 1
                 seq += 1

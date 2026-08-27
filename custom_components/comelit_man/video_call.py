@@ -1194,7 +1194,18 @@ class VideoCallSession:
                 _LOGGER.warning("answer_inbound: device RTPC not opened within timeout — audio unavailable")
 
         if self._rtp_receiver and self._device_rtpc_req_id:
-            self._rtp_receiver.start_audio_sender(self._device_rtpc_req_id)
+            # TCP TX path for TCP-media sessions: frames go out on the
+            # device's own RTPC channel (send_binary frames them with the
+            # same req_id the UDP path stamps into its ICONA header).
+            device_rtpc = self._inbound_device_rtpc
+            client = self._client
+            tcp_send = None
+            if device_rtpc is not None:
+
+                async def tcp_send(body: bytes) -> None:
+                    await client.send_binary(device_rtpc, body)
+
+            self._rtp_receiver.start_audio_sender(self._device_rtpc_req_id, tcp_send=tcp_send)
             _LOGGER.info("Inbound answered — audio started (req_id=0x%04X)", self._device_rtpc_req_id)
 
     @staticmethod

@@ -1728,7 +1728,11 @@ class TestAnswerInbound:
         assert encode_call_response_ack(our_addr, our_base, _transform_device_ts(DEV_TS_E)) in sent_payloads
 
         # Audio sender started with device RTPC req_id
-        mock_receiver.start_audio_sender.assert_called_once_with(0xBBBB)
+        assert mock_receiver.start_audio_sender.call_count == 1
+        args, kwargs = mock_receiver.start_audio_sender.call_args
+        assert args[0] == 0xBBBB
+        # TCP TX path is offered for TCP-media inbound sessions
+        assert "tcp_send" in kwargs
 
     @pytest.mark.asyncio
     async def test_answer_inbound_already_answered_is_noop(self):
