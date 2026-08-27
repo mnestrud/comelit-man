@@ -49,6 +49,9 @@ class ComelitDoorbellCard extends HTMLElement {
     this._micAvailable = false;
     this._starting = false;
     this._retryTimer = null;
+    this._mediaStream = null;
+    this._sessionId = null;
+    this._candQueue = [];
     this.attachShadow({ mode: "open" });
   }
 
@@ -244,13 +247,19 @@ class ComelitDoorbellCard extends HTMLElement {
       this._updateMicChip();
 
       const video = this.shadowRoot.getElementById("stream");
+      this._mediaStream = new MediaStream();
       pc.ontrack = (ev) => {
-        if (video && ev.streams[0] && video.srcObject !== ev.streams[0]) {
-          video.srcObject = ev.streams[0];
-          video.muted = this._state !== "answered";
-          video.play().catch(() => {});
-          this._setStatus("");
+        if (!video) return;
+        // go2rtc answers don't always carry stream (msid) associations —
+        // accumulate tracks into our own MediaStream when ev.streams is empty.
+        const stream = ev.streams[0] ?? this._mediaStream;
+        if (!ev.streams[0]) this._mediaStream.addTrack(ev.track);
+        if (video.srcObject !== stream) {
+          video.srcObject = stream;
         }
+        video.muted = this._state !== "answered";
+        video.play().catch(() => {});
+        this._setStatus("");
       };
 
       pc.onconnectionstatechange = () => {
@@ -260,12 +269,17 @@ class ComelitDoorbellCard extends HTMLElement {
         }
       };
 
-      // Non-trickle offer: the integration's provider forwards one complete
-      // SDP to go2rtc, so wait for ICE gathering before sending (2s cap —
-      // TURN relay candidates need a moment on remote connections).
+      // Trickle ICE: candidates are forwarded through camera/webrtc/candidate
+      // once the session id arrives; queue any that beat it.
+      this._sessionId = null;
+      this._candQueue = [];
+      pc.onicecandidate = (ev) => {
+        if (!ev.candidate?.candidate) return;
+        this._sendCandidate(ev.candidate);
+      };
+
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      await this._waitIceComplete(pc, 2000);
 
       this._unsub = await this._hass.connection.subscribeMessage(
         (msg) => this._onSignal(msg),
@@ -286,7 +300,11 @@ class ComelitDoorbellCard extends HTMLElement {
   _onSignal(msg) {
     const pc = this._pc;
     if (!pc) return;
-    if (msg.type === "answer") {
+    if (msg.type === "session") {
+      this._sessionId = msg.session_id;
+      const queued = this._candQueue.splice(0);
+      queued.forEach((c) => this._sendCandidate(c));
+    } else if (msg.type === "answer") {
       pc.setRemoteDescription({ type: "answer", sdp: msg.answer }).catch(
         (err) => this._setStatus(`Stream error: ${err?.message ?? err}`)
       );
@@ -298,17 +316,23 @@ class ComelitDoorbellCard extends HTMLElement {
     }
   }
 
-  _waitIceComplete(pc, timeoutMs) {
-    if (pc.iceGatheringState === "complete") return Promise.resolve();
-    return new Promise((resolve) => {
-      const timer = setTimeout(resolve, timeoutMs);
-      pc.onicegatheringstatechange = () => {
-        if (pc.iceGatheringState === "complete") {
-          clearTimeout(timer);
-          resolve();
-        }
-      };
-    });
+  _sendCandidate(candidate) {
+    if (!this._sessionId) {
+      this._candQueue.push(candidate);
+      return;
+    }
+    this._hass.connection
+      .sendMessagePromise({
+        type: "camera/webrtc/candidate",
+        entity_id: this._config.camera_entity,
+        session_id: this._sessionId,
+        candidate: {
+          candidate: candidate.candidate,
+          sdpMid: candidate.sdpMid,
+          sdpMLineIndex: candidate.sdpMLineIndex,
+        },
+      })
+      .catch(() => {});
   }
 
   _scheduleRetry() {
@@ -349,6 +373,9 @@ class ComelitDoorbellCard extends HTMLElement {
     }
     const video = this.shadowRoot?.getElementById("stream");
     if (video) video.srcObject = null;
+    this._mediaStream = null;
+    this._sessionId = null;
+    this._candQueue = [];
   }
 
   _setMicEnabled(enabled) {
