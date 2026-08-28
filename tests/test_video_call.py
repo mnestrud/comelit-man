@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import struct
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -172,19 +173,23 @@ class TestCtppMonitorLoop:
         session._external_rtsp = False
         session._ctpp_lock = asyncio.Lock()
         session._call_counter = 0
+        session._answer_handoff = None
+        session._on_ring = None
         return session
 
     @pytest.mark.asyncio
     async def test_ctpp_keepalive_is_acked(self):
-        """0x1840/0x0000 keepalive should be ACKed with 0x1800."""
+        """0x1840/0x0000 keepalive is ACKed with 0x1800 using transform(device_ts)."""
         import struct
+
+        from custom_components.comelit_man.video_call import _transform_device_ts
 
         session = self._make_session()
 
         sent_data = []
-
+        DEV_TS = 0x12345678
         mock_client = MagicMock()
-        keepalive_body = struct.pack("<H", 0x1840) + struct.pack("<I", 0x12345678) + struct.pack(">H", 0x0000)
+        keepalive_body = struct.pack("<H", 0x1840) + struct.pack("<I", DEV_TS) + struct.pack(">H", 0x0000)
 
         call_count = 0
 
@@ -211,10 +216,14 @@ class TestCtppMonitorLoop:
             media_req_id=0x1234,
         )
 
-        # An ACK (0x1800 prefix) should have been sent
         assert len(sent_data) == 1
         prefix = struct.unpack_from("<H", sent_data[0], 0)[0]
         assert prefix == 0x1800
+        # ACK timestamp must be transform(device_ts), not a counter
+        ack_ts = struct.unpack_from("<I", sent_data[0], 2)[0]
+        assert ack_ts == _transform_device_ts(DEV_TS)
+        # self._call_counter must NOT be updated by an ACK
+        assert session._call_counter == 0
 
     @pytest.mark.asyncio
     async def test_ctpp_call_end_triggers_inline_reestablish(self):
@@ -391,16 +400,19 @@ class TestCtppMonitorLoop:
 
     @pytest.mark.asyncio
     async def test_ctpp_0x1860_message_is_bare_acked(self):
-        """0x1860 messages in the monitor loop (e.g. stray RTPC link after
-        renewal) must be bare-ACKed with 0x1800, not logged as unexpected.
+        """0x1860 messages in the monitor loop must be ACKed with transform(device_ts).
 
         PCAP-verified: device sends 0x1860/0x000A during renewal; if
-        _ack_device_rtpc_link missed it, the monitor loop must still ACK it.
+        _ack_device_rtpc_link missed it, the monitor loop must still ACK it
+        using the correct transform format, not a counter.
         """
         import struct
 
+        from custom_components.comelit_man.video_call import _transform_device_ts
+
         session = self._make_session()
         sent_data = []
+        DEV_TS = 0xCAFEBABE
 
         mock_client = MagicMock()
         call_count = 0
@@ -409,7 +421,7 @@ class TestCtppMonitorLoop:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                return struct.pack("<H", 0x1860) + struct.pack("<I", 0xCAFEBABE) + struct.pack(">H", 0x000A)
+                return struct.pack("<H", 0x1860) + struct.pack("<I", DEV_TS) + struct.pack(">H", 0x000A)
             session._active = False
             raise TimeoutError()
 
@@ -429,6 +441,8 @@ class TestCtppMonitorLoop:
         assert len(sent_data) == 1
         prefix = struct.unpack_from("<H", sent_data[0], 0)[0]
         assert prefix == 0x1800, f"Expected 0x1800 ACK, got 0x{prefix:04X}"
+        ack_ts = struct.unpack_from("<I", sent_data[0], 2)[0]
+        assert ack_ts == _transform_device_ts(DEV_TS)
 
 
 class TestAckDeviceRtpcLink:
@@ -900,6 +914,8 @@ class TestCtppMonitorLoopRarePaths:
         session._external_rtsp = False
         session._ctpp_lock = asyncio.Lock()
         session._call_counter = 0
+        session._answer_handoff = None
+        session._on_ring = None
         session._on_call_end = on_call_end
         return session
 
@@ -1531,6 +1547,9 @@ class TestStartInbound:
         session._ctpp_lock = asyncio.Lock()
         session._on_call_end = None
         session._on_timeout = None
+        session._inbound_device_rtpc = None
+        session._answer_handoff = None
+        session._on_ring = None
         return session
 
     @pytest.mark.asyncio
@@ -1551,8 +1570,9 @@ class TestStartInbound:
         await session.stop()
 
     @pytest.mark.asyncio
-    async def test_start_inbound_stores_device_rtpc_req_id(self):
-        """start_inbound stores the device RTPC server channel ID for answer_inbound."""
+    async def test_start_inbound_stores_inbound_device_rtpc_not_req_id(self):
+        """start_inbound saves the device RTPC placeholder on self._inbound_device_rtpc
+        but does NOT set _device_rtpc_req_id — that's deferred to answer_inbound()."""
         config, mock_client, mock_receiver, mock_rtsp, ctpp_ch = self._make_mocks()
         session = self._make_session(config, mock_client)
 
@@ -1562,7 +1582,10 @@ class TestStartInbound:
         ):
             await session.start_inbound("SB100001", 0x12345678)
 
-        assert session._device_rtpc_req_id == 0xBBBB
+        # Answer is deferred — req_id stays 0 until answer_inbound() is called
+        assert session._device_rtpc_req_id == 0
+        # Placeholder must be stored for answer_inbound() to await
+        assert session._inbound_device_rtpc is not None
         await session.stop()
 
     @pytest.mark.asyncio
@@ -1600,23 +1623,15 @@ class TestStartInbound:
 
         renewal = struct.pack("<HI", 0x1860, 0xAAAAAAAA) + struct.pack(">HH", 0x0010, 0x0000)
         bundle = struct.pack("<HI", 0x1840, 0x11111111) + struct.pack(">HH", 0x0008, 0x0000)
-        rtpc_link = struct.pack("<HI", 0x1840, 0x22222222) + struct.pack(">HH", 0x000A, 0x0011)
-        peer_msg = struct.pack("<HI", 0x1840, 0x33333333) + struct.pack(">HH", 0x000E, 0x0000)
 
         await ctpp_ch.response_queue.put(renewal)
         await ctpp_ch.response_queue.put(bundle)
 
-        async def fake_sleep(t):
-            # Inject rtpc_link + peer during the 3s video_config retransmit sleep
-            # so the Step 15 drain can complete without timing out.
-            if t == 3.0:
-                await ctpp_ch.response_queue.put(rtpc_link)
-                await ctpp_ch.response_queue.put(peer_msg)
-
+        # Steps 13-17 (peer, call_accepted, drain, device RTPC, audio) are now
+        # deferred to answer_inbound() — no injection needed for start_inbound().
         with (
             patch("custom_components.comelit_man.video_call.RtpReceiver", return_value=mock_receiver),
             patch("custom_components.comelit_man.video_call.LocalRtspServer", return_value=mock_rtsp),
-            patch("asyncio.sleep", AsyncMock(side_effect=fake_sleep)),
         ):
             await session.start_inbound("SB100001", 0x12345678, renewal_ack_ts=RENEWAL_ACK_TS)
 
@@ -1629,32 +1644,267 @@ class TestStartInbound:
 
 
 class TestAnswerInbound:
-    """Tests for VideoCallSession.answer_inbound()."""
+    """Tests for VideoCallSession.answer_inbound() — now async."""
 
-    def _make_session_with_receiver(self, device_rtpc_req_id: int = 0x1234):
+    def _make_session(self, device_rtpc_req_id: int = 0, inbound_rtpc_pre_opened: bool = True):
+        """Build a session in the passive-inbound state (after start_inbound)."""
+        config = MagicMock()
+        config.apt_address = "SB000006"
+        config.apt_subaddress = "1"
+
+        ctpp_ch = MagicMock()
+        ctpp_ch.server_channel_id = 0x0010
+
+        mock_client = MagicMock()
+        mock_client.get_channel = MagicMock(return_value=ctpp_ch)
+        mock_client.send_binary = AsyncMock()
+
+        inbound_device_rtpc = MagicMock()
+        inbound_device_rtpc.open_event = asyncio.Event()
+        inbound_device_rtpc.server_channel_id = 0xBBBB
+        if inbound_rtpc_pre_opened:
+            inbound_device_rtpc.open_event.set()
+
+        mock_receiver = MagicMock()
+        mock_receiver.start_audio_sender = MagicMock()
+
         session = VideoCallSession.__new__(VideoCallSession)
         session._active = True
         session._device_rtpc_req_id = device_rtpc_req_id
-        mock_receiver = MagicMock()
-        mock_receiver.start_audio_sender = MagicMock()
         session._rtp_receiver = mock_receiver
-        return session, mock_receiver
+        session._client = mock_client
+        session._config = config
+        session._ctpp_lock = asyncio.Lock()
+        session._call_counter = 0x00100000
+        session._inbound_device_rtpc = inbound_device_rtpc
+        session._answer_handoff = None
+        session._on_ring = None
+        return session, mock_client, mock_receiver, ctpp_ch, inbound_device_rtpc
 
-    def test_answer_inbound_calls_start_audio_sender(self):
-        """answer_inbound starts the audio sender with the device RTPC req_id."""
-        session, mock_receiver = self._make_session_with_receiver(device_rtpc_req_id=0x1234)
-        session.answer_inbound()
-        mock_receiver.start_audio_sender.assert_called_once_with(0x1234)
+    @pytest.mark.asyncio
+    async def test_answer_inbound_sends_peer_call_accepted_transform_acks_starts_audio(self):
+        """answer_inbound sends peer+call_accepted, drains 0x000A/0x000E with
+        transform(device_ts) ACKs, waits for device RTPC, starts audio."""
+        import struct
 
-    def test_answer_inbound_no_op_when_no_receiver(self):
-        """answer_inbound is a no-op (does not raise) when receiver is None."""
-        session = VideoCallSession.__new__(VideoCallSession)
-        session._rtp_receiver = None
-        session._device_rtpc_req_id = 0x1234
-        session.answer_inbound()  # must not raise
+        from custom_components.comelit_man.video_call import _transform_device_ts
 
-    def test_answer_inbound_no_op_when_req_id_zero(self):
-        """answer_inbound is a no-op when device_rtpc_req_id is 0 (RTPC never opened)."""
-        session, mock_receiver = self._make_session_with_receiver(device_rtpc_req_id=0)
-        session.answer_inbound()
+        session, mock_client, mock_receiver, ctpp_ch, _ = self._make_session()
+
+        DEV_TS_A = 0xAABBCCDD  # 0x000A device timestamp
+        DEV_TS_E = 0x11223344  # 0x000E device timestamp
+        rtpc_link_msg = struct.pack("<HI", 0x1840, DEV_TS_A) + struct.pack(">H", 0x000A)
+        peer_msg = struct.pack("<HI", 0x1840, DEV_TS_E) + struct.pack(">H", 0x000E)
+
+        our_addr = "SB0000061"
+        our_base = "SB000006"
+
+        async def run_and_inject():
+            # Inject 0x000A + 0x000E into the handoff queue once it's created
+            while session._answer_handoff is None:
+                await asyncio.sleep(0)
+            await session._answer_handoff.put(rtpc_link_msg)
+            await session._answer_handoff.put(peer_msg)
+
+        inject_task = asyncio.create_task(run_and_inject())
+        await session.answer_inbound()
+        await inject_task
+
+        calls = mock_client.send_binary.call_args_list
+        sent_payloads = [c.args[1] for c in calls]
+
+        # Peer + call_accepted must be the first two sends
+        from custom_components.comelit_man.protocol import encode_answer_peer, encode_call_accepted
+
+        counter_after_peer = (0x00100000 + 0x00010000) & 0xFFFFFFFF
+        counter_after_accepted = (counter_after_peer + 0x00010000) & 0xFFFFFFFF
+        assert encode_answer_peer(our_addr, our_base, counter_after_peer, inbound=True) in sent_payloads
+        assert encode_call_accepted(our_addr, our_base, counter_after_accepted) in sent_payloads
+
+        # Transform-based ACKs for 0x000A and 0x000E
+        from custom_components.comelit_man.protocol import encode_call_response_ack
+
+        assert encode_call_response_ack(our_addr, our_base, _transform_device_ts(DEV_TS_A)) in sent_payloads
+        assert encode_call_response_ack(our_addr, our_base, _transform_device_ts(DEV_TS_E)) in sent_payloads
+
+        # Audio sender started with device RTPC req_id
+        assert mock_receiver.start_audio_sender.call_count == 1
+        args, kwargs = mock_receiver.start_audio_sender.call_args
+        assert args[0] == 0xBBBB
+        # TCP TX path is offered for TCP-media inbound sessions
+        assert "tcp_send" in kwargs
+
+    @pytest.mark.asyncio
+    async def test_answer_inbound_already_answered_is_noop(self):
+        """answer_inbound is a no-op when _device_rtpc_req_id is already set."""
+        session, mock_client, mock_receiver, _, _ = self._make_session(device_rtpc_req_id=0x1234)
+        await session.answer_inbound()
+        mock_client.send_binary.assert_not_called()
         mock_receiver.start_audio_sender.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_answer_inbound_no_op_when_no_receiver(self):
+        """answer_inbound is a no-op (no raise) when receiver is None."""
+        session, mock_client, _, _, _ = self._make_session()
+        session._rtp_receiver = None
+        await session.answer_inbound()  # must not raise
+        mock_client.send_binary.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_answer_inbound_device_rtpc_timeout_skips_audio(self):
+        """If device RTPC open_event never fires, audio sender is NOT started."""
+        import struct
+
+        session, _, mock_receiver, _, _ = self._make_session(inbound_rtpc_pre_opened=False)
+
+        DEV_TS_A = 0xAABBCCDD
+        DEV_TS_E = 0x11223344
+        rtpc_link_msg = struct.pack("<HI", 0x1840, DEV_TS_A) + struct.pack(">H", 0x000A)
+        peer_msg = struct.pack("<HI", 0x1840, DEV_TS_E) + struct.pack(">H", 0x000E)
+
+        async def run_and_inject():
+            while session._answer_handoff is None:
+                await asyncio.sleep(0)
+            await session._answer_handoff.put(rtpc_link_msg)
+            await session._answer_handoff.put(peer_msg)
+
+        inject_task = asyncio.create_task(run_and_inject())
+        with patch("custom_components.comelit_man.video_call.VIDEO_RESPONSE_TIMEOUT", 0.05):
+            await session.answer_inbound()
+        await inject_task
+
+        mock_receiver.start_audio_sender.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _forward_ring — mid-call ring forwarding (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+class TestForwardRing:
+    def _make_session(self, on_ring=None) -> VideoCallSession:
+        session = VideoCallSession.__new__(VideoCallSession)
+        session._active = True
+        session._client = None
+        session._rtp_receiver = None
+        session._rtsp_server = None
+        session._external_rtsp = False
+        session._ctpp_lock = asyncio.Lock()
+        session._call_counter = 0
+        session._answer_handoff = None
+        session._on_ring = on_ring
+        return session
+
+    @staticmethod
+    def _ring_frame(ring_ts: int = 0x27EEAB1C, addresses: tuple[str, ...] = ("SB100001", "SB000003")) -> bytes:
+        buf = bytearray()
+        buf += struct.pack("<H", 0x18C0)
+        buf += struct.pack("<I", ring_ts)
+        buf += struct.pack(">H", 0x0028)
+        buf += struct.pack(">H", 0x0001)
+        buf += b"\xff\xff\xff\xff"
+        for addr in addresses:
+            buf += addr.encode("ascii") + b"\x00"
+        return bytes(buf)
+
+    def test_forwards_entrance_and_ring_ts(self):
+        rings = []
+        session = self._make_session(on_ring=lambda addr, ts: rings.append((addr, ts)))
+        session._forward_ring(self._ring_frame())
+        assert rings == [("SB100001", 0x27EEAB1C)]
+
+    def test_no_callback_is_noop(self):
+        session = self._make_session(on_ring=None)
+        session._forward_ring(self._ring_frame())  # must not raise
+
+    def test_unparseable_frame_ignored(self):
+        rings = []
+        session = self._make_session(on_ring=lambda addr, ts: rings.append((addr, ts)))
+        session._forward_ring(b"\x00\x01")
+        assert rings == []
+
+    def test_no_addresses_forwards_empty_entrance(self):
+        rings = []
+        session = self._make_session(on_ring=lambda addr, ts: rings.append((addr, ts)))
+        session._forward_ring(self._ring_frame(addresses=()))
+        assert rings == [("", 0x27EEAB1C)]
+
+    def test_callback_exception_swallowed(self):
+        def boom(addr, ts):
+            raise RuntimeError("boom")
+
+        session = self._make_session(on_ring=boom)
+        session._forward_ring(self._ring_frame())  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_monitor_forwards_18c0_without_ack(self):
+        """0x18C0 in the monitor loop forwards the ring and sends NO ACK."""
+        rings = []
+        session = self._make_session(on_ring=lambda addr, ts: rings.append((addr, ts)))
+
+        sent_data: list[bytes] = []
+        mock_client = MagicMock()
+        mock_client.send_binary = AsyncMock(side_effect=lambda ch, data: sent_data.append(data))
+        frames = [self._ring_frame()]
+
+        async def mock_read_response(channel):
+            if frames:
+                return frames.pop(0)
+            session._active = False
+            return b""
+
+        mock_client.read_response = mock_read_response
+
+        await session._ctpp_monitor_loop(
+            mock_client,
+            MagicMock(),
+            "SB0000031",
+            "SB100001",
+            0x10000000,
+            rtpc1_server_id=0xABCD,
+            media_req_id=0x1234,
+        )
+
+        assert rings == [("SB100001", 0x27EEAB1C)]
+        assert sent_data == []  # no ACK for the new ring
+
+    @pytest.mark.asyncio
+    async def test_monitor_forwards_1860_in_alerting_and_still_acks(self):
+        """0x1860/0x0001 (IN_ALERTING) forwards the ring AND keeps its normal ACK."""
+        rings = []
+        session = self._make_session(on_ring=lambda addr, ts: rings.append((addr, ts)))
+
+        buf = bytearray()
+        buf += struct.pack("<H", 0x1860)
+        buf += struct.pack("<I", 0x11223344)
+        buf += struct.pack(">H", 0x0001)
+        buf += struct.pack(">H", 0x0000)
+        buf += b"\xff\xff\xff\xff"
+        buf += b"SB100001\x00"
+
+        sent_data: list[bytes] = []
+        mock_client = MagicMock()
+        mock_client.send_binary = AsyncMock(side_effect=lambda ch, data: sent_data.append(data))
+        frames = [bytes(buf)]
+
+        async def mock_read_response(channel):
+            if frames:
+                return frames.pop(0)
+            session._active = False
+            return b""
+
+        mock_client.read_response = mock_read_response
+
+        await session._ctpp_monitor_loop(
+            mock_client,
+            MagicMock(),
+            "SB0000031",
+            "SB100001",
+            0x10000000,
+            rtpc1_server_id=0xABCD,
+            media_req_id=0x1234,
+        )
+
+        assert rings == [("SB100001", 0x11223344)]
+        assert len(sent_data) == 1  # existing transform ACK unchanged
+        assert struct.unpack_from("<H", sent_data[0], 0)[0] == 0x1800

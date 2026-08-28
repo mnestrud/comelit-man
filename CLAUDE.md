@@ -4,8 +4,8 @@
 
 Run ALL of these before responding to any user message.
 
-1. `git -C "C:/Users/micha/code/comelit-man" status`
-2. `git -C "C:/Users/micha/code/comelit-man" log --oneline -5`
+1. `git -C /home/ataraxia/code/comelit-man status`
+2. `git -C /home/ataraxia/code/comelit-man log --oneline -5`
 3. Read `custom_components/comelit_man/manifest.json` → note version
 4. Read memory file `memory/comelit_man_audit.md` → note (a) quality tier, (b) `Last full sweep` date, (c) `**Stale rows:**` count from the summary block at the top.
 
@@ -58,26 +58,32 @@ Platforms: `BUTTON, CAMERA, EVENT` | Min HA: `2026.1.0` | Repo: `https://github.
 
 ## Running Tests Locally
 
-**Working directory: `C:/Users/micha/code/comelit-man`**
+**Working directory: `/home/ataraxia/code/comelit-man`**
 
 ```bash
-# First time — create venv (matches CI exactly)
-python -m venv .venv
-.venv\Scripts\pip install pytest pytest-asyncio aiohttp av pytest-cov pytest-homeassistant-custom-component pyturbojpeg
+# First time — create venv
+uv venv .venv
+uv pip install -p .venv/bin/python pytest pytest-asyncio aiohttp av pytest-cov pyturbojpeg homeassistant freezegun syrupy pytest-aiohttp
+```
 
+⚠️ Do NOT install `pytest-homeassistant-custom-component` — its bundled pytest-socket plugin
+blocks socket creation and fails the two `test_video_flow_integration.py` tests (verified
+2026-08-11). Install `homeassistant` directly instead, as above.
+
+```bash
 # All tests
-.venv\Scripts\pytest tests/ -v
+.venv/bin/pytest tests/ -v
 
 # Unit tests only (no device needed)
-.venv\Scripts\pytest tests/test_protocol.py tests/test_client.py tests/test_rtp_receiver.py tests/test_rtsp_server.py tests/test_token.py tests/test_video_call.py tests/test_video_signaling.py -v
+.venv/bin/pytest tests/test_protocol.py tests/test_client.py tests/test_rtp_receiver.py tests/test_rtsp_server.py tests/test_token.py tests/test_video_call.py tests/test_video_signaling.py -v
 
 # Stop on first failure
-.venv\Scripts\pytest tests/ -x --tb=short
+.venv/bin/pytest tests/ -x --tb=short
 ```
 
 Integration tests (real device required):
 ```bash
-COMELIT_HOST=192.168.113.12 COMELIT_TOKEN=<token> .venv\Scripts\pytest tests/test_integration.py -v -s
+COMELIT_HOST=192.168.113.12 COMELIT_TOKEN=<token> .venv/bin/pytest tests/test_integration.py -v -s
 ```
 
 ---
@@ -114,15 +120,15 @@ COMELIT_HOST=192.168.113.12 COMELIT_TOKEN=<token> .venv\Scripts\pytest tests/tes
 
 ## Development and Deploy Workflow
 
-**Source of truth: git repo. Test target: live HA via Samba. Two separate steps.**
+**Source of truth: git repo. Test target: live HA via the /mnt/ha-config mount. Two separate steps.**
 
 ### Step 1 — Edit and test locally
-1. Edit files in `C:/Users/micha/code/comelit-man/custom_components/comelit_man/`
+1. Edit files in `/home/ataraxia/code/comelit-man/custom_components/comelit_man/`
 2. Run `pytest tests/ --tb=short` to catch regressions
 
 ### Step 2 — Deploy to live HA for integration testing
 ```bash
-robocopy "C:\Users\micha\code\comelit-man\custom_components\comelit_man" "\\botworth\config\custom_components\comelit_man" /MIR /NFL /NDL
+rsync -a --delete /home/ataraxia/code/comelit-man/custom_components/comelit_man/ /mnt/ha-config/custom_components/comelit_man/
 ```
 - **Python changes** (any `.py` file): full HA restart required — use `ha_restart` MCP call; do NOT poll after, tell user to confirm when ready
 - **Non-Python changes** (strings.json, translations): reload only — `ha_reload_config component=core`
@@ -144,7 +150,7 @@ git push origin dev
 | When | Use |
 |------|-----|
 | HA entity API signatures, coordinator/flow patterns, HA breaking changes | `ha-dev` agent |
-| After robocopy deploy + restart confirmed | `ha-integration-validator` agent |
+| After rsync deploy + restart confirmed | `ha-integration-validator` agent |
 | General Python/testing questions | Answer directly |
 
 ---
@@ -196,10 +202,12 @@ All entities use `_attr_has_entity_name = True`. Entity IDs reflect the user-con
 | Entity | Description |
 |--------|-------------|
 | `button.<name>_<door_name>` | Press to open door/gate; stops video 10s after if active |
-| `event.<name>_doorbell` | Fires `doorbell_ring` and `missed_call` events |
+| `event.<name>_doorbell` | Fires `ring`, `missed_call`, and `door_opened` events |
 | `camera.<name>_live_feed` | Live video stream from intercom |
-| `button.<name>_start_video_feed` | Manually trigger video call |
-| `button.<name>_stop_video_feed` | Stop active video call |
+| `button.<name>_start_video_feed` | Manually trigger video call (disabled by default) |
+| `button.<name>_stop_video_feed` | Stop active video call (disabled by default) |
+| `button.<name>_answer_doorbell` | Answer an inbound call — starts two-way audio |
+| `image.<name>_last_ring_snapshot` | JPEG captured from video at the last ring |
 
 ---
 
@@ -221,7 +229,7 @@ Three code paths selected automatically by `coordinator.async_open_door`:
 - `rtp_receiver.py`: ICONA header → RTP → H.264 FU-A → PyAV → JPEG; PCMA audio routing
 - `rtsp_server.py`: H.264 over local RTSP (TCP interleaved); monotonic timestamps rebased across calls
 - **Persistent RTSP server** owned by coordinator — started at HA setup, never stopped between calls
-- **`_video_ready_event`** gates `stream_source()` and RTSP `PLAY` handler during CTPP handshake
+- **`_video_ready_event`** (coordinator) gates `camera.stream_source()` during CTPP handshake; RTSP `PLAY` responds immediately (the server's `_ready_event` only gates the audio silence keepalive)
 - **`_video_start_lock`** prevents concurrent `async_start_video` calls
 - RTCP Sender Reports every 5s for NTP/RTP sync
 - Inline re-establishment on CALL_END (~30s): ACK → refresh → no TCP reconnect
@@ -230,9 +238,10 @@ Three code paths selected automatically by `coordinator.async_open_door`:
 
 ## Audio Streaming
 
-- Audio does NOT auto-start — requires explicit "answer" sequence after video starts
+- Audio does NOT auto-start — requires an explicit answer after video starts
 - **Codec: PCMA G.711 A-law, PT=8, 20ms frames (160 bytes/frame)**
-- Answer sequence: `encode_answer_video_reconfig` → `encode_answer_peer` → `encode_answer_config_ack`
+- Inbound answer (`answer_inbound()`): `encode_answer_peer(inbound=True)` → `encode_call_accepted` → drain/ACK device responses → `start_audio_sender()`
+- Outbound calls: a single `0x1840/0x0070` peer/accept (`_send_answer_sequence`) after video flows; the device does not send PCMA on HA-initiated calls
 - Audio arrives on same UDP port as video, distinguished by RTP payload type (PT=8)
 
 ---
@@ -292,8 +301,8 @@ logger:
 
 ## Future Opportunities
 
-### Inbound call answer (complete)
-When a visitor presses the doorbell, the integration auto-answers via `_on_inbound_ring` → `async_start_inbound_video` (coordinator) → `VideoCallSession.start_inbound()` (video_call.py). An "Answer Doorbell" button entity triggers `answer_inbound()` for two-way audio. Live-tested on device 2026-05-30: 547 video frames + 676 audio frames received, 551 audio frames sent.
+### Inbound call answer (complete — passive video + Answer button)
+When a visitor presses the doorbell, the integration starts **passive** inbound video via `_on_inbound_ring` → `async_start_inbound_video` (coordinator) → `VideoCallSession.start_inbound()` (video_call.py). The call is NOT answered — other phones/intercoms keep ringing until the user acts. The "Answer Doorbell" button entity triggers `answer_inbound()` (peer/accept + `start_audio_sender()`) for two-way audio. Live-tested on device 2026-05-30: 547 video frames + 676 audio frames received, 551 audio frames sent.
 
 ### Face recognition via FRCG channel
 The device has a built-in face recognition pipeline. When a ring occurs, the device:
@@ -306,7 +315,7 @@ The device has a built-in face recognition pipeline. When a ring occurs, the dev
 The FRCG channel uses the same JSON-over-ICONA framing as UAUT/UCFG. The `rcg-detected-recognition` payload includes enough metadata (bounding box, existing similarity score) to know whether the device already matched the face against its own database.
 
 ### Full protocol reference
-See `memory/protocol_reference.md` for complete PCAP-derived wire format documentation (ICONA header, CTPP binary format, channel types, inbound/outbound call sequences, audio).
+See **`docs/PROTOCOL.md`** — committed, covers framing, channels, CTPP events and the three timestamp regimes, door paths, outbound/inbound call sequences, media transport symmetry, audio, and the Home Assistant end-to-end path (RTSP → go2rtc → WebRTC, SDP direction traps, trickle ICE, mic secure-context constraint). Encoder-level byte layouts remain in `protocol.py` docstrings.
 
 ---
 
@@ -315,4 +324,4 @@ See `memory/protocol_reference.md` for complete PCAP-derived wire format documen
 - [Original fork source](https://github.com/antoiba86/hass-comelit-intercom-local) — antoiba86
 - [Protocol analysis Part 1](https://grdw.nl/2023/01/28/my-intercom-part-1.html) — grdw (reverse engineering ICONA)
 - [comelit-client](https://github.com/madchicken/comelit-client) — Pierpaolo Follia
-- `memory/protocol_reference.md` — full PCAP-derived protocol reference (this repo)
+- [simllll/hass-comelit-icona](https://github.com/simllll/hass-comelit-icona) — sibling fork; `docs/PROTOCOL.md` (6742W-verified), floor-call tag, backchannel SDP

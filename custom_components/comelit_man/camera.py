@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from typing import TYPE_CHECKING
 
 import aiohttp
 from homeassistant.components.camera import Camera, CameraEntityFeature
-from homeassistant.components.camera.webrtc import WebRTCAnswer, WebRTCError, WebRTCSendMessage
+from homeassistant.components.camera.webrtc import (
+    WebRTCAnswer,
+    WebRTCCandidate,
+    WebRTCError,
+    WebRTCSendMessage,
+)
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from webrtc_models import RTCIceCandidateInit
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -116,6 +124,8 @@ class ComelitIntercomCamera(ComelitEntity, Camera):
         self._remove_push_cb: Callable[[], None] | None = None
         self._remove_stop_video_cb: Callable[[], None] | None = None
         self._remove_state_cb: Callable[[], None] | None = None
+        # Active go2rtc WS signaling sessions: session_id -> (ws, listen task)
+        self._webrtc_sessions: dict[str, tuple[aiohttp.ClientWebSocketResponse, asyncio.Task[None]]] = {}
 
     @property
     def is_streaming(self) -> bool:
@@ -219,21 +229,82 @@ class ComelitIntercomCamera(ComelitEntity, Camera):
         session_id: str,
         send_message: WebRTCSendMessage,
     ) -> None:
-        """Forward WebRTC offer to go2rtc using the pre-registered backchannel stream."""
+        """Open a go2rtc WebSocket signaling session for this offer.
+
+        Uses go2rtc's /api/ws trickle-ICE protocol (same as HA core's go2rtc
+        provider): the offer goes up immediately, and answer + ICE candidates
+        stream back as they arrive. Client candidates are forwarded in
+        async_on_webrtc_candidate. The previous one-shot HTTP POST had no
+        candidate path — every trickled candidate raised "Cannot handle
+        WebRTC candidate" and killed the session (observed live 2026-08-27).
+        """
         name = f"comelit_man_{self._entry_id}"
+        session = async_get_clientsession(self.hass)
         try:
-            async with aiohttp.ClientSession() as http:
-                resp = await http.post(
-                    f"http://127.0.0.1:1984/api/webrtc?src={name}",
-                    data=offer_sdp,
-                    headers={"Content-Type": "application/sdp"},
-                    timeout=aiohttp.ClientTimeout(total=10),
-                )
-                resp.raise_for_status()
-                answer_sdp = await resp.text()
-            send_message(WebRTCAnswer(answer=answer_sdp))
+            ws = await session.ws_connect(
+                f"http://127.0.0.1:1984/api/ws?src={name}",
+                timeout=aiohttp.ClientWSTimeout(ws_close=5.0),
+            )
         except Exception as err:
             send_message(WebRTCError(code="go2rtc_error", message=str(err)))
+            return
+
+        async def listen() -> None:
+            try:
+                async for msg in ws:
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        break
+                    data = msg.json()
+                    mtype = data.get("type")
+                    value = data.get("value")
+                    if mtype == "webrtc/answer":
+                        _LOGGER.debug("WebRTC %s: answer from go2rtc (%d bytes)", session_id, len(value or ""))
+                        send_message(WebRTCAnswer(answer=value))
+                    elif mtype == "webrtc/candidate" and value:
+                        _LOGGER.debug("WebRTC %s: candidate from go2rtc: %.60s", session_id, value)
+                        send_message(WebRTCCandidate(candidate=RTCIceCandidateInit(value)))
+                    elif mtype == "error":
+                        _LOGGER.debug("WebRTC %s: go2rtc error: %s", session_id, value)
+                        send_message(WebRTCError(code="go2rtc_error", message=str(value)))
+                    else:
+                        _LOGGER.debug("WebRTC %s: unhandled go2rtc message type=%s", session_id, mtype)
+            except Exception:
+                _LOGGER.debug("go2rtc signaling session %s ended", session_id, exc_info=True)
+
+        task = self.hass.async_create_background_task(listen(), f"comelit-webrtc-{session_id}")
+        self._webrtc_sessions[session_id] = (ws, task)
+        try:
+            await ws.send_json({"type": "webrtc/offer", "value": offer_sdp})
+        except Exception as err:
+            send_message(WebRTCError(code="go2rtc_error", message=str(err)))
+            self.close_webrtc_session(session_id)
+
+    async def async_on_webrtc_candidate(self, session_id: str, candidate: RTCIceCandidateInit) -> None:
+        """Forward a client ICE candidate to the go2rtc signaling session."""
+        entry = self._webrtc_sessions.get(session_id)
+        if entry is None:
+            _LOGGER.debug("Unknown WebRTC session %s — ignoring candidate", session_id)
+            return
+        ws, _task = entry
+        try:
+            _LOGGER.debug("WebRTC %s: candidate from client: %.60s", session_id, candidate.candidate)
+            await ws.send_json({"type": "webrtc/candidate", "value": candidate.candidate})
+        except Exception:
+            _LOGGER.debug("Failed to forward candidate for session %s", session_id, exc_info=True)
+
+    def close_webrtc_session(self, session_id: str) -> None:
+        """Close a go2rtc signaling session (called on WS unsubscribe)."""
+        entry = self._webrtc_sessions.pop(session_id, None)
+        if entry is None:
+            return
+        ws, task = entry
+        task.cancel()
+
+        async def _close() -> None:
+            with contextlib.suppress(Exception):
+                await ws.close()
+
+        self.hass.async_create_background_task(_close(), f"comelit-webrtc-close-{session_id}")
 
     def _on_push(self, event: PushEvent) -> None:
         """Handle push events — no auto-start; user controls video via button or automation."""

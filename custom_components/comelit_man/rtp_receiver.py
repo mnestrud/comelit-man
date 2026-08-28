@@ -9,7 +9,10 @@ import logging
 import secrets
 import struct
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
 
 from .protocol import HEADER_SIZE, ICONA_BRIDGE_PORT
 
@@ -126,6 +129,9 @@ class RtpReceiver:
         self._keepalive_task: asyncio.Task[None] | None = None
         self._audio_sender_task: asyncio.Task[None] | None = None
         self._audio_sent_count: int = 0
+        # TX audit counters: real mic frames vs silence filler (E2E validation).
+        self.audio_tx_real_count: int = 0
+        self.audio_tx_silence_count: int = 0
 
         # Fires as soon as the first video NAL has been queued — callers can
         # await this to know that video is actually flowing before reporting
@@ -208,24 +214,36 @@ class RtpReceiver:
         self._keepalive_task = asyncio.create_task(self._keepalive_loop())
         _LOGGER.debug("UDP keepalive loop started")
 
-    def start_audio_sender(self, device_rtpc_req_id: int) -> None:
-        """Start sending blank PCMA audio frames to the device.
+    def start_audio_sender(
+        self,
+        device_rtpc_req_id: int,
+        tcp_send: Callable[[bytes], Awaitable[None]] | None = None,
+    ) -> None:
+        """Start sending PCMA audio frames to the device.
 
         Uses the req_id from the device's own RTPC channel open in the ICONA
         header (captured after the device opens its RTPC post-video-config).
-        Sends 160-byte G.711 A-law silence at 20 ms intervals (8 kHz, PT=8).
-        Callers can replace silence with real audio in a future implementation
-        by writing to an injected queue; for now blank frames keep the audio
-        path alive even when no microphone source is available.
+        Sends 160-byte G.711 A-law frames at 20 ms intervals (8 kHz, PT=8):
+        real mic audio when a backchannel queue is attached, silence otherwise.
+
+        Transport matches the session's media transport (PCAP-verified
+        2026-08-27): the Android app's UDP-media calls answer with UDP from
+        the media port; our inbound calls run media over TCP, where UDP TX
+        went unheard — pass tcp_send to deliver frames on the device's TCP
+        RTPC channel instead.
         """
         if self._audio_sender_task and not self._audio_sender_task.done():
             _LOGGER.debug("Audio sender already running — skipping duplicate start")
             return
-        self._audio_sender_task = asyncio.create_task(self._audio_send_loop(device_rtpc_req_id))
+        self._audio_sender_task = asyncio.create_task(self._audio_send_loop(device_rtpc_req_id, tcp_send))
         _LOGGER.debug("Audio sender started (device_rtpc_req_id=0x%04X)", device_rtpc_req_id)
 
-    async def _audio_send_loop(self, device_rtpc_req_id: int) -> None:
-        """Send PCMA audio frames every 20 ms on the existing UDP socket.
+    async def _audio_send_loop(
+        self,
+        device_rtpc_req_id: int,
+        tcp_send: Callable[[bytes], Awaitable[None]] | None = None,
+    ) -> None:
+        """Send PCMA audio frames every 20 ms, transport-matched to the media.
 
         When a backchannel queue is attached (go2rtc mic audio), real frames
         are sent; otherwise silence (0xD5) fills each 20 ms slot.
@@ -236,12 +254,36 @@ class RtpReceiver:
         _SILENCE = bytes([0xD5] * 160)  # G.711 A-law silence (near-zero signal)
         _BODY_LEN = 12 + 160  # 12-byte RTP header + 160-byte payload
         icona_prefix = struct.pack("<BBHH2s", 0x00, 0x06, _BODY_LEN, device_rtpc_req_id, b"\x00\x00")
+        tx_buf = bytearray()
         try:
             while self._running:
-                payload = _SILENCE
+                # Drain the whole queue into a smoothing buffer, then emit
+                # exactly one 160-byte frame per 20ms tick.  go2rtc delivers
+                # backchannel audio in TCP bursts of arbitrary payload sizes;
+                # consuming one packet per tick both interleaved silence
+                # between real frames and truncated oversize payloads —
+                # audible as scratchiness at the entrance speaker.
                 if self._backchannel_queue is not None:
-                    with contextlib.suppress(asyncio.QueueEmpty):
-                        payload = self._backchannel_queue.get_nowait()
+                    while True:
+                        try:
+                            tx_buf += self._backchannel_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                    if len(tx_buf) > 6400:  # bound talk latency to ~800ms
+                        del tx_buf[:-3200]
+                if len(tx_buf) >= 160:
+                    payload = bytes(tx_buf[:160])
+                    del tx_buf[:160]
+                    self.audio_tx_real_count += 1
+                    if self.audio_tx_real_count % 250 == 1:
+                        _LOGGER.debug(
+                            "TX audio: %d real mic frames, %d silence frames sent",
+                            self.audio_tx_real_count,
+                            self.audio_tx_silence_count,
+                        )
+                else:
+                    payload = _SILENCE
+                    self.audio_tx_silence_count += 1
                 rtp_header = struct.pack(
                     ">BBHII",
                     0x80,  # V=2, P=0, X=0, CC=0
@@ -250,7 +292,16 @@ class RtpReceiver:
                     ts & 0xFFFFFFFF,
                     ssrc,
                 )
-                if self._transport:
+                # Transport-match the session's media path: TCP-media calls
+                # take TX on the device's TCP RTPC channel; UDP-media calls
+                # take UDP from the media socket (app-PCAP-verified).
+                if tcp_send is not None and self._tcp_media_packet_count > self._udp_media_packet_count:
+                    try:
+                        await tcp_send(rtp_header + payload[:160])
+                        self._audio_sent_count += 1
+                    except Exception:
+                        _LOGGER.debug("TCP audio TX failed", exc_info=True)
+                elif self._transport:
                     self._transport.sendto(icona_prefix + rtp_header + payload[:160])
                     self._audio_sent_count += 1
                 seq += 1

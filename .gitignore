@@ -29,6 +29,7 @@ test_output.txt
 *.pcap
 compare_pcap2.py
 parse_pcap.py
+validate_protocol_doc.py
 compare_output.txt
 tshark_*.txt
 memory/protocol_reference.md
@@ -36,6 +37,7 @@ memory/protocol_reference.md
 # Home Assistant
 *.log
 
-docs/
+docs/*
+!docs/PROTOCOL.md
 
 .claude

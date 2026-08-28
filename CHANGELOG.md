@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.4.0
+
+### New features
+
+- **Two-way audio validated end-to-end** — talk-back from the doorbell card to the entrance speaker confirmed live (echo loopback). Mic TX now matches the session's media transport (TCP RTPC channel on inbound calls — the previous UDP-only path was never audible), payloads are burst-smoothed and re-chunked to exact 20 ms frames, and PCMU backchannel audio is converted to A-law
+- **Doorbell card is a full answer station** — built-in WebRTC player over HA's native signaling (`camera/webrtc/*`), so streaming works on the local URL and remotely (Nabu Casa TURN); mic captured on HTTPS origins with a clear "mic needs HTTPS" indicator on http; Open Door buttons in both ringing and answered states
+- **Backchannel negotiated per ONVIF convention** — main audio m-line carries no direction attribute (go2rtc previously read `a=sendonly` as a client-mic track and never subscribed audio); the mic m-line is advertised only when the client sends `Require: ...backchannel`
+- **go2rtc WebSocket signaling with trickle ICE** — the camera provider forwards answers and ICE candidates both directions; HA's native camera player now works against the intercom too
+- **Rings during an active video call fire events** — previously dropped by the session's CTPP monitor
+- **Real missed-call detection** — `missed_call` fires when a ring's passive session ends unanswered, deduplicated against retransmits
+- **Video sessions end when nobody is watching** — no more perpetual 120 s session cycling after every ring
+- **RFC 3550/3551 audio pause encoding** — RTP timestamps advance by wall clock across transmission pauses, marker bit set on resume
+
+### Bug fixes
+
+- **Doorbell card vanished on ring** — a display-style toggle bug collapsed the card the moment a ring arrived
+- **Inbound-ring dedup** — device `0x18C0` retransmits are deduplicated by `(entrance, ring_ts)`; late retransmits no longer tear down a live session
+- **go2rtc stream registration reports failures** — HTTP errors log a warning with the static-entry fallback instead of false success
+
 ## 1.2.0
 
 ### New features

@@ -38,6 +38,13 @@ _LOGGER = logging.getLogger(__name__)
 
 UPDATE_INTERVAL = timedelta(seconds=30)
 
+# Retransmits of the same 0x18C0 ring carry the same ring_ts; a genuine new
+# ring gets a fresh ts, so exact-key dedup never suppresses a real ring.
+RING_DEDUP_WINDOW = 120.0
+# A device 0x1840/0x0000 (idle) counts as a missed call only when it follows
+# a ring this recently; otherwise it is video-teardown / CTPP-init tail.
+MISSED_CALL_WINDOW = 45.0
+
 
 class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
     """Coordinator that manages the persistent connection and push notifications."""
@@ -84,6 +91,22 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         # Tracks whether we were connected on the last health-check so
         # disconnect / reconnect are logged exactly once per transition.
         self._connection_lost: bool = False
+        # Last JPEG snapshot captured when passive inbound video started.
+        # Set before the ring event fires; never overwritten by outbound video.
+        self._last_ring_snapshot: bytes | None = None
+        # Ring dedup + missed-call state.  Lives here (not in the VIP
+        # listener) because the listener is recreated after every video
+        # session — listener-local state would be wiped while the device
+        # is still retransmitting the ring.
+        self._recent_rings: dict[tuple[str, int], float] = {}
+        self._last_ring_mono: float | None = None
+        self._inbound_answered: bool = False
+        # Caller of the passive inbound session's ring; when the session
+        # ends with _inbound_answered still False, missed_call fires
+        # (outcome-based — the device-signal path in _on_call_idle can't
+        # cover the standard flow because passive video holds the CTPP
+        # channel far past the 45s window).
+        self._pending_inbound_ring: str | None = None
         # Use an insertion-ordered dict to track callbacks (value is always None).
         # This avoids ValueError on removal and preserves iteration order.
         self._push_callbacks: dict[Callable[[PushEvent], None], None] = {}
@@ -171,6 +194,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                     self._on_push_event,
                     init_ts=init_ts,
                     on_inbound_ring=self._on_inbound_ring,
+                    on_call_idle=self._on_call_idle,
                 )
                 await vip.start()
                 self._vip_listener = vip
@@ -249,6 +273,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                     self._on_push_event,
                     init_ts=init_ts,
                     on_inbound_ring=self._on_inbound_ring,
+                    on_call_idle=self._on_call_idle,
                 )
                 await vip.start()
                 self._vip_listener = vip
@@ -417,6 +442,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 rtsp_server=self._rtsp_server,
                 on_call_end=self._on_video_call_end,
                 on_timeout=self._on_video_call_end,
+                on_ring=self._on_ring_during_video,
             )
             # Publish the session ONLY after start() has completed its
             # readiness gate (first real NAL queued).  Publishing earlier
@@ -460,13 +486,24 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         )
 
     async def _auto_restart_video(self) -> None:
-        """Auto-restart video after CALL_END or timeout.
+        """Restart video after CALL_END/timeout — but only while watched.
+
+        Restarting unconditionally kept the camera cycling 120s sessions
+        forever after every ring.  Someone actively viewing (an RTSP client
+        — go2rtc holds one only while a WebRTC/stream consumer exists) gets
+        seamless continuity; with no viewers the session ends cleanly and
+        the VIP listener takes the CTPP channel back.
 
         Calls async_start_video() without by_user=True so the call is
         silently dropped if the user has stopped video in the meantime.
         RuntimeError from that path is caught here to avoid HA logging an
         unhandled task exception for a normal, expected situation.
         """
+        watchers = self._rtsp_server.client_count if self._rtsp_server else 0
+        if watchers == 0:
+            _LOGGER.info("Video session ended with no viewers — not restarting")
+            await self.async_stop_video()
+            return
         try:
             await self.async_start_video()
         except RuntimeError as err:
@@ -477,9 +514,24 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
     def _on_inbound_ring(self, entrance_addr: str, ring_ts: int) -> None:
         """Called by VIP listener when device initiates a ring (PREFIX_CALL_INIT).
 
-        Schedules async_start_inbound_video as a background task so the
-        full 20-step answer sequence runs without blocking the VIP listener loop.
+        Dedups device retransmits by (entrance, ring_ts), then schedules
+        async_start_inbound_video as a background task so the inbound
+        signaling sequence runs without blocking the VIP listener loop.
         """
+        now = time.monotonic()
+        key = (entrance_addr, ring_ts)
+        seen = self._recent_rings.get(key)
+        if seen is not None and now - seen < RING_DEDUP_WINDOW:
+            _LOGGER.debug(
+                "Inbound ring retransmit ignored (entrance=%s ring_ts=0x%08X)",
+                entrance_addr,
+                ring_ts,
+            )
+            return
+        self._recent_rings = {k: t for k, t in self._recent_rings.items() if now - t < RING_DEDUP_WINDOW}
+        self._recent_rings[key] = now
+        self._last_ring_mono = now
+        self._inbound_answered = False
         _LOGGER.debug("Inbound ring: entrance=%s ring_ts=0x%08X", entrance_addr, ring_ts)
         self.config_entry.async_create_background_task(  # type: ignore[union-attr]
             self.hass,
@@ -487,11 +539,68 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             "comelit-inbound-video",
         )
 
-    async def async_start_inbound_video(self, entrance_addr: str, ring_ts: int) -> None:
-        """Answer a device-initiated ring: run inbound signaling and start video.
+    def _on_ring_during_video(self, entrance_addr: str, ring_ts: int) -> None:
+        """Ring forwarded by the video session's CTPP monitor (listener stopped).
 
-        On success, fires doorbell_ring after video is ready so automations
-        see the camera stream already flowing when the event triggers.
+        Fires the ring event without touching the running session — passive
+        behavior: video keeps flowing, other stations keep ringing. Shares
+        the (entrance, ring_ts) dedup with _on_inbound_ring so device
+        retransmits fire at most once.
+        """
+        now = time.monotonic()
+        key = (entrance_addr, ring_ts)
+        seen = self._recent_rings.get(key)
+        if seen is not None and now - seen < RING_DEDUP_WINDOW:
+            return
+        self._recent_rings[key] = now
+        self._last_ring_mono = now
+        self._inbound_answered = False
+        self._pending_inbound_ring = entrance_addr
+        # Video is already flowing, so a warm frame makes the snapshot free.
+        session = self._video_session
+        if session is not None and session.rtp_receiver is not None:
+            frame = session.rtp_receiver.latest_frame
+            if frame is not None:
+                self._last_ring_snapshot = frame
+        _LOGGER.info("Ring during active video (entrance=%s ring_ts=0x%08X)", entrance_addr, ring_ts)
+        self._on_push_event(
+            PushEvent(
+                event_type="ring",
+                apt_address=entrance_addr,
+                timestamp=time.time(),
+            )
+        )
+
+    def _on_call_idle(self, addresses: list[str]) -> None:
+        """Called by VIP listener on a device 0x1840/0x0000 (idle) frame.
+
+        Fires missed_call only when the frame follows a recent unanswered
+        ring and no video session is running — the same frame also arrives
+        as a video-teardown tail and at CTPP init after a device reboot.
+        """
+        if self._video_session is not None:
+            return
+        if self._inbound_answered:
+            return
+        if self._last_ring_mono is None or time.monotonic() - self._last_ring_mono > MISSED_CALL_WINDOW:
+            return
+        self._last_ring_mono = None
+        caller = addresses[0] if addresses else ""
+        _LOGGER.info("Missed call detected (caller=%s)", caller)
+        self._on_push_event(
+            PushEvent(
+                event_type="missed_call",
+                apt_address=caller,
+                timestamp=time.time(),
+            )
+        )
+
+    async def async_start_inbound_video(self, entrance_addr: str, ring_ts: int) -> None:
+        """Start passive video for a device-initiated ring (does not answer).
+
+        On success, fires the ring event after video is ready so automations
+        see the camera stream already flowing when the event triggers. Other
+        stations keep ringing until answer_inbound() runs (Answer button).
         On failure, fires missed_call and restores the VIP listener.
         """
         if not self._config:
@@ -518,12 +627,16 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 rtsp_server=self._rtsp_server,
                 on_call_end=self._on_video_call_end,
                 on_timeout=self._on_video_call_end,
+                on_ring=self._on_ring_during_video,
             )
             try:
                 renewal_ack_ts = (self._ctpp_init_ts + _CTR_INCR_BOTH) & 0xFFFFFFFF
                 await session.start_inbound(entrance_addr, ring_ts, renewal_ack_ts=renewal_ack_ts)
             except Exception:
                 _LOGGER.warning("Inbound call answer failed", exc_info=True)
+                # This path fires its own missed_call — clear the ring
+                # recency so a later device idle frame doesn't double-fire.
+                self._last_ring_mono = None
                 self._on_push_event(
                     PushEvent(
                         event_type="missed_call",
@@ -541,7 +654,17 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             if self._rtsp_server:
                 self._rtsp_server.mark_ready()
             await self._notify_video_state_change()
+            # Capture snapshot before firing ring so the image entity is ready
+            # when automations react to the event.
+            if session.rtp_receiver is not None:
+                snapshot = session.rtp_receiver.latest_frame
+                if snapshot is None:
+                    with contextlib.suppress(Exception):
+                        snapshot = await asyncio.wait_for(session.rtp_receiver.get_jpeg_frame(), timeout=2.0)
+                if snapshot is not None:
+                    self._last_ring_snapshot = snapshot
             # Fire ring AFTER video is flowing so automations see the stream
+            self._pending_inbound_ring = entrance_addr
             self._on_push_event(
                 PushEvent(
                     event_type="ring",
@@ -552,9 +675,11 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             _LOGGER.info("Inbound video ready, ring fired (entrance=%s)", entrance_addr)
 
     async def async_answer_inbound(self) -> None:
-        """Start two-way audio for an active inbound call."""
+        """Answer an active passive inbound call — send answer signals, start audio."""
         if self._video_session and self._video_session.active:
-            self._video_session.answer_inbound()
+            await self._video_session.answer_inbound()
+            self._inbound_answered = True
+            self._pending_inbound_ring = None
 
     async def _register_go2rtc_stream(self) -> None:
         """Register our RTSP stream with go2rtc, enabling backchannel support.
@@ -566,15 +691,29 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         if not self._rtsp_url:
             return
         name = f"comelit_man_{self.config_entry.entry_id}"  # type: ignore[union-attr]
-        src = f"{self._rtsp_url}#backchannel=1"
+        # Bare URL — go2rtc negotiates the backchannel itself via the
+        # `Require: ...backchannel` header on DESCRIBE; the old #backchannel=1
+        # source flag is unnecessary with that negotiation in place.
+        src = self._rtsp_url
         try:
             async with aiohttp.ClientSession() as session:
-                await session.put(
+                resp = await session.put(
                     "http://127.0.0.1:1984/api/streams",
                     params={"name": name, "src": src},
                     timeout=aiohttp.ClientTimeout(total=5),
                 )
-            _LOGGER.debug("Registered go2rtc stream: %s -> %s", name, src)
+                if resp.status >= 400:
+                    # e.g. 401 when go2rtc's API has auth configured — a
+                    # static entry in go2rtc.yaml then has to provide the
+                    # stream; say so instead of logging false success.
+                    _LOGGER.warning(
+                        "go2rtc stream registration failed (HTTP %d) — add a static entry '%s: %s' to go2rtc.yaml",
+                        resp.status,
+                        name,
+                        src,
+                    )
+                else:
+                    _LOGGER.debug("Registered go2rtc stream: %s -> %s", name, src)
         except Exception:
             _LOGGER.debug("go2rtc unavailable — backchannel inactive (RTSP/HLS still works)")
 
@@ -589,6 +728,11 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                     timeout=aiohttp.ClientTimeout(total=5),
                 )
             _LOGGER.debug("Deregistered go2rtc stream: %s", name)
+
+    @property
+    def last_ring_snapshot(self) -> bytes | None:
+        """Return the JPEG snapshot from the most recent inbound ring."""
+        return self._last_ring_snapshot
 
     @property
     def video_stopped_by_user(self) -> bool:
@@ -663,6 +807,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 self._on_push_event,
                 init_ts=self._ctpp_init_ts,
                 on_inbound_ring=self._on_inbound_ring,
+                on_call_idle=self._on_call_idle,
             )
             await vip.start()
             self._vip_listener = vip
@@ -684,6 +829,22 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             return
         self._video_session = None
         self._video_ready_event.clear()
+
+        # Outcome-based missed call: a passive inbound session is ending and
+        # the Answer button was never pressed — the call was missed. Fires
+        # here because every session teardown path (timeout, auto-restart,
+        # user stop, replacement by a new ring) funnels through this method.
+        pending = self._pending_inbound_ring
+        self._pending_inbound_ring = None
+        if pending is not None and not self._inbound_answered:
+            _LOGGER.info("Missed call: passive session ended unanswered (caller=%s)", pending)
+            self._on_push_event(
+                PushEvent(
+                    event_type="missed_call",
+                    apt_address=pending,
+                    timestamp=time.time(),
+                )
+            )
 
         # Tear HA's Stream worker down gracefully FIRST, before any
         # forced RTSP client disconnect.  Stream.stop() joins the

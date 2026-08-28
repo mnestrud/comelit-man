@@ -349,3 +349,180 @@ async def test_camera_setup_entry_skips_camera_without_rtsp():
     added: list = []
     await async_setup_entry(MagicMock(), entry, lambda ents: added.extend(ents))
     assert len(added) == 0
+
+
+# ---------------------------------------------------------------------------
+# go2rtc WebSocket signaling (offer / candidate / close)
+# ---------------------------------------------------------------------------
+
+
+class _FakeWsMsg:
+    def __init__(self, data: dict | None, msg_type=None):
+        import aiohttp as _aiohttp
+
+        self.type = msg_type if msg_type is not None else _aiohttp.WSMsgType.TEXT
+        self._data = data
+
+    def json(self):
+        return self._data
+
+
+class _FakeWs:
+    def __init__(self, messages: list[_FakeWsMsg]):
+        self._messages = list(messages)
+        self.sent: list[dict] = []
+        self.closed = False
+        self.send_json = AsyncMock(side_effect=self._record)
+
+    async def _record(self, payload):
+        self.sent.append(payload)
+
+    async def close(self):
+        self.closed = True
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._messages:
+            return self._messages.pop(0)
+        raise StopAsyncIteration
+
+
+def _wire_hass(cam):
+    """Give the entity a hass whose background tasks actually run."""
+    hass = MagicMock()
+    hass.async_create_background_task = lambda coro, name: asyncio.get_event_loop().create_task(coro)
+    cam.hass = hass
+    return hass
+
+
+def _session_with_ws(ws):
+    session = MagicMock()
+    session.ws_connect = AsyncMock(return_value=ws)
+    return session
+
+
+class TestWebRtcSignaling:
+    @pytest.mark.asyncio
+    async def test_offer_answer_candidate_flow(self, camera):
+        _wire_hass(camera)
+        ws = _FakeWs(
+            [
+                _FakeWsMsg({"type": "webrtc/answer", "value": "v=0\r\nanswer"}),
+                _FakeWsMsg({"type": "webrtc/candidate", "value": "candidate:1 1 udp 1 1.2.3.4 8555 typ host"}),
+                _FakeWsMsg({"type": "unknown/thing", "value": "x"}),
+            ]
+        )
+        sent = []
+        with patch(
+            "custom_components.comelit_man.camera.async_get_clientsession",
+            return_value=_session_with_ws(ws),
+        ):
+            await camera.async_handle_async_webrtc_offer("v=0\r\noffer", "sess1", sent.append)
+            await asyncio.sleep(0.05)
+
+        assert ws.sent[0] == {"type": "webrtc/offer", "value": "v=0\r\noffer"}
+        kinds = [type(m).__name__ for m in sent]
+        assert "WebRTCAnswer" in kinds
+        assert "WebRTCCandidate" in kinds
+        camera.close_webrtc_session("sess1")
+        await asyncio.sleep(0)
+        assert "sess1" not in camera._webrtc_sessions
+
+    @pytest.mark.asyncio
+    async def test_go2rtc_error_message_forwarded(self, camera):
+        _wire_hass(camera)
+        ws = _FakeWs([_FakeWsMsg({"type": "error", "value": "stream not found"})])
+        sent = []
+        with patch(
+            "custom_components.comelit_man.camera.async_get_clientsession",
+            return_value=_session_with_ws(ws),
+        ):
+            await camera.async_handle_async_webrtc_offer("sdp", "sess2", sent.append)
+            await asyncio.sleep(0.05)
+        assert any(type(m).__name__ == "WebRTCError" for m in sent)
+        camera.close_webrtc_session("sess2")
+        await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_ws_connect_failure_sends_error(self, camera):
+        _wire_hass(camera)
+        session = MagicMock()
+        session.ws_connect = AsyncMock(side_effect=OSError("refused"))
+        sent = []
+        with patch("custom_components.comelit_man.camera.async_get_clientsession", return_value=session):
+            await camera.async_handle_async_webrtc_offer("sdp", "sess3", sent.append)
+        assert len(sent) == 1
+        assert type(sent[0]).__name__ == "WebRTCError"
+        assert "sess3" not in camera._webrtc_sessions
+
+    @pytest.mark.asyncio
+    async def test_offer_send_failure_sends_error_and_cleans_up(self, camera):
+        _wire_hass(camera)
+        ws = _FakeWs([])
+        ws.send_json = AsyncMock(side_effect=ConnectionError("gone"))
+        sent = []
+        with patch(
+            "custom_components.comelit_man.camera.async_get_clientsession",
+            return_value=_session_with_ws(ws),
+        ):
+            await camera.async_handle_async_webrtc_offer("sdp", "sess4", sent.append)
+            await asyncio.sleep(0)
+        assert any(type(m).__name__ == "WebRTCError" for m in sent)
+        assert "sess4" not in camera._webrtc_sessions
+
+    @pytest.mark.asyncio
+    async def test_candidate_forwarded_to_session(self, camera):
+        from webrtc_models import RTCIceCandidateInit
+
+        _wire_hass(camera)
+        ws = _FakeWs([])
+        with patch(
+            "custom_components.comelit_man.camera.async_get_clientsession",
+            return_value=_session_with_ws(ws),
+        ):
+            await camera.async_handle_async_webrtc_offer("sdp", "sess5", lambda m: None)
+        await camera.async_on_webrtc_candidate("sess5", RTCIceCandidateInit("candidate:9 1 udp 1 5.6.7.8 1 typ host"))
+        assert {"type": "webrtc/candidate", "value": "candidate:9 1 udp 1 5.6.7.8 1 typ host"} in ws.sent
+        camera.close_webrtc_session("sess5")
+        await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_candidate_unknown_session_ignored(self, camera):
+        from webrtc_models import RTCIceCandidateInit
+
+        await camera.async_on_webrtc_candidate("nope", RTCIceCandidateInit("candidate:1"))  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_candidate_send_failure_swallowed(self, camera):
+        from webrtc_models import RTCIceCandidateInit
+
+        _wire_hass(camera)
+        ws = _FakeWs([])
+        with patch(
+            "custom_components.comelit_man.camera.async_get_clientsession",
+            return_value=_session_with_ws(ws),
+        ):
+            await camera.async_handle_async_webrtc_offer("sdp", "sess6", lambda m: None)
+        ws.send_json = AsyncMock(side_effect=ConnectionError("gone"))
+        await camera.async_on_webrtc_candidate("sess6", RTCIceCandidateInit("candidate:1"))  # must not raise
+        camera.close_webrtc_session("sess6")
+        await asyncio.sleep(0)
+
+    def test_close_unknown_session_noop(self, camera):
+        camera.close_webrtc_session("ghost")  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_close_cancels_task_and_closes_ws(self, camera):
+        _wire_hass(camera)
+        ws = _FakeWs([_FakeWsMsg(None, msg_type=__import__("aiohttp").WSMsgType.BINARY)])
+        with patch(
+            "custom_components.comelit_man.camera.async_get_clientsession",
+            return_value=_session_with_ws(ws),
+        ):
+            await camera.async_handle_async_webrtc_offer("sdp", "sess7", lambda m: None)
+        camera.close_webrtc_session("sess7")
+        await asyncio.sleep(0.05)
+        assert ws.closed
+        assert "sess7" not in camera._webrtc_sessions
