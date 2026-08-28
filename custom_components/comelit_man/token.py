@@ -11,6 +11,7 @@ import io
 import logging
 import re
 import tarfile
+from pathlib import PurePosixPath
 
 import aiohttp
 from homeassistant.core import HomeAssistant
@@ -124,38 +125,43 @@ async def _do_extract(session: aiohttp.ClientSession, base_url: str, password: s
 def _parse_token_from_archive(archive_data: bytes) -> str | None:
     """Parse the authentication token from a backup tar.gz archive."""
     members_seen: list[str] = []
+    candidates_read: list[str] = []
     try:
         with tarfile.open(fileobj=io.BytesIO(archive_data), mode="r:gz") as tar:
             for member in tar.getmembers():
                 members_seen.append(member.name)
-                if member.name.endswith("users.cfg"):
-                    f = tar.extractfile(member)
-                    if f is None:
-                        continue
-                    raw = f.read()
+                # Match the file name exactly.  An `endswith` test also matches
+                # etc/comelit/facerecognitionusers.cfg, which holds unrelated
+                # face-recognition users and no tokens — and on this firmware it
+                # is listed *before* the real users.cfg, so a first-match-wins
+                # scan reads the wrong file and fails (verified on 6701W fw 2.x).
+                if PurePosixPath(member.name).name != "users.cfg":
+                    continue
+                f = tar.extractfile(member)
+                if f is None:
+                    continue
+                raw = f.read()
 
-                    # Some firmware versions gzip users.cfg without a .gz extension
-                    if raw[:2] == b"\x1f\x8b":
-                        raw = gzip.decompress(raw)
+                # Some firmware versions gzip users.cfg without a .gz extension
+                if raw[:2] == b"\x1f\x8b":
+                    raw = gzip.decompress(raw)
 
-                    content = raw.decode("utf-8", errors="replace")
-                    _LOGGER.debug("users.cfg size: %d bytes", len(content))
+                content = raw.decode("utf-8", errors="replace")
+                candidates_read.append(f"{member.name} ({len(content)} bytes)")
+                _LOGGER.debug("Read %s: %d bytes", member.name, len(content))
 
-                    matches = TOKEN_PATTERN.findall(content)
-                    if matches:
-                        # Skip null tokens (all zeros)
-                        for token in matches:
-                            if token != "00000000000000000000000000000000":
-                                _LOGGER.debug(
-                                    "Extracted token: %s...%s", token[:4], token[-4:]
-                                )  # nosemgrep: python-logger-credential-disclosure
-                                return str(token)
-
-                    raise TokenExtractionError(
-                        f"Token pattern not found in users.cfg (file size: {len(content)} bytes)"
-                    )
+                # Skip null tokens (all zeros); keep scanning other candidates
+                # rather than failing on the first file without a token.
+                for token in TOKEN_PATTERN.findall(content):
+                    if token != "00000000000000000000000000000000":
+                        _LOGGER.debug(
+                            "Extracted token: %s...%s", token[:4], token[-4:]
+                        )  # nosemgrep: python-logger-credential-disclosure
+                        return str(token)
 
     except tarfile.TarError as e:
         raise TokenExtractionError(f"Failed to read backup archive: {e}") from e
 
+    if candidates_read:
+        raise TokenExtractionError(f"No token found in backup archive. Files read: {', '.join(candidates_read)}")
     raise TokenExtractionError(f"users.cfg not found in backup archive. Members seen: {members_seen}")
