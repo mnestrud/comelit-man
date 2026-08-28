@@ -298,6 +298,11 @@ class LocalRtspServer:
 
         _LOGGER.debug("RTSP server stopped")
 
+    @property
+    def client_count(self) -> int:
+        """Number of RTSP clients currently receiving media."""
+        return len(self._active_clients)
+
     def mark_ready(self) -> None:
         """Signal that a video session is flowing — unblocks pending PLAYs."""
         self._ready_event.set()

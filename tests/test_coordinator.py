@@ -902,9 +902,16 @@ class TestVideoCallEnd:
         coord._on_video_call_end()
         coord.config_entry.async_create_background_task.assert_called_once()
 
+    @staticmethod
+    def _watched_rtsp() -> MagicMock:
+        rtsp = MagicMock()
+        rtsp.client_count = 1
+        return rtsp
+
     @pytest.mark.asyncio
     async def test_auto_restart_video_success(self):
         coord = _make_coordinator(with_client=True)
+        coord._rtsp_server = self._watched_rtsp()
         mock_session = MagicMock()
         mock_session.start = AsyncMock()
         with patch("custom_components.comelit_man.coordinator.VideoCallSession", return_value=mock_session):
@@ -915,13 +922,15 @@ class TestVideoCallEnd:
     async def test_auto_restart_video_skips_gracefully_on_runtime_error(self):
         """_auto_restart_video silently drops RuntimeError (expected stop-by-user case)."""
         coord = _make_coordinator(with_client=True)
+        coord._rtsp_server = self._watched_rtsp()
         coord._video_stopped_by_user = True
         await coord._auto_restart_video()  # must not raise
 
     @pytest.mark.asyncio
     async def test_auto_restart_video_logs_general_exception(self):
-        """_auto_restart_video logs non-RuntimeError exceptions (lines 464-465)."""
+        """_auto_restart_video logs non-RuntimeError exceptions."""
         coord = _make_coordinator(with_client=True)
+        coord._rtsp_server = self._watched_rtsp()
         with patch.object(coord, "async_start_video", new_callable=AsyncMock, side_effect=ValueError("boom")):
             await coord._auto_restart_video()  # must not raise
 
@@ -1586,3 +1595,54 @@ class TestOutcomeMissedCall:
         coord._video_session.rtp_receiver = None
         coord._on_ring_during_video("SB100001", 0x27EEAB1C)
         assert coord._pending_inbound_ring == "SB100001"
+
+
+# ---------------------------------------------------------------------------
+# _auto_restart_video viewer gating (no more forever-cycling camera)
+# ---------------------------------------------------------------------------
+
+
+class TestAutoRestartViewerGate:
+    @pytest.mark.asyncio
+    async def test_no_viewers_stops_instead_of_restarting(self):
+        coord = _make_coordinator(with_client=True)
+        rtsp = MagicMock()
+        rtsp.client_count = 0
+        coord._rtsp_server = rtsp
+        session = MagicMock()
+        session.stop = AsyncMock()
+        coord._video_session = session
+
+        with patch("custom_components.comelit_man.coordinator.VideoCallSession") as vcs:
+            await coord._auto_restart_video()
+        vcs.assert_not_called()
+        session.stop.assert_awaited_once()
+        assert coord._video_session is None
+
+    @pytest.mark.asyncio
+    async def test_with_viewers_restarts(self):
+        coord = _make_coordinator(with_client=True)
+        rtsp = MagicMock()
+        rtsp.client_count = 1
+        rtsp.mark_ready = MagicMock()
+        rtsp.mark_not_ready = MagicMock()
+        rtsp.disconnect_clients = MagicMock()
+        rtsp.reset = MagicMock()
+        coord._rtsp_server = rtsp
+        mock_session = MagicMock()
+        mock_session.start = AsyncMock()
+
+        with patch(
+            "custom_components.comelit_man.coordinator.VideoCallSession",
+            return_value=mock_session,
+        ):
+            await coord._auto_restart_video()
+        mock_session.start.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_rtsp_server_stops(self):
+        coord = _make_coordinator(with_client=True)
+        coord._rtsp_server = None
+        with patch("custom_components.comelit_man.coordinator.VideoCallSession") as vcs:
+            await coord._auto_restart_video()
+        vcs.assert_not_called()

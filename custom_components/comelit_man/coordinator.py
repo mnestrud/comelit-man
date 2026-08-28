@@ -486,13 +486,24 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         )
 
     async def _auto_restart_video(self) -> None:
-        """Auto-restart video after CALL_END or timeout.
+        """Restart video after CALL_END/timeout — but only while watched.
+
+        Restarting unconditionally kept the camera cycling 120s sessions
+        forever after every ring.  Someone actively viewing (an RTSP client
+        — go2rtc holds one only while a WebRTC/stream consumer exists) gets
+        seamless continuity; with no viewers the session ends cleanly and
+        the VIP listener takes the CTPP channel back.
 
         Calls async_start_video() without by_user=True so the call is
         silently dropped if the user has stopped video in the meantime.
         RuntimeError from that path is caught here to avoid HA logging an
         unhandled task exception for a normal, expected situation.
         """
+        watchers = self._rtsp_server.client_count if self._rtsp_server else 0
+        if watchers == 0:
+            _LOGGER.info("Video session ended with no viewers — not restarting")
+            await self.async_stop_video()
+            return
         try:
             await self.async_start_video()
         except RuntimeError as err:
