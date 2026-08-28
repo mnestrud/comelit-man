@@ -1908,3 +1908,42 @@ class TestForwardRing:
         assert rings == [("SB100001", 0x11223344)]
         assert len(sent_data) == 1  # existing transform ACK unchanged
         assert struct.unpack_from("<H", sent_data[0], 0)[0] == 0x1800
+
+
+class TestForwardRingFloorTag:
+    def _session(self, on_ring):
+        session = VideoCallSession.__new__(VideoCallSession)
+        session._active = True
+        session._client = None
+        session._rtp_receiver = None
+        session._rtsp_server = None
+        session._external_rtsp = False
+        session._ctpp_lock = asyncio.Lock()
+        session._call_counter = 0
+        session._answer_handoff = None
+        session._on_ring = on_ring
+        cfg = MagicMock()
+        cfg.apt_address = "SB000006"
+        session._config = cfg
+        return session
+
+    @staticmethod
+    def _tagged_ring(tag: bytes) -> bytes:
+        buf = bytearray()
+        buf += struct.pack("<H", 0x18C0)
+        buf += struct.pack("<I", 0x27EEAB1C)
+        buf += struct.pack(">H", 0x0028)
+        buf += struct.pack(">H", 0x0001)
+        buf += tag + b"\xff\xff\xff\xff"
+        buf += b"SB100001\x00"
+        return bytes(buf)
+
+    def test_floor_ring_forwarded_as_own_apartment(self):
+        rings = []
+        self._session(lambda a, t: rings.append(a))._forward_ring(self._tagged_ring(b"FF"))
+        assert rings == ["SB000006"]
+
+    def test_entrance_ring_forwarded_as_entrance(self):
+        rings = []
+        self._session(lambda a, t: rings.append(a))._forward_ring(self._tagged_ring(b"PP"))
+        assert rings == ["SB100001"]

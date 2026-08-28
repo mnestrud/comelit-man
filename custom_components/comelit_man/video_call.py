@@ -748,13 +748,17 @@ class VideoCallSession:
             return
         # Local import: vip_listener imports _transform_device_ts from this
         # module, so a top-level import here would be circular.
-        from .vip_listener import parse_ctpp_message
+        from .vip_listener import CALL_TAG_FLOOR, parse_ctpp_message
 
         msg = parse_ctpp_message(data)
         if msg is None:
             return
         addresses = msg.get("addresses", [])
-        entrance_addr = addresses[0] if addresses else ""
+        # Same floor-door tag handling as the listener (vip_listener._caller_for)
+        if msg.get("call_tag") == CALL_TAG_FLOOR and self._config.apt_address:
+            entrance_addr = self._config.apt_address
+        else:
+            entrance_addr = addresses[0] if addresses else ""
         # DEBUG: fires once per device retransmit (~5x per ring); the
         # coordinator logs the deduped ring once at INFO.
         _LOGGER.debug(

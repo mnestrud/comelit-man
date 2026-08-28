@@ -22,7 +22,15 @@ from .exceptions import (
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = [Platform.BUTTON, Platform.CAMERA, Platform.EVENT, Platform.IMAGE]
+PLATFORMS = [
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+    Platform.CAMERA,
+    Platform.EVENT,
+    Platform.IMAGE,
+    Platform.LOCK,
+    Platform.SENSOR,
+]
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
@@ -43,12 +51,17 @@ async def _register_static_path(hass: HomeAssistant, url: str, path: str) -> Non
 async def _init_resource(hass: HomeAssistant, url: str, version: str) -> None:
     """Add the card JS to Lovelace resources (GUI mode) or extra JS (YAML mode)."""
     from homeassistant.components.frontend import add_extra_js_url
-    from homeassistant.components.lovelace.resources import ResourceStorageCollection
-
-    lovelace = hass.data["lovelace"]
-    resources: ResourceStorageCollection = (
-        lovelace.resources if hasattr(lovelace, "resources") else lovelace["resources"]
+    from homeassistant.components.lovelace.const import LOVELACE_DATA
+    from homeassistant.components.lovelace.resources import (
+        ResourceStorageCollection,
+        ResourceYAMLCollection,
     )
+
+    # LOVELACE_DATA is Lovelace's declared HassKey; the old string lookup with
+    # an attribute/dict fallback predates it.  In YAML mode the collection is
+    # read-only (ResourceYAMLCollection), which is why every mutation below is
+    # guarded by an isinstance check and falls back to add_extra_js_url.
+    resources: ResourceStorageCollection | ResourceYAMLCollection = hass.data[LOVELACE_DATA].resources
     await resources.async_get_info()
 
     url_versioned = f"{url}?v={version}"
@@ -109,14 +122,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ComelitLocalConfigEntry)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
+    # No update listener here: the options flow subclasses
+    # OptionsFlowWithReload, which schedules the reload itself.  Registering
+    # both is rejected by Home Assistant.
 
     return True
-
-
-async def _async_options_updated(hass: HomeAssistant, entry: ComelitLocalConfigEntry) -> None:
-    """Reload the entry when options change."""
-    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ComelitLocalConfigEntry) -> bool:

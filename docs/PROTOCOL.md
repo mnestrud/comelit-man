@@ -15,7 +15,7 @@ Contents:
 0. [Provenance and verification status](#0-provenance-and-verification-status)
 1. [Framing](#1-framing)
 2. [Channels](#2-channels)
-3. [Authentication and configuration](#3-authentication-and-configuration)
+3. [Authentication and configuration](#3-authentication-and-configuration) — incl. [the config backup](#31-the-configuration-backup-web-ui-port-8080) and [`users.cfg`](#32-userscfg--the-vip-user-table)
 4. [CTPP: the VIP event channel](#4-ctpp-the-vip-event-channel)
 5. [Timestamps, counters, and ACKs](#5-timestamps-counters-and-acks)
 6. [Door opening](#6-door-opening)
@@ -25,7 +25,7 @@ Contents:
 10. [Audio](#10-audio)
 11. [Home Assistant end-to-end: RTSP, go2rtc, WebRTC](#11-home-assistant-end-to-end-rtsp-go2rtc-webrtc)
 12. [Firmware and model differences](#12-firmware-and-model-differences)
-13. [Other channels and unexplored surface](#13-other-channels-and-unexplored-surface)
+13. [Other channels and unexplored surface](#13-other-channels-and-unexplored-surface) — incl. [minting a dedicated identity](#133-minting-a-dedicated-identity)
 
 ---
 
@@ -36,6 +36,7 @@ Not every statement here rests on the same evidence. Four tiers:
 | Tier | Meaning |
 |---|---|
 | **PCAP-confirmed** | Re-verified 2026-08-28 by parsing this repo's captures (`inbound_call.pcap`, `test_inbound_run9.pcap` — gitignored, kept locally) |
+| **Device-verified** | Read directly from the reference device over HTTP on 2026-08-28 (configuration backup and user table, §3.1–3.2) |
 | **Live-validated** | Observed working (or failing) against the device through the integration's own debug logs during development |
 | **Code-derived** | Transcribed from `custom_components/comelit_man/` implementation and its docstrings. The implementation demonstrably works, but the specific byte-level claim was not independently re-checked against a capture |
 | **Secondhand** | Reported by other projects for hardware not available here. Treat as a lead, not fact |
@@ -67,8 +68,20 @@ Not covered by the captures on hand:
   capture; the layout is **code-derived** from a docstring citing a capture not
   retained here.
 - §3 JSON message shapes, §6 door sequences, §7 the full outbound ordering,
-  §13 FRCG / discovery / provisioning — **code-derived** or **secondhand**.
+  §13.1–13.2 FRCG and discovery — **code-derived** or **secondhand**.
 - §12's whole table beyond the `SB` row — **secondhand**.
+
+Read directly from the device on 2026-08-28 (**device-verified**):
+
+- §3.1 the web-UI login / backup / download sequence, the archive's member
+  list, and the `facerecognitionusers.cfg` name collision — the last of these
+  by observing the shipped token extractor fail against the device before the
+  fix and succeed after it
+- §3.2 the complete `users.cfg` slot layout, field numbering, slot count, and
+  the fact that the type fields do not reliably indicate a free slot
+- §13.3 in full — the complete identity-minting sequence was executed end to end, a token minted and authenticated, and the test users removed
+- §12's address-regex note — the widened pattern was diffed against the old
+  one across every CTPP message in both captures before being adopted
 
 §11 (Home Assistant end-to-end) is **live-validated**: every claim in it was
 established by making the corresponding failure happen and then fixing it,
@@ -174,6 +187,74 @@ on inbound calls, the bare `apt_address` (`SB000006`) as the callee.
 > **Identity caveat.** The wall monitor holds its own identity. Registering a
 > second listener under the same identity gets one of them kicked — use a
 > dedicated app-class user.
+>
+> This is easy to get wrong by accident: a token lifted from the device's
+> configuration backup *belongs to whichever identity already owns it*. On the
+> reference device the token in use was slot `0_1`, named "google Pixel 10" —
+> i.e. the household phone's identity, shared with Home Assistant. §3.2
+> describes reading the user table; §13.3 describes minting a separate one.
+
+### 3.1 The configuration backup (web UI, port 8080)
+
+Both token extraction and user provisioning read the device's own backup
+archive. The web UI uses **IP-based sessions**: authenticate once from an
+address and subsequent requests from it are authorized — there is no cookie or
+token to carry.
+
+| Step | Request |
+|---|---|
+| Log in | `POST /do-login.html`, form field `l-pwd`, `Referer` header required; success is the string `Access granted` in the body |
+| Create backup | `POST /create-backup.html` with `X-Requested-With: XMLHttpRequest`; body contains `Backup successfully created` |
+| Wait | ~2 s — the file is written asynchronously |
+| List | `GET /config-backup.html`, scrape `([0-9]+\.tar\.gz)`, take the highest |
+| Download | `GET /<name>.tar.gz` |
+
+The archive is a gzipped tar of `etc/comelit/*.cfg` (23 members, ~4 KB on the
+reference device). Files of interest:
+
+| Member | Contents |
+|---|---|
+| `etc/comelit/users.cfg` | The ViP user table — names, tokens, emails (§3.2) |
+| `etc/comelit/facerecognitionusers.cfg` | **Unrelated.** Face-recognition users in a completely different format (`recUserList.N = 2:4:"name" …`), no tokens |
+| `etc/comelit/pushinfo.cfg`, `otherdevices.cfg` | Also contain 32-hex strings that are *not* ViP tokens |
+
+> **Trap.** `facerecognitionusers.cfg` also ends with the literal text
+> `users.cfg`, and it is listed **before** the real file. Any member scan using
+> a suffix test reads the wrong file, finds no token, and fails. Match the
+> basename exactly, and keep scanning rather than failing on the first
+> candidate. (This broke token auto-extraction outright until 2026-08-28.)
+
+Some firmware gzips `users.cfg` *inside* the tar with no `.gz` extension —
+detect the `1f 8b` magic and decompress.
+
+### 3.2 `users.cfg` — the ViP user table
+
+One line per slot:
+
+```
+mspUsersMap.<map>.<slot> = 4:2:<a> 5:2:<kind> 6:4:"<name>" 7:2:2 8:2:0
+                           9:4:"<token>" 10:4:"" 11:4:"<email>" 12:4:"" 13:2:0
+                           14:4:"" 15:2:0 16:2:0 17:4:"" 18:4:"<code>"
+                           19:2:2 20:4:"" 21:2:0 22:4:""
+```
+
+Fields are `index:type:value`, where type 4 is a quoted string and type 2 an
+integer. The ones that matter:
+
+| Field | Meaning |
+|---|---|
+| 6 | Display name (`"google Pixel 10"`, `"effienestrud"`) |
+| 9 | The 32-hex ViP token — this is what the integration authenticates with |
+| 11 | Email address |
+| 18 | A 10-character code present on provisioned users (`"4moujk1umj"`) |
+
+The reference device exposes **16 slots** (`0.0`–`0.15`).
+
+**Determining whether a slot is free.** Use "no name *and* no token". The type
+fields are not a reliable indicator: field 4 was `1` on both occupied slots and
+`2` elsewhere, but field 5 was `2` on an *empty* slot as well as on occupied
+ones. Slot `0` belongs to the wall monitor / primary internal unit and must
+never be claimed regardless of how empty it looks.
 
 ---
 
@@ -669,14 +750,31 @@ everything in the right-hand column is secondhand (see
 | Event delivery | Local CTPP only | 6742W supports local CTPP *or* cloud FCM |
 
 Address parsing that assumes the `SB` prefix will fail on apartment-block
-hardware; a regex of the form `(?:SB)?[0-9A-Fa-f]{6,9}` covers both.
+hardware. A regex of the form `(?:SB)?[0-9A-Fa-f]{6,9}` covers all three forms
+(kit, numeric, dropped-prefix).
+
+**Require the terminating NUL.** Addresses in VIP messages are null-terminated,
+and matching on that is what keeps a bare hex-digit run in a binary header from
+being read as an address. It also matters in the other direction: a scan that
+simply searches for the literal `SB` and reads to the next NUL will happily
+swallow an entire JSON payload (a `get-configuration` response contains
+`"apt-address":"SB000003"`) or a run of encrypted media bytes. Anchoring on
+`…{6,9}\x00` rejects both.
+
+Widening the pattern was checked against captures before adoption: across all
+73 CTPP messages in two captures, the widened regex and the old `SB`-literal
+scan produced **identical** address lists, while the widened one additionally
+rejected 20 garbage "addresses" the old scan produced from JSON and binary
+payloads elsewhere in the stream.
 
 ---
 
 ## 13. Other channels and unexplored surface
 
-> Everything in this section is **code-derived or secondhand** — none of it has
-> been observed on the wire here.
+> §13.1–13.2 are **code-derived or secondhand** — not observed on the wire
+> here. §13.3 is fully device-verified.
+
+### 13.1 Unexplored channels
 
 **FRCG — face recognition.** The device runs a face-recognition pipeline
 locally. On a ring it captures a face image and emits, on the `FRCG` channel
@@ -690,19 +788,67 @@ locally. On a ring it captures a face image and emits, on the `FRCG` channel
 Opening this channel alongside CTPP would let the captured image feed HA's
 vision tooling entirely locally. Not implemented.
 
+### 13.2 Discovery and ports
+
 **Hardware discovery.** A UDP `INFO` datagram to port **24199** returns
 hardware details including the MAC address.
 
 **Open ports observed:** 53 (DNS), 8080 (HTTP web UI), 8443 (HTTPS),
 64100 (ICONA).
 
-**User provisioning.** A dedicated identity can be created entirely locally
-through the device's web UI: log in, create an "Apps"-type user in a free slot,
-generate an activation code, read it from the slot's `.mug` pairing file, and
-redeem it on `UAUT` with a `user-activation` message. Slot 0 is the wall
-monitor and must never be touched; free slots should be identified from a
-configuration backup rather than by probing `.mug` files, since an already
-activated user has none and would be silently overwritten. Not implemented.
+### 13.3 Minting a dedicated identity
+
+A ViP identity separate from any phone can be created entirely on the LAN.
+Read the user table first (§3.1–3.2) and pick a free slot — **never probe the
+per-slot `.mug` pairing files to find one**, because an already-activated user
+has no pending pairing file and its slot would look free and be overwritten.
+
+| Step | Request | Status |
+|---|---|---|
+| Read the user table | §3.1 backup → §3.2 parse | **Device-verified** |
+| Choose a free slot | no name and no token; never slot 0 | **Device-verified** |
+| Create the user | `POST /update.html?mspUsersMap_.<map>.<slot>_<field>=<value>` — field 5 = 2 (Apps), field 6 = name, field 4 = 1 (enabled) | **Device-verified** |
+| Generate a code | `POST /create-actcode.html?user=<map>.<slot>` | **Device-verified** |
+| Read the code | `GET /users.html`, take the `<strong>` inside the slot's row | **Device-verified** |
+| Redeem it | `UAUT` channel: `{"message":"user-activation","activation-code":…,"description":…,"message-type":"request","message-id":2}` → `response-code` 200 carries `user-token` | **Device-verified** |
+
+The whole sequence was run end to end on 2026-08-28: it created a user, minted
+a token, and that token authenticated and read the device configuration. Test
+users were removed afterwards.
+
+Details that cost time to find:
+
+- **Slot separator.** URLs address a slot as `<map>.<slot>` (a **dot**, e.g.
+  `0.2`), while the field suffix uses an underscore. Both appear in one
+  parameter: `mspUsersMap_.0.2_5`.
+- **Encode spaces as `%20`.** A form encoder that emits `+` for spaces will
+  have the device store the literal plus sign — a name came back as
+  `HA+Provision+Test`.
+- **Where the pending code lives.** It is rendered on `users.html` inside the
+  slot's row, **not** stored in the user table. Field 18 holds a longer
+  (10-character) value on already-activated users and stays empty for a
+  pending code, so reading it finds nothing. Anchor the scrape on the row's
+  own `mspUsersMap_.<slot>_4=` checkbox: once a code is pending the row no
+  longer emits a "Generate activation code" button, so anchoring on that
+  button silently fails.
+- **There is no `user-file.mug` endpoint** on this firmware. Every form of the
+  request answers "Invalid request" — with **HTTP 200 and an HTML body**, so a
+  status check will not notice. (Another implementation reads such a file;
+  that presumably applies to different firmware.)
+- **The redemption message is `user-activation`** with an `activation-code`
+  field, not the `user-cloud-activation` / `cloud-activation-code` pair some
+  notes describe. Codes are 6 characters.
+- **The backup archive lags a write.** After `POST /update.html`, a
+  create-backup/download cycle can still return the pre-write table, so verify
+  writes against `users.html` rather than a fresh backup.
+- **A new identity gets its own subaddress.** The provisioned user came back
+  with `apt-subaddress` 2 where the phone holds 1, so the VIP address changes
+  from `SB0000031` to `SB0000032`.
+
+To undo a provisioned user the page offers `reset-user.html?user=<map>.<slot>`
+("Reset activation") and the field-4 checkbox to disable it.
+
+> Every step above has now been executed against the reference device.
 
 ---
 

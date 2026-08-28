@@ -11,6 +11,7 @@ import io
 import logging
 import re
 import tarfile
+from pathlib import PurePosixPath
 
 import aiohttp
 from homeassistant.core import HomeAssistant
@@ -50,7 +51,17 @@ async def extract_token(
 
 async def _do_extract(session: aiohttp.ClientSession, base_url: str, password: str) -> str | None:
     """Run the extraction steps against the given session."""
-    # Step 1: Login to establish IP-based session
+    await login(session, base_url, password)
+    archive_data = await download_latest_backup(session, base_url)
+    return _parse_token_from_archive(archive_data)
+
+
+async def login(session: aiohttp.ClientSession, base_url: str, password: str) -> None:
+    """Authenticate against the device web UI.
+
+    Sessions are IP-based: once authenticated from an address, subsequent
+    requests from it are authorized.  Shared with user provisioning.
+    """
     _LOGGER.debug("Logging in to %s", base_url)
     login_headers = {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -71,7 +82,9 @@ async def _do_extract(session: aiohttp.ClientSession, base_url: str, password: s
 
     _LOGGER.debug("Login successful")
 
-    # Step 2: Create a fresh backup
+
+async def download_latest_backup(session: aiohttp.ClientSession, base_url: str) -> bytes:
+    """Create a fresh configuration backup and download it."""
     _LOGGER.debug("Creating backup")
     backup_headers = {
         "X-Requested-With": "XMLHttpRequest",
@@ -90,7 +103,6 @@ async def _do_extract(session: aiohttp.ClientSession, base_url: str, password: s
     # Wait for the device to finish creating the backup file
     await asyncio.sleep(2)
 
-    # Step 3: Find backup link
     _LOGGER.debug("Listing backups")
     async with session.get(f"{base_url}/config-backup.html", timeout=_REQUEST_TIMEOUT) as resp:
         if resp.status != 200:
@@ -98,64 +110,87 @@ async def _do_extract(session: aiohttp.ClientSession, base_url: str, password: s
         html = await resp.text()
 
     backup_files = re.findall(r"([0-9]+\.tar\.gz)", html)
-
     if not backup_files:
         raise TokenExtractionError(f"No backup files found on device. Page content (first 500 chars): {html[:500]}")
 
-    # Use the latest backup (highest number)
     backup_files.sort()
     latest_backup = backup_files[-1]
     _LOGGER.debug("Using latest backup: %s", latest_backup)
 
-    # Step 4: Download the archive
-    archive_url = f"{base_url}/{latest_backup}"
-    _LOGGER.debug("Downloading backup from %s", archive_url)
-    async with session.get(archive_url, timeout=_REQUEST_TIMEOUT) as resp:
+    async with session.get(f"{base_url}/{latest_backup}", timeout=_REQUEST_TIMEOUT) as resp:
         if resp.status != 200:
             raise TokenExtractionError(f"Backup download failed with status {resp.status}")
         archive_data = await resp.read()
 
     _LOGGER.debug("Downloaded %d bytes", len(archive_data))
+    return bytes(archive_data)
 
-    # Step 5: Extract token from users.cfg
-    return _parse_token_from_archive(archive_data)
+
+def read_users_cfg(archive_data: bytes) -> str:
+    """Return the text of etc/comelit/users.cfg from a backup archive.
+
+    Matches the basename exactly — facerecognitionusers.cfg is a different
+    file that also ends in "users.cfg" and appears earlier in the archive.
+    """
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive_data), mode="r:gz") as tar:
+            for member in tar.getmembers():
+                if PurePosixPath(member.name).name != "users.cfg":
+                    continue
+                f = tar.extractfile(member)
+                if f is None:
+                    continue
+                raw = f.read()
+                if raw[:2] == b"\x1f\x8b":
+                    raw = gzip.decompress(raw)
+                text = raw.decode("utf-8", errors="replace")
+                if "mspUsersMap" in text:
+                    return text
+    except tarfile.TarError as e:
+        raise TokenExtractionError(f"Failed to read backup archive: {e}") from e
+    raise TokenExtractionError("users.cfg with user slots not found in backup archive")
 
 
 def _parse_token_from_archive(archive_data: bytes) -> str | None:
     """Parse the authentication token from a backup tar.gz archive."""
     members_seen: list[str] = []
+    candidates_read: list[str] = []
     try:
         with tarfile.open(fileobj=io.BytesIO(archive_data), mode="r:gz") as tar:
             for member in tar.getmembers():
                 members_seen.append(member.name)
-                if member.name.endswith("users.cfg"):
-                    f = tar.extractfile(member)
-                    if f is None:
-                        continue
-                    raw = f.read()
+                # Match the file name exactly.  An `endswith` test also matches
+                # etc/comelit/facerecognitionusers.cfg, which holds unrelated
+                # face-recognition users and no tokens — and on this firmware it
+                # is listed *before* the real users.cfg, so a first-match-wins
+                # scan reads the wrong file and fails (verified on 6701W fw 2.x).
+                if PurePosixPath(member.name).name != "users.cfg":
+                    continue
+                f = tar.extractfile(member)
+                if f is None:
+                    continue
+                raw = f.read()
 
-                    # Some firmware versions gzip users.cfg without a .gz extension
-                    if raw[:2] == b"\x1f\x8b":
-                        raw = gzip.decompress(raw)
+                # Some firmware versions gzip users.cfg without a .gz extension
+                if raw[:2] == b"\x1f\x8b":
+                    raw = gzip.decompress(raw)
 
-                    content = raw.decode("utf-8", errors="replace")
-                    _LOGGER.debug("users.cfg size: %d bytes", len(content))
+                content = raw.decode("utf-8", errors="replace")
+                candidates_read.append(f"{member.name} ({len(content)} bytes)")
+                _LOGGER.debug("Read %s: %d bytes", member.name, len(content))
 
-                    matches = TOKEN_PATTERN.findall(content)
-                    if matches:
-                        # Skip null tokens (all zeros)
-                        for token in matches:
-                            if token != "00000000000000000000000000000000":
-                                _LOGGER.debug(
-                                    "Extracted token: %s...%s", token[:4], token[-4:]
-                                )  # nosemgrep: python-logger-credential-disclosure
-                                return str(token)
-
-                    raise TokenExtractionError(
-                        f"Token pattern not found in users.cfg (file size: {len(content)} bytes)"
-                    )
+                # Skip null tokens (all zeros); keep scanning other candidates
+                # rather than failing on the first file without a token.
+                for token in TOKEN_PATTERN.findall(content):
+                    if token != "00000000000000000000000000000000":
+                        _LOGGER.debug(
+                            "Extracted token: %s...%s", token[:4], token[-4:]
+                        )  # nosemgrep: python-logger-credential-disclosure
+                        return str(token)
 
     except tarfile.TarError as e:
         raise TokenExtractionError(f"Failed to read backup archive: {e}") from e
 
+    if candidates_read:
+        raise TokenExtractionError(f"No token found in backup archive. Files read: {', '.join(candidates_read)}")
     raise TokenExtractionError(f"users.cfg not found in backup archive. Members seen: {members_seen}")

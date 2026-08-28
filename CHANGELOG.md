@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.5.0
+
+### New features
+
+- **Dedicated device user** — opt in during setup and the integration creates its own account on the intercom and mints its own token, rather than reusing one that belongs to a phone. The device allows a single listener per identity, so a shared token makes Home Assistant and the Comelit app kick each other off. Verified end to end against a 6701W
+- **Lock entities** — each door is now also a lock (`LockEntityFeature.OPEN`) for HomeKit, voice assistants, and the lock card. The door buttons remain, and keep the stop-video-after-open behaviour
+- **Ring sensors** — last-ring timestamp and cumulative ring count, both restored across restarts; plus ringing and connectivity binary sensors
+- **Per-caller doorbell entities** — created on the first ring from a new call origin, so multi-entrance systems can automate per door; a floor door appears as "Floor call"
+- **Broader device support** — address parsing now covers apartment-block numeric addresses and kit-mode dropped prefixes alongside the `SB` form, and the floor-door origin tag is honoured. 6701W behaviour is unchanged
+- **Doorbell card** — sections-view sizing via `getGridOptions()`, and the card is now offered in the picker when adding a doorbell entity, prefilled from the same device. The Open Door control accepts a button or a lock entity
+
+### Bug fixes
+
+- **Token auto-extraction was broken** — the backup scan matched `etc/comelit/facerecognitionusers.cfg`, which sorts before the real `users.cfg` and contains no token, so setup with a blank token field failed outright. Verified against the device before and after
+- **Video no longer runs forever after a ring** — sessions restart only while something is actually watching, instead of cycling every 120 s until stopped by hand
+
+### Maintenance
+
+- Options changes now reload through `OptionsFlowWithReload`; the config-entry update listener it replaces was deprecated and would have become an error in HA 2026.12
+- `DhcpServiceInfo` imported from its canonical location; Lovelace resources accessed through the typed `LOVELACE_DATA` key; platforms use `AddConfigEntryEntitiesCallback`
+- Minimum Home Assistant version is now declared in `hacs.json` (2026.2.3)
+- `docs/PROTOCOL.md` documents the device's web UI, user table, and identity-minting sequence, with every claim tagged by how it was verified
+
 ## 1.4.0
 
 ### New features

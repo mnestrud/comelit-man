@@ -12,14 +12,16 @@ import struct
 
 from .channels import Channel
 from .client import IconaBridgeClient
+from .const import RENEWAL_ACK_INCREMENT
 from .protocol import encode_call_response_ack, encode_ctpp_init
 
 _LOGGER = logging.getLogger(__name__)
 
 # Both sub-counters increment by 1 (bytes[4] and bytes[5] of the CTPP body).
-# Used to compute the ACK timestamp offset from the init timestamp.
-# Value matches PCAP-verified video session analysis (_CTR_INCR_BOTH in video_call.py).
-_CTR_INCR_BOTH = 0x01010000
+# Used to compute the renewal ACK timestamp offset from the init timestamp.
+# Sourced from const.RENEWAL_ACK_INCREMENT so firmware variants have one knob;
+# the alias is kept because callers import this name.
+_CTR_INCR_BOTH = RENEWAL_ACK_INCREMENT
 
 # Minimum response length: prefix(2) + timestamp(4) + action(2) = 8 bytes.
 _CTPP_RESPONSE_MIN_LEN = 8

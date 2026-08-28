@@ -756,22 +756,28 @@ class TestSetupEntryErrors:
 
 
 # ===========================================================================
-# _async_options_updated
+# Options reload behaviour
 # ===========================================================================
 
 
-class TestOptionsUpdated:
-    @pytest.mark.asyncio
-    async def test_options_updated_triggers_reload(self):
-        from custom_components.comelit_man import _async_options_updated
+class TestOptionsReload:
+    def test_options_flow_reloads_itself(self):
+        """Reload comes from OptionsFlowWithReload, not an update listener.
 
-        hass = _make_hass()
-        entry = MagicMock()
-        entry.entry_id = "test_entry_789"
+        Registering both is rejected by Home Assistant, and the listener form
+        is deprecated.
+        """
+        from homeassistant.config_entries import OptionsFlowWithReload
 
-        await _async_options_updated(hass, entry)
+        from custom_components.comelit_man.config_flow import ComelitLocalOptionsFlow
 
-        hass.config_entries.async_reload.assert_awaited_once_with("test_entry_789")
+        assert issubclass(ComelitLocalOptionsFlow, OptionsFlowWithReload)
+        assert ComelitLocalOptionsFlow.automatic_reload is True
+
+    def test_no_update_listener_registered(self):
+        import custom_components.comelit_man as pkg
+
+        assert not hasattr(pkg, "_async_options_updated")
 
 
 # ===========================================================================

@@ -11,17 +11,18 @@ from homeassistant import config_entries
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_TOKEN
 
 if TYPE_CHECKING:
-    from homeassistant.components.dhcp import DhcpServiceInfo  # type: ignore[attr-defined]
+    from homeassistant.helpers.service_info.dhcp import DhcpServiceInfo
 
 from .auth import authenticate
 from .client import IconaBridgeClient
-from .const import CONF_ENABLE_NOTIFICATIONS, CONF_HTTP_PORT, DEFAULT_HTTP_PORT, DEFAULT_PORT, DOMAIN
+from .const import CONF_CREATE_USER, CONF_ENABLE_NOTIFICATIONS, CONF_HTTP_PORT, DEFAULT_HTTP_PORT, DEFAULT_PORT, DOMAIN
 from .exceptions import (
     AuthenticationError,
 )
 from .exceptions import (
     ConnectionComelitError as ComelitConnectionError,
 )
+from .provisioning import provision_user
 from .token import extract_token
 
 _LOGGER = logging.getLogger(__name__)
@@ -34,6 +35,7 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
         vol.Optional(CONF_HTTP_PORT, default=DEFAULT_HTTP_PORT): int,
         vol.Optional(CONF_TOKEN, default=""): str,
         vol.Optional(CONF_PASSWORD, default="comelit"): str,
+        vol.Optional(CONF_CREATE_USER, default=False): bool,
     }
 )
 
@@ -63,8 +65,26 @@ class ComelitLocalConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             password = user_input.get(CONF_PASSWORD, "comelit")
             title = name if name else f"Comelit {host}"
 
-            # Auto-extract token if not provided
-            if not token:
+            # Create a dedicated device user, or reuse an existing token.
+            # Provisioning gives Home Assistant its own ViP identity so it
+            # does not share one with a phone (two listeners on one identity
+            # kick each other off the device).
+            if not token and user_input.get(CONF_CREATE_USER):
+                try:
+                    token = await provision_user(
+                        host,
+                        password,
+                        http_port,
+                        port,
+                        self.hass,
+                        name=title,
+                    )
+                except Exception as err:
+                    _LOGGER.exception(
+                        "User provisioning failed: %s", err
+                    )  # nosemgrep: python-logger-credential-disclosure
+                    errors["base"] = "provisioning_failed"
+            elif not token:
                 try:
                     token = await extract_token(host, password, http_port, self.hass)
                 except Exception as err:
@@ -298,8 +318,13 @@ class ComelitLocalConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
 
-class ComelitLocalOptionsFlow(config_entries.OptionsFlow):
-    """Handle options for Comelit Local (e.g. enable/disable notifications)."""
+class ComelitLocalOptionsFlow(config_entries.OptionsFlowWithReload):
+    """Handle options for Comelit Local (e.g. enable/disable notifications).
+
+    OptionsFlowWithReload reloads the entry itself when options change; an
+    explicit update listener is the deprecated way to do that and HA refuses
+    to allow both.
+    """
 
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
         self._config_entry = config_entry

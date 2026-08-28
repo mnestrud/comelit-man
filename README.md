@@ -16,7 +16,7 @@ Home Assistant custom component for the **Comelit 6701W** WiFi video intercom. C
 
 - Comelit 6701W (or compatible ICONA Bridge device)
 - Device accessible on your local network
-- Home Assistant 2026.1+
+- Home Assistant 2026.2.3+
 
 ## Supported devices
 
@@ -52,6 +52,13 @@ The integration communicates via the **ICONA Bridge TCP protocol** on port 64100
 3. Enter your device IP and either:
    - Your device password (token will be extracted automatically), or
    - A pre-extracted 32-character hex token
+
+**Create a dedicated user (recommended).** Tick *Create a dedicated user on the
+device* and Home Assistant will provision its own account on the intercom and
+mint its own token, instead of reusing one that already belongs to a phone.
+This matters: the intercom allows only one listener per identity, so sharing a
+token with the Comelit app makes the two kick each other off. Requires a free
+user slot on the device (the wall monitor's slot is never touched).
 
 ### Notification settings
 
@@ -93,6 +100,17 @@ The integration does not persist any state outside the config entry, so no manua
 | `event.comelit_intercom_doorbell` | Fires `ring`, `missed_call`, and `door_opened` events for automations |
 | `button.comelit_intercom_answer_doorbell` | Start two-way audio on an active inbound call |
 | `image.comelit_intercom_last_ring_snapshot` | JPEG captured from video as the last ring arrived |
+| `lock.comelit_intercom_<door_name>` | Same relay as the door button, with lock semantics for HomeKit/voice |
+| `binary_sensor.comelit_intercom_ringing` | On for 30 s after a ring |
+| `binary_sensor.comelit_intercom_connectivity` | Diagnostic — connection health |
+| `sensor.comelit_intercom_last_ring` | Timestamp of the most recent ring (survives restarts) |
+| `sensor.comelit_intercom_ring_count` | Cumulative ring count (survives restarts) |
+
+Systems with more than one call origin also get a doorbell event entity per
+origin, created the first time that origin rings (a floor door appears as
+"Floor call"). Doors are exposed **both** as buttons and as locks — the buttons
+carry the stop-video-after-open behaviour and existing automations; the locks
+exist for HomeKit, voice assistants, and the lock card.
 
 `missed_call` fires when a ring's passive video session ends without the Answer button being pressed (~2 minutes after the ring), or immediately if inbound video fails to start.
 
@@ -117,7 +135,7 @@ doorbell_entity: event.comelit_intercom_doorbell
 camera_entity: camera.comelit_intercom_live_feed
 answer_entity: button.comelit_intercom_answer_doorbell
 stop_entity: button.comelit_intercom_stop_video_feed
-door_entity: button.comelit_intercom_entrance_lock  # optional — adds Open Door buttons
+door_entity: button.comelit_intercom_entrance_lock  # optional — a button or lock entity
 dismiss_after: 30  # optional, default 30s
 ```
 

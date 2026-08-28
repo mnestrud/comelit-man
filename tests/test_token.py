@@ -48,7 +48,7 @@ class TestParseTokenFromArchive:
 
     def test_parse_token_no_match_in_users_cfg(self):
         archive = _make_tar_gz({"config/users.cfg": b"no token here"})
-        with pytest.raises(TokenExtractionError, match="Token pattern not found"):
+        with pytest.raises(TokenExtractionError, match="No token found"):
             _parse_token_from_archive(archive)
 
     def test_parse_token_skips_null_token(self):
@@ -61,7 +61,7 @@ class TestParseTokenFromArchive:
     def test_parse_token_all_null_tokens(self):
         null_token = b'9:4:"00000000000000000000000000000000"'
         archive = _make_tar_gz({"config/users.cfg": null_token})
-        with pytest.raises(TokenExtractionError, match="Token pattern not found"):
+        with pytest.raises(TokenExtractionError, match="No token found"):
             _parse_token_from_archive(archive)
 
     def test_parse_token_gzipped_users_cfg(self):
@@ -217,3 +217,72 @@ class TestExtractToken:
         with _patch_session(session), patch("asyncio.sleep", AsyncMock()):
             with pytest.raises(TokenExtractionError, match="Backup page returned status 500"):
                 await extract_token("192.168.1.1", hass=MagicMock())
+
+
+# ---------------------------------------------------------------------------
+# Regression: facerecognitionusers.cfg must not shadow users.cfg
+# ---------------------------------------------------------------------------
+
+
+def _archive(members: list[tuple[str, bytes]]) -> bytes:
+    """Build a tar.gz with members in the given order."""
+    import io as _io
+    import tarfile as _tarfile
+
+    buf = _io.BytesIO()
+    with _tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, payload in members:
+            info = _tarfile.TarInfo(name=name)
+            info.size = len(payload)
+            tar.addfile(info, _io.BytesIO(payload))
+    return buf.getvalue()
+
+
+# Shapes mirror a real 6701W backup; values are synthetic.
+_FACEREC = b'recUserList.0 = 2:4:"someone" 3:2:1 4:2:1 \n'
+_USERS = (
+    b'mspUsersMap.0.0 = 4:2:2 5:2:0 6:4:"" 9:4:"" 11:4:"" \n'
+    b'mspUsersMap.0.1 = 4:2:1 5:2:2 6:4:"Phone" 9:4:"aedf67d4130203c77b8e62ecb093ec39" 11:4:"a@b.c" \n'
+)
+
+
+class TestUsersCfgSelection:
+    def test_facerecognitionusers_does_not_shadow_users_cfg(self):
+        """It sorts before users.cfg in a real archive and holds no token."""
+        from custom_components.comelit_man.token import _parse_token_from_archive
+
+        data = _archive(
+            [
+                ("etc/comelit/facerecognitionusers.cfg", _FACEREC),
+                ("etc/comelit/users.cfg", _USERS),
+            ]
+        )
+        assert _parse_token_from_archive(data) == "aedf67d4130203c77b8e62ecb093ec39"
+
+    def test_token_found_regardless_of_member_order(self):
+        from custom_components.comelit_man.token import _parse_token_from_archive
+
+        data = _archive(
+            [
+                ("etc/comelit/users.cfg", _USERS),
+                ("etc/comelit/facerecognitionusers.cfg", _FACEREC),
+            ]
+        )
+        assert _parse_token_from_archive(data) == "aedf67d4130203c77b8e62ecb093ec39"
+
+    def test_error_names_files_actually_read(self):
+        from custom_components.comelit_man.exceptions import TokenExtractionError
+        from custom_components.comelit_man.token import _parse_token_from_archive
+
+        empty = b'mspUsersMap.0.0 = 4:2:2 5:2:0 6:4:"" 9:4:"" \n'
+        data = _archive([("etc/comelit/facerecognitionusers.cfg", _FACEREC), ("etc/comelit/users.cfg", empty)])
+        with pytest.raises(TokenExtractionError, match="users.cfg"):
+            _parse_token_from_archive(data)
+
+    def test_missing_users_cfg_reports_members(self):
+        from custom_components.comelit_man.exceptions import TokenExtractionError
+        from custom_components.comelit_man.token import _parse_token_from_archive
+
+        data = _archive([("etc/comelit/facerecognitionusers.cfg", _FACEREC)])
+        with pytest.raises(TokenExtractionError, match="not found"):
+            _parse_token_from_archive(data)

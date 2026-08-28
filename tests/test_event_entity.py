@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -237,3 +237,115 @@ class TestCoordinatorPushCallbacks:
         coord._on_push_event(PushEvent(event_type="ring"))
 
         cb.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: dynamic per-caller doorbell entities
+# ---------------------------------------------------------------------------
+
+
+class TestDynamicCallerEntities:
+    def _entry_and_coordinator(self):
+        from custom_components.comelit_man.models import DeviceConfig
+
+        coordinator = MagicMock()
+        coordinator.device_name = "Comelit Intercom"
+        coordinator.device_config = DeviceConfig(apt_address="SB000006")
+        callbacks = []
+        coordinator.add_push_callback = lambda cb: callbacks.append(cb) or (lambda: None)
+        entry = MagicMock()
+        entry.runtime_data = coordinator
+        entry.entry_id = "entry"
+        return entry, coordinator, callbacks
+
+    @pytest.mark.asyncio
+    async def test_entity_created_on_first_unknown_caller(self):
+        from custom_components.comelit_man.event import async_setup_entry
+
+        entry, _coord, callbacks = self._entry_and_coordinator()
+        added: list = []
+        await async_setup_entry(MagicMock(), entry, lambda e: added.extend(e))
+        assert len(added) == 1  # just the main doorbell entity
+
+        callbacks[0](PushEvent(event_type="ring", apt_address="SB100001", timestamp=0.0))
+        assert len(added) == 2
+        assert added[1].name == "Doorbell SB100001"
+
+    @pytest.mark.asyncio
+    async def test_same_caller_creates_once(self):
+        from custom_components.comelit_man.event import async_setup_entry
+
+        entry, _coord, callbacks = self._entry_and_coordinator()
+        added: list = []
+        await async_setup_entry(MagicMock(), entry, lambda e: added.extend(e))
+        for _ in range(3):
+            callbacks[0](PushEvent(event_type="ring", apt_address="SB100001", timestamp=0.0))
+        assert len(added) == 2
+
+    @pytest.mark.asyncio
+    async def test_distinct_callers_get_distinct_entities(self):
+        from custom_components.comelit_man.event import async_setup_entry
+
+        entry, _coord, callbacks = self._entry_and_coordinator()
+        added: list = []
+        await async_setup_entry(MagicMock(), entry, lambda e: added.extend(e))
+        callbacks[0](PushEvent(event_type="ring", apt_address="SB100001", timestamp=0.0))
+        callbacks[0](PushEvent(event_type="ring", apt_address="SB100002", timestamp=0.0))
+        assert len(added) == 3
+        assert added[1].unique_id != added[2].unique_id
+
+    @pytest.mark.asyncio
+    async def test_floor_call_named_floor(self):
+        """A ring reporting our own apartment address is a floor call."""
+        from custom_components.comelit_man.event import async_setup_entry
+
+        entry, _coord, callbacks = self._entry_and_coordinator()
+        added: list = []
+        await async_setup_entry(MagicMock(), entry, lambda e: added.extend(e))
+        callbacks[0](PushEvent(event_type="ring", apt_address="SB000006", timestamp=0.0))
+        assert added[1].name == "Floor call"
+
+    @pytest.mark.asyncio
+    async def test_non_ring_events_do_not_create_entities(self):
+        from custom_components.comelit_man.event import async_setup_entry
+
+        entry, _coord, callbacks = self._entry_and_coordinator()
+        added: list = []
+        await async_setup_entry(MagicMock(), entry, lambda e: added.extend(e))
+        callbacks[0](PushEvent(event_type="door_opened", apt_address="SB100001", timestamp=0.0))
+        callbacks[0](PushEvent(event_type="ring", apt_address="", timestamp=0.0))
+        assert len(added) == 1
+
+    @pytest.mark.asyncio
+    async def test_initial_ring_replayed_on_add(self):
+        """The ring that created the entity must not be lost."""
+        from custom_components.comelit_man.event import ComelitCallerEvent
+
+        coordinator = MagicMock()
+        coordinator.device_name = "Comelit Intercom"
+        coordinator.add_push_callback = MagicMock(return_value=lambda: None)
+        initial = PushEvent(event_type="ring", apt_address="SB100001", timestamp=0.0)
+        ent = ComelitCallerEvent(coordinator, "entry", "SB100001", False, initial)
+        ent.hass = MagicMock()
+        ent.async_on_remove = MagicMock()
+        with (
+            patch.object(ent, "_trigger_event") as trigger,
+            patch.object(ent, "async_write_ha_state"),
+        ):
+            await ent.async_added_to_hass()
+        trigger.assert_called_once_with("ring", {"apt_address": "SB100001"})
+
+    def test_only_fires_for_its_own_caller(self):
+        from custom_components.comelit_man.event import ComelitCallerEvent
+
+        coordinator = MagicMock()
+        coordinator.device_name = "Comelit Intercom"
+        ent = ComelitCallerEvent(coordinator, "entry", "SB100001", False)
+        with (
+            patch.object(ent, "_trigger_event") as trigger,
+            patch.object(ent, "async_write_ha_state"),
+        ):
+            ent._on_push(PushEvent(event_type="ring", apt_address="SB100002", timestamp=0.0))
+            trigger.assert_not_called()
+            ent._on_push(PushEvent(event_type="ring", apt_address="SB100001", timestamp=0.0))
+            trigger.assert_called_once()

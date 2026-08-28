@@ -25,6 +25,7 @@ from custom_components.comelit_man.vip_listener import (
     PREFIX_VIDEO_EVENT,
     PREFIX_VIP_EVENT,
     VipEventListener,
+    address_matches,
     parse_ctpp_message,
 )
 
@@ -933,3 +934,133 @@ class TestOnCallIdleDispatch:
         listener._handle_vip_event(msg)
         assert rings == [("SB100001", 0x2000)]
         assert idle_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: model-agnostic addressing + floor-call origin tag
+# ---------------------------------------------------------------------------
+
+
+class TestAddressParsing:
+    def test_sb_prefixed_addresses_still_parse(self):
+        """6701W kit-mode addressing is unchanged."""
+        data = _make_ctpp_msg(PREFIX_CALL_INIT, 0x1000, 0x0028, flags=0, addresses=["SB100001", "SB000006"])
+        msg = parse_ctpp_message(data)
+        assert msg["addresses"] == ["SB100001", "SB000006"]
+
+    def test_plain_numeric_addresses_parse(self):
+        """Apartment-block systems use bare numeric addresses."""
+        data = _make_ctpp_msg(PREFIX_CALL_INIT, 0x1000, 0x0028, flags=0, addresses=["00000100", "00000001"])
+        msg = parse_ctpp_message(data)
+        assert msg["addresses"] == ["00000100", "00000001"]
+
+    def test_dropped_prefix_address_parses(self):
+        """Kit firmware may report the caller without the S mode prefix."""
+        data = _make_ctpp_msg(PREFIX_CALL_INIT, 0x1000, 0x0028, flags=0, addresses=["B100001"])
+        msg = parse_ctpp_message(data)
+        assert msg["addresses"] == ["B100001"]
+
+    def test_subaddress_form_parses(self):
+        data = _make_ctpp_msg(PREFIX_VIP_EVENT, 0x1000, 0x0010, flags=0, addresses=["SB0000061", "SB000006"])
+        msg = parse_ctpp_message(data)
+        assert msg["addresses"] == ["SB0000061", "SB000006"]
+
+    def test_no_addresses_when_absent(self):
+        msg = parse_ctpp_message(_make_ctpp_msg(PREFIX_VIP_EVENT, 0x1000, 0x0001, flags=0))
+        assert msg["addresses"] == []
+
+    def test_unterminated_run_not_matched(self):
+        """Null termination is required, so a bare digit run is not an address."""
+        data = struct.pack("<H", PREFIX_VIP_EVENT) + b"01234567" + b"\x01\x02"
+        msg = parse_ctpp_message(data)
+        assert msg["addresses"] == []
+
+    def test_json_payload_does_not_yield_garbage(self):
+        """The old SB-literal scan swallowed whole JSON blobs as 'addresses'."""
+        blob = b'{"apt-address":"SB000003","apt-subaddress":1}\x00'
+        data = struct.pack("<H", PREFIX_VIP_EVENT) + struct.pack("<I", 0) + struct.pack(">H", 0) + blob
+        msg = parse_ctpp_message(data)
+        assert all(len(a) <= 11 for a in msg["addresses"])
+        assert not any('"' in a for a in msg["addresses"])
+
+
+class TestCallTag:
+    def test_floor_tag_extracted(self):
+        buf = bytearray()
+        buf += struct.pack("<H", PREFIX_CALL_INIT)
+        buf += struct.pack("<I", 0x2000)
+        buf += struct.pack(">H", 0x0028)
+        buf += struct.pack(">H", 0x0001)
+        buf += b"FF" + b"\xff\xff\xff\xff"
+        buf += b"SB100001\x00"
+        msg = parse_ctpp_message(bytes(buf))
+        assert msg["call_tag"] == b"FF"
+
+    def test_entrance_tag_extracted(self):
+        buf = bytearray()
+        buf += struct.pack("<H", PREFIX_CALL_INIT)
+        buf += struct.pack("<I", 0x2000)
+        buf += struct.pack(">H", 0x0028)
+        buf += struct.pack(">H", 0x0001)
+        buf += b"PP" + b"\xff\xff\xff\xff"
+        buf += b"SB100001\x00"
+        msg = parse_ctpp_message(bytes(buf))
+        assert msg["call_tag"] == b"PP"
+
+    def test_no_marker_gives_none_tag(self):
+        msg = parse_ctpp_message(_make_ctpp_msg(PREFIX_VIP_EVENT, 0x1000, 0x0001, flags=0))
+        assert msg["call_tag"] is None
+
+    def test_floor_call_reports_own_apartment(self):
+        """Floor rings route separately from entrance rings."""
+        rings = []
+        listener = _make_listener(on_inbound_ring=lambda addr, ts: rings.append(addr))
+        buf = bytearray()
+        buf += struct.pack("<H", PREFIX_CALL_INIT)
+        buf += struct.pack("<I", 0x2000)
+        buf += struct.pack(">H", 0x0028)
+        buf += struct.pack(">H", 0x0001)
+        buf += b"FF" + b"\xff\xff\xff\xff"
+        buf += b"SB100001\x00"
+        listener._handle_vip_event(parse_ctpp_message(bytes(buf)))
+        assert rings == ["SB000006"]  # our apt address, not the entrance panel
+
+    def test_entrance_call_reports_entrance(self):
+        rings = []
+        listener = _make_listener(on_inbound_ring=lambda addr, ts: rings.append(addr))
+        buf = bytearray()
+        buf += struct.pack("<H", PREFIX_CALL_INIT)
+        buf += struct.pack("<I", 0x2000)
+        buf += struct.pack(">H", 0x0028)
+        buf += struct.pack(">H", 0x0001)
+        buf += b"PP" + b"\xff\xff\xff\xff"
+        buf += b"SB100001\x00"
+        listener._handle_vip_event(parse_ctpp_message(bytes(buf)))
+        assert rings == ["SB100001"]
+
+    def test_untagged_call_reports_first_address(self):
+        """Firmware without origin tags behaves exactly as before."""
+        rings = []
+        listener = _make_listener(on_inbound_ring=lambda addr, ts: rings.append(addr))
+        msg = parse_ctpp_message(_make_ctpp_msg(PREFIX_CALL_INIT, 0x2000, 0x0028, flags=0, addresses=["SB100001"]))
+        listener._handle_vip_event(msg)
+        assert rings == ["SB100001"]
+
+
+class TestAddressMatches:
+    def test_exact_match(self):
+        assert address_matches("SB100001", "SB100001")
+
+    def test_dropped_prefix_matches(self):
+        assert address_matches("SB100001", "B100001")
+        assert address_matches("B100001", "SB100001")
+
+    def test_subaddress_matches_base(self):
+        assert address_matches("SB0000061", "SB000006")
+
+    def test_different_addresses_do_not_match(self):
+        assert not address_matches("SB100001", "SB100002")
+
+    def test_empty_never_matches(self):
+        assert not address_matches("", "SB100001")
+        assert not address_matches("SB100001", "")
