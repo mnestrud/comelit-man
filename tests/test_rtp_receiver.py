@@ -1308,3 +1308,108 @@ class TestTxSmoothingBuffer:
 
         # 7000 bytes trimmed to 3200, one frame consumed
         assert receiver.audio_tx_real_count == 1
+
+
+# ---------------------------------------------------------------------------
+# start_audio_sender lifecycle and TCP-media TX path
+# ---------------------------------------------------------------------------
+
+
+class TestStartAudioSender:
+    @pytest.mark.asyncio
+    async def test_starts_a_single_sender_task(self):
+        receiver = RtpReceiver("127.0.0.1")
+        with patch.object(receiver, "_audio_send_loop", new=AsyncMock()):
+            receiver.start_audio_sender(0x1234)
+            task = receiver._audio_sender_task
+            assert task is not None
+            receiver.start_audio_sender(0x1234)
+            assert receiver._audio_sender_task is task
+            await asyncio.sleep(0)
+        task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_restarts_after_the_previous_task_finished(self):
+        """A completed sender is replaced, not treated as still running."""
+        receiver = RtpReceiver("127.0.0.1")
+        done = MagicMock()
+        done.done = MagicMock(return_value=True)
+        receiver._audio_sender_task = done
+        with patch.object(receiver, "_audio_send_loop", new=AsyncMock()):
+            receiver.start_audio_sender(0x1234)
+            task = receiver._audio_sender_task
+            assert task is not done
+            await asyncio.sleep(0)
+        task.cancel()
+
+
+class TestAudioSendLoopTcpTransport:
+    def _receiver(self, *, tcp: int, udp: int) -> RtpReceiver:
+        receiver = RtpReceiver("127.0.0.1")
+        receiver._running = True
+        receiver._tcp_media_packet_count = tcp
+        receiver._udp_media_packet_count = udp
+        return receiver
+
+    def _one_tick(self, receiver: RtpReceiver):
+        async def fake_sleep(_t: float) -> None:
+            receiver._running = False
+
+        return patch("custom_components.comelit_man.rtp_receiver.asyncio.sleep", side_effect=fake_sleep)
+
+    @pytest.mark.asyncio
+    async def test_tcp_media_session_sends_on_the_tcp_channel(self):
+        """TCP-media inbound calls must transmit mic audio over TCP, not UDP."""
+        receiver = self._receiver(tcp=100, udp=0)
+        receiver._transport = MagicMock()
+        sent: list[bytes] = []
+
+        async def tcp_send(body: bytes) -> None:
+            sent.append(body)
+
+        with self._one_tick(receiver):
+            await receiver._audio_send_loop(0x1234, tcp_send=tcp_send)
+
+        assert len(sent) == 1
+        assert len(sent[0]) == 12 + 160  # RTP header + PCMA frame, no ICONA prefix
+        assert receiver.audio_sent_count == 1
+        receiver._transport.sendto.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_tcp_send_failure_does_not_stop_the_loop(self):
+        receiver = self._receiver(tcp=100, udp=0)
+
+        async def tcp_send(body: bytes) -> None:
+            raise ConnectionResetError("device closed RTPC")
+
+        with self._one_tick(receiver):
+            await receiver._audio_send_loop(0x1234, tcp_send=tcp_send)
+
+        assert receiver.audio_sent_count == 0
+
+    @pytest.mark.asyncio
+    async def test_udp_media_session_ignores_tcp_send(self):
+        """When media arrived over UDP the UDP socket stays the TX path."""
+        receiver = self._receiver(tcp=0, udp=100)
+        sent: list[bytes] = []
+        transport = MagicMock()
+        transport.sendto = lambda data, **kw: sent.append(data)
+        receiver._transport = transport
+
+        async def tcp_send(body: bytes) -> None:  # pragma: no cover - must not run
+            raise AssertionError("UDP-media session must not use the TCP path")
+
+        with self._one_tick(receiver):
+            await receiver._audio_send_loop(0x1234, tcp_send=tcp_send)
+
+        assert len(sent) == 1
+        assert receiver.audio_sent_count == 1
+
+    @pytest.mark.asyncio
+    async def test_cancellation_ends_the_loop_quietly(self):
+        receiver = self._receiver(tcp=0, udp=0)
+        with patch(
+            "custom_components.comelit_man.rtp_receiver.asyncio.sleep",
+            side_effect=asyncio.CancelledError,
+        ):
+            await receiver._audio_send_loop(0x1234)

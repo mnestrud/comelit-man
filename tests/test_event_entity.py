@@ -349,3 +349,17 @@ class TestDynamicCallerEntities:
             trigger.assert_not_called()
             ent._on_push(PushEvent(event_type="ring", apt_address="SB100001", timestamp=0.0))
             trigger.assert_called_once()
+
+    def test_ignores_event_types_outside_the_declared_set(self):
+        """A non-doorbell push (e.g. a state ping) never reaches _trigger_event."""
+        from custom_components.comelit_man.event import ComelitCallerEvent
+
+        coordinator = MagicMock()
+        coordinator.device_name = "Comelit Intercom"
+        ent = ComelitCallerEvent(coordinator, "entry", "SB100001", False)
+        with (
+            patch.object(ent, "_trigger_event") as trigger,
+            patch.object(ent, "async_write_ha_state"),
+        ):
+            ent._on_push(PushEvent(event_type="video_started", apt_address="SB100001", timestamp=0.0))
+        trigger.assert_not_called()

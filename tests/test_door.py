@@ -69,6 +69,18 @@ class TestOpenDoorFastPath:
         assert client.read_response.await_count == 2
 
     @pytest.mark.asyncio
+    async def test_silent_device_during_door_init_still_completes(self):
+        """A device that never answers door_init must not abort the open sequence."""
+        channel = MagicMock()
+        client = _make_client(ctpp_channel=channel)
+        client.read_response = AsyncMock(side_effect=TimeoutError)
+
+        await open_door(HOST, PORT, TOKEN, client, _make_config(), _make_door())
+
+        assert client.read_response.await_count == 2
+        assert client.send_binary.await_count == 5
+
+    @pytest.mark.asyncio
     async def test_uses_existing_ctpp_channel(self):
         """open_door uses the channel returned by get_channel('CTPP')."""
         channel = MagicMock()

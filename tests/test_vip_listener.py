@@ -1064,3 +1064,42 @@ class TestAddressMatches:
     def test_empty_never_matches(self):
         assert not address_matches("", "SB100001")
         assert not address_matches("SB100001", "")
+
+
+class TestResolveAckAddressesFallbacks:
+    """_resolve_ack_addresses when the renewal has no repeated/solo split."""
+
+    def test_all_distinct_uses_longest_and_shortest(self):
+        listener = _make_listener()
+        caller, callee = listener._resolve_ack_addresses(["SB000006", "SB0000061"])
+        assert (caller, callee) == ("SB0000061", "SB000006")
+
+    def test_same_length_distinct_pair_still_resolves(self):
+        listener = _make_listener()
+        caller, callee = listener._resolve_ack_addresses(["SB000006", "SB000007"])
+        assert caller in ("SB000006", "SB000007")
+        assert callee in ("SB000006", "SB000007")
+
+    def test_single_repeated_address_falls_back_to_config(self):
+        """No solo entry and only one unique address — config wins."""
+        listener = _make_listener(apt_address="SB000006", apt_subaddress=1)
+        assert listener._resolve_ack_addresses(["SB000006", "SB000006"]) == ("SB0000061", "SB000006")
+
+
+class TestInboundRingCallbackErrors:
+    def test_raising_inbound_ring_callback_is_swallowed(self):
+        """A broken coordinator hook must not kill the CTPP listen loop."""
+        hook = MagicMock(side_effect=RuntimeError("coordinator exploded"))
+        listener = _make_listener(on_inbound_ring=hook)
+
+        listener._handle_vip_event(
+            {
+                "prefix": PREFIX_CALL_INIT,
+                "timestamp": 0x11223344,
+                "action": 0,
+                "flags": 0,
+                "addresses": ["SB100001", "SB000006"],
+            }
+        )
+
+        hook.assert_called_once()
