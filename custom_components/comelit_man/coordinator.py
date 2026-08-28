@@ -50,6 +50,11 @@ MISSED_CALL_WINDOW = 45.0
 class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
     """Coordinator that manages the persistent connection and push notifications."""
 
+    # DataUpdateCoordinator types this as ConfigEntry | None; this coordinator
+    # is always constructed with one, so narrowing it here removes a dozen
+    # union-attr suppressions at the use sites.
+    config_entry: ComelitLocalConfigEntry
+
     def __init__(
         self,
         hass: HomeAssistant,
@@ -186,7 +191,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         # Start VIP event listener for doorbell ring detection, unless disabled.
         # The PUSH channel is one-shot FCM registration; actual call events
         # arrive as binary VIP messages on the CTPP channel.
-        if self.config_entry.options.get(CONF_ENABLE_NOTIFICATIONS, True):  # type: ignore[union-attr]
+        if self.config_entry.options.get(CONF_ENABLE_NOTIFICATIONS, True):
             try:
                 init_ts = await self._open_ctpp_channels(client, self._config)
                 vip = VipEventListener(
@@ -265,7 +270,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         self._client = client
         client.set_disconnect_callback(self._on_client_disconnect)
 
-        if self.config_entry.options.get(CONF_ENABLE_NOTIFICATIONS, True):  # type: ignore[union-attr]
+        if self.config_entry.options.get(CONF_ENABLE_NOTIFICATIONS, True):
             try:
                 init_ts = await self._open_ctpp_channels(client, self._config)
                 vip = VipEventListener(
@@ -370,7 +375,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 await open_door(self.host, self.port, self.token, self._client, self._config, door)
             except DoorOpenError as err:
                 if isinstance(err.__cause__, AuthenticationError):
-                    self.config_entry.async_start_reauth(self.hass)  # type: ignore[union-attr]
+                    self.config_entry.async_start_reauth(self.hass)
                 raise
 
     async def async_start_video(self, auto_timeout: bool = True, by_user: bool = False) -> VideoCallSession:
@@ -482,7 +487,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         if self._video_stopped_by_user:
             return
         _LOGGER.debug("CALL_END received — scheduling session restart")
-        self.config_entry.async_create_background_task(  # type: ignore[union-attr]
+        self.config_entry.async_create_background_task(
             self.hass, self._auto_restart_video(), "comelit-auto-restart-video"
         )
 
@@ -534,7 +539,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         self._last_ring_mono = now
         self._inbound_answered = False
         _LOGGER.debug("Inbound ring: entrance=%s ring_ts=0x%08X", entrance_addr, ring_ts)
-        self.config_entry.async_create_background_task(  # type: ignore[union-attr]
+        self.config_entry.async_create_background_task(
             self.hass,
             self.async_start_inbound_video(entrance_addr, ring_ts),
             "comelit-inbound-video",
@@ -691,7 +696,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         """
         if not self._rtsp_url:
             return
-        name = f"comelit_man_{self.config_entry.entry_id}"  # type: ignore[union-attr]
+        name = f"comelit_man_{self.config_entry.entry_id}"
         # Bare URL — go2rtc negotiates the backchannel itself via the
         # `Require: ...backchannel` header on DESCRIBE; the old #backchannel=1
         # source flag is unnecessary with that negotiation in place.
@@ -720,7 +725,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
 
     async def _deregister_go2rtc_stream(self) -> None:
         """Remove our stream registration from go2rtc on shutdown."""
-        name = f"comelit_man_{self.config_entry.entry_id}"  # type: ignore[union-attr]
+        name = f"comelit_man_{self.config_entry.entry_id}"
         with contextlib.suppress(Exception):
             session = async_get_clientsession(self.hass)
             async with session.delete(
@@ -800,7 +805,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         """
         if self._vip_listener or not self._config or not self._client:
             return
-        if not self.config_entry.options.get(CONF_ENABLE_NOTIFICATIONS, True):  # type: ignore[union-attr]
+        if not self.config_entry.options.get(CONF_ENABLE_NOTIFICATIONS, True):
             return
         try:
             vip = VipEventListener(
@@ -891,7 +896,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         if not self._connection_lost:
             _LOGGER.warning("Comelit device disconnected — attempting reconnect")
             self._connection_lost = True
-        self.config_entry.async_create_background_task(  # type: ignore[union-attr]
+        self.config_entry.async_create_background_task(
             self.hass, self.async_request_refresh(), "comelit-reconnect-refresh"
         )
 
@@ -924,7 +929,11 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         except Exception as err:
             raise UpdateFailed(f"Reconnect failed: {err}") from err
 
-        return self._config  # type: ignore[return-value]
+        # _reconnect() repopulates _config or raises; a None here would be a
+        # logic error rather than a runtime condition.
+        if self._config is None:
+            raise UpdateFailed("Reconnect completed without a device configuration")
+        return self._config
 
 
 type ComelitLocalConfigEntry = ConfigEntry[ComelitLocalCoordinator]

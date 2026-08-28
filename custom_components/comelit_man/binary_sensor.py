@@ -9,7 +9,7 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntity,
 )
 from homeassistant.const import EntityCategory
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_call_later
 
@@ -74,7 +74,7 @@ class ComelitRingingSensor(ComelitEntity, BinarySensorEntity):
         super().__init__(coordinator, entry_id)
         self._attr_unique_id = f"{entry_id}_ringing"
         self._attr_is_on = False
-        self._cancel_clear: object | None = None
+        self._cancel_clear: CALLBACK_TYPE | None = None
 
     async def async_added_to_hass(self) -> None:
         """Register the push callback."""
@@ -86,7 +86,7 @@ class ComelitRingingSensor(ComelitEntity, BinarySensorEntity):
 
     def _cancel_pending(self) -> None:
         if self._cancel_clear is not None:
-            self._cancel_clear()  # type: ignore[operator]
+            self._cancel_clear()
             self._cancel_clear = None
 
     @callback
