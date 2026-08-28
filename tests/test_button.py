@@ -281,3 +281,31 @@ class TestButtonSetupEntry:
         added: list = []
         await async_setup_entry(MagicMock(), entry, lambda ents: added.extend(ents))
         assert len(added) == 0
+
+
+# ---------------------------------------------------------------------------
+# ComelitAnswerDoorbellButton
+# ---------------------------------------------------------------------------
+
+
+def _make_answer_button() -> ComelitAnswerDoorbellButton:
+    coordinator = MagicMock()
+    coordinator.async_answer_inbound = AsyncMock()
+    btn = ComelitAnswerDoorbellButton.__new__(ComelitAnswerDoorbellButton)
+    btn.coordinator = coordinator
+    return btn
+
+
+class TestComelitAnswerDoorbellButton:
+    @pytest.mark.asyncio
+    async def test_press_answers_inbound_call(self):
+        btn = _make_answer_button()
+        await btn.async_press()
+        btn.coordinator.async_answer_inbound.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_press_does_not_raise_on_failure(self):
+        """A failed answer must not surface as an unhandled service error."""
+        btn = _make_answer_button()
+        btn.coordinator.async_answer_inbound = AsyncMock(side_effect=RuntimeError("no session"))
+        await btn.async_press()  # must not raise
