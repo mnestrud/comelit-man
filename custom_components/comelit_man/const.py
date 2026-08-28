@@ -6,6 +6,8 @@ MODEL = "6701W"
 
 CONF_HTTP_PORT = "http_port"
 CONF_ENABLE_NOTIFICATIONS = "enable_notifications"
+# Opt-in: create a dedicated device user instead of reusing an existing token.
+CONF_CREATE_USER = "create_dedicated_user"
 
 DEFAULT_PORT = 64100
 DEFAULT_HTTP_PORT = 8080

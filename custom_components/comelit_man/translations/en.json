@@ -75,7 +75,8 @@
           "port": "ICONA Bridge port",
           "http_port": "HTTP port",
           "token": "Authentication token (32-char hex)",
-          "password": "Device password (to auto-extract token)"
+          "password": "Device password (to auto-extract token)",
+          "create_dedicated_user": "Create a dedicated user on the device"
         },
         "data_description": {
           "name": "Friendly name for this intercom (leave empty to use the host IP)",
@@ -83,7 +84,8 @@
           "port": "TCP port for ICONA Bridge protocol (default: 64100)",
           "http_port": "HTTP port for device web interface (default: 8080)",
           "token": "Leave empty to auto-extract from device using password",
-          "password": "Only needed if token is not provided"
+          "password": "Only needed if token is not provided",
+          "create_dedicated_user": "Creates a new app user on the intercom and mints its own token, so Home Assistant does not share an identity with a phone. Leave off to reuse a token from the device backup."
         }
       },
       "dhcp_confirm": {
@@ -132,7 +134,8 @@
       "cannot_connect": "Failed to connect to the device",
       "invalid_auth": "Authentication failed — check token or password",
       "token_extraction_failed": "Could not extract token from device backup",
-      "unknown": "Unexpected error"
+      "unknown": "Unexpected error",
+      "provisioning_failed": "Could not create a dedicated user on the device. Check the web password, or free a user slot in the device web interface."
     },
     "abort": {
       "already_configured": "Device is already configured",
