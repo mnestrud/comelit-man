@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.5.1
+
+### Bug fixes
+
+- **go2rtc calls use HA's shared aiohttp session** — stream registration no longer creates a standalone `ClientSession`
+
+### Maintenance
+
+- Strict typing hardened: all 12 `type: ignore` suppressions eliminated; mypy strict clean
+- Test coverage restored to 100% across all 32 source files (4014/4014 statements, 1064 tests)
+- Quality audit re-swept at v1.5.x (Sweep 6); README changelog brought current
+
 ## 1.5.0
 
 ### New features
