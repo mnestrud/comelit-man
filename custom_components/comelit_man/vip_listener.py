@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import struct
 import time
 from typing import TYPE_CHECKING, Any
@@ -57,6 +58,15 @@ ACTION_REGISTRATION_RENEWAL = 0x0010  # Device keepalive — must ACK with 0x180
 # Minimum message size: prefix(2) + timestamp(4) + action(2) = 8
 MIN_MSG_SIZE = 8
 
+# VIP address, null-terminated.  Optional "SB" mode prefix (kit/single-house
+# systems) followed by 6-9 hex-ish digits; apartment-block systems omit it.
+_ADDR_RE = re.compile(rb"((?:SB)?[0-9A-Fa-f]{6,9})\x00")
+# Separator preceding the caller/callee block in every VIP message.
+_ADDR_SEPARATOR = b"\xff\xff\xff\xff"
+# Origin tags carried immediately before the separator on kit firmware.
+CALL_TAG_ENTRANCE = b"PP"
+CALL_TAG_FLOOR = b"FF"
+
 
 def parse_ctpp_message(data: bytes) -> dict[str, Any] | None:
     """Parse a binary CTPP message into its components.
@@ -82,20 +92,35 @@ def parse_ctpp_message(data: bytes) -> dict[str, Any] | None:
     if len(data) >= 10:
         result["flags"] = struct.unpack_from(">H", data, 8)[0]
 
-    # Extract VIP addresses (null-terminated ASCII strings starting with "SB")
-    addresses: list[str] = []
-    i = 0
-    while i < len(data) - 1:
-        if data[i : i + 2] == b"SB":
-            end = data.index(0, i) if 0 in data[i:] else len(data)
-            addr = data[i:end].decode("ascii", errors="replace")
-            addresses.append(addr)
-            i = end + 1
-        else:
-            i += 1
+    # Extract VIP addresses.  Kit/single-house systems (this repo's 6701W) use
+    # an "S" mode prefix — SB000006, SB100001 — while apartment-block systems
+    # use bare numeric addresses (00000100), and some firmware reports a ring's
+    # caller with the mode prefix dropped (B100001 for SB100001).  The regex
+    # covers all three.  Null termination is required, which keeps binary
+    # header/flag bytes that happen to be ASCII hex from matching.
+    addresses = [m.group(1).decode("ascii", errors="replace") for m in _ADDR_RE.finditer(data)]
     result["addresses"] = addresses
 
+    # Origin tag: the two ASCII bytes immediately before the 0xFFFFFFFF
+    # separator.  On kit firmware a floor-door ("fuoriporta") ring is otherwise
+    # byte-identical to an entrance-panel ring; b"PP" = entrance panel,
+    # b"FF" = floor door.  Absent on firmware that doesn't tag calls.
+    marker = data.find(_ADDR_SEPARATOR)
+    result["call_tag"] = data[marker - 2 : marker] if marker >= 2 else None
+
     return result
+
+
+def address_matches(a: str, b: str) -> bool:
+    """Compare two VIP addresses tolerantly.
+
+    Kit-mode devices store `SB100001` in the address book but may report the
+    caller as `B100001`, so exact comparison is not enough.  Matches on
+    equality, or when either address is a prefix or suffix of the other.
+    """
+    if not a or not b:
+        return False
+    return a == b or a.startswith(b) or b.startswith(a) or a.endswith(b) or b.endswith(a)
 
 
 class VipEventListener:
@@ -387,12 +412,13 @@ class VipEventListener:
         # A 0x18C0 (call init) from the device means the device is initiating
         # a call to us — this IS the doorbell ring event.
         if prefix == PREFIX_CALL_INIT:
-            entrance_addr = addresses[0] if addresses else ""
+            entrance_addr = self._caller_for(msg, addresses)
             ring_ts = msg["timestamp"]
             _LOGGER.debug(
-                "CTPP call init received (action=0x%04X, addrs=%s ring_ts=0x%08X)",
+                "CTPP call init received (action=0x%04X, addrs=%s tag=%s ring_ts=0x%08X)",
                 action,
                 addresses,
+                msg.get("call_tag"),
                 ring_ts,
             )
             if self._on_inbound_ring is not None:
@@ -454,6 +480,18 @@ class VipEventListener:
             action,
             addresses,
         )
+
+    def _caller_for(self, msg: dict[str, Any], addresses: list[str]) -> str:
+        """Resolve the calling address, honouring the floor-door origin tag.
+
+        On kit firmware a floor-door ring carries the entrance panel's address
+        and is otherwise byte-identical to a building-door ring; only the
+        origin tag distinguishes them.  Report our own apartment address for
+        floor calls so they route separately from entrance calls.
+        """
+        if msg.get("call_tag") == CALL_TAG_FLOOR and self._config.apt_address:
+            return str(self._config.apt_address)
+        return addresses[0] if addresses else ""
 
     def _fire_event(self, event_type: str, addresses: list[str]) -> None:
         """Create and dispatch a PushEvent, deduplicating rapid retransmissions."""
