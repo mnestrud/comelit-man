@@ -286,3 +286,94 @@ class TestUsersCfgSelection:
         data = _archive([("etc/comelit/facerecognitionusers.cfg", _FACEREC)])
         with pytest.raises(TokenExtractionError, match="not found"):
             _parse_token_from_archive(data)
+
+
+# ---------------------------------------------------------------------------
+# read_users_cfg — shared by token extraction and user provisioning
+# ---------------------------------------------------------------------------
+
+
+_SLOTS = b'mspUsersMap.0.0 = 4:2:2 5:2:0 6:4:"" 9:4:"" \n'
+
+
+class TestReadUsersCfg:
+    def test_returns_slot_table(self):
+        from custom_components.comelit_man.token import read_users_cfg
+
+        data = _archive([("etc/comelit/users.cfg", _SLOTS)])
+        assert "mspUsersMap" in read_users_cfg(data)
+
+    def test_skips_facerecognitionusers(self):
+        """Same trap as token extraction: it sorts first and has no slot table."""
+        from custom_components.comelit_man.token import read_users_cfg
+
+        data = _archive([("etc/comelit/facerecognitionusers.cfg", _FACEREC), ("etc/comelit/users.cfg", _SLOTS)])
+        assert "mspUsersMap" in read_users_cfg(data)
+
+    def test_handles_gzipped_member(self):
+        import gzip as _gzip
+
+        from custom_components.comelit_man.token import read_users_cfg
+
+        data = _archive([("etc/comelit/users.cfg", _gzip.compress(_SLOTS))])
+        assert "mspUsersMap" in read_users_cfg(data)
+
+    def test_skips_users_cfg_without_slot_table(self):
+        """A users.cfg that is not the ViP table keeps the scan going."""
+        from custom_components.comelit_man.exceptions import TokenExtractionError
+        from custom_components.comelit_man.token import read_users_cfg
+
+        data = _archive([("etc/comelit/users.cfg", b'recUserList.0 = 2:4:"x"\n')])
+        with pytest.raises(TokenExtractionError, match="not found"):
+            read_users_cfg(data)
+
+    def test_missing_file_raises(self):
+        from custom_components.comelit_man.exceptions import TokenExtractionError
+        from custom_components.comelit_man.token import read_users_cfg
+
+        data = _archive([("etc/comelit/other.cfg", b"x")])
+        with pytest.raises(TokenExtractionError, match="not found"):
+            read_users_cfg(data)
+
+    def test_directory_member_skipped(self):
+        """extractfile() returns None for a directory entry."""
+        import io as _io
+        import tarfile as _tarfile
+
+        from custom_components.comelit_man.token import read_users_cfg
+
+        buf = _io.BytesIO()
+        with _tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            d = _tarfile.TarInfo(name="etc/comelit/users.cfg")
+            d.type = _tarfile.DIRTYPE
+            tar.addfile(d)
+            info = _tarfile.TarInfo(name="etc/other/users.cfg")
+            info.size = len(_SLOTS)
+            tar.addfile(info, _io.BytesIO(_SLOTS))
+        assert "mspUsersMap" in read_users_cfg(buf.getvalue())
+
+    def test_corrupt_archive_raises(self):
+        from custom_components.comelit_man.exceptions import TokenExtractionError
+        from custom_components.comelit_man.token import read_users_cfg
+
+        with pytest.raises(TokenExtractionError, match="Failed to read backup archive"):
+            read_users_cfg(b"not a tar archive at all")
+
+
+class TestParseTokenDirectoryMember:
+    def test_directory_named_users_cfg_is_skipped(self):
+        """extractfile() returns None for a directory; the scan continues."""
+        import io as _io
+        import tarfile as _tarfile
+
+        from custom_components.comelit_man.token import _parse_token_from_archive
+
+        buf = _io.BytesIO()
+        with _tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            d = _tarfile.TarInfo(name="etc/comelit/users.cfg")
+            d.type = _tarfile.DIRTYPE
+            tar.addfile(d)
+            info = _tarfile.TarInfo(name="etc/other/users.cfg")
+            info.size = len(_USERS)
+            tar.addfile(info, _io.BytesIO(_USERS))
+        assert _parse_token_from_archive(buf.getvalue()) == "aedf67d4130203c77b8e62ecb093ec39"
