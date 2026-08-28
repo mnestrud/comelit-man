@@ -315,7 +315,7 @@ The device has a built-in face recognition pipeline. When a ring occurs, the dev
 The FRCG channel uses the same JSON-over-ICONA framing as UAUT/UCFG. The `rcg-detected-recognition` payload includes enough metadata (bounding box, existing similarity score) to know whether the device already matched the face against its own database.
 
 ### Full protocol reference
-A committed `docs/PROTOCOL.md` is planned (cherry-pick Phase 7) to replace the gitignored, no-longer-present `memory/protocol_reference.md`. Until then, the wire-format knowledge lives in `protocol.py` encoder docstrings and the sequence docs in `video_call.py`.
+See **`docs/PROTOCOL.md`** — committed, covers framing, channels, CTPP events and the three timestamp regimes, door paths, outbound/inbound call sequences, media transport symmetry, audio, and the Home Assistant end-to-end path (RTSP → go2rtc → WebRTC, SDP direction traps, trickle ICE, mic secure-context constraint). Encoder-level byte layouts remain in `protocol.py` docstrings.
 
 ---
 

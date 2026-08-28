@@ -227,6 +227,8 @@ Key operations:
 - **Door open (notifications disabled)**: Open transient CTPP channel → full init → 6-step binary sequence → close
 - **Push channel**: Registers FCM token; also used as a 90s keepalive probe — device ACKs with JSON, preventing false reconnect cycles
 
+Full wire-format reference — framing, channels, CTPP events, call sequences, media transport, audio, and the Home Assistant WebRTC path — is in **[docs/PROTOCOL.md](docs/PROTOCOL.md)**.
+
 ## Troubleshooting
 
 ### Enable debug logging
