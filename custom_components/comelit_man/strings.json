@@ -28,6 +28,27 @@
       "doorbell": {
         "name": "Doorbell"
       }
+    },
+    "binary_sensor": {
+      "connectivity": {
+        "name": "Connectivity"
+      },
+      "ringing": {
+        "name": "Ringing"
+      }
+    },
+    "lock": {
+      "door": {
+        "name": "Door"
+      }
+    },
+    "sensor": {
+      "last_ring": {
+        "name": "Last ring"
+      },
+      "ring_count": {
+        "name": "Ring count"
+      }
     }
   },
   "options": {
