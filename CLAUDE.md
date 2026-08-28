@@ -52,7 +52,7 @@ Home Assistant custom component for the **Comelit 6701W** WiFi video intercom. C
 | `tests/test_*.py` | One file per source module |
 | `.github/workflows/validate.yml` | CI: HACS, hassfest, ruff check+format, mypy, pytest |
 
-Platforms: `BUTTON, CAMERA, EVENT` | Min HA: `2026.1.0` | Repo: `https://github.com/mnestrud/comelit-man`
+Platforms: `BINARY_SENSOR, BUTTON, CAMERA, EVENT, IMAGE, LOCK, SENSOR` | Min HA: `2026.1.0` | Repo: `https://github.com/mnestrud/comelit-man`
 
 ---
 
@@ -130,8 +130,10 @@ COMELIT_HOST=192.168.113.12 COMELIT_TOKEN=<token> .venv/bin/pytest tests/test_in
 ```bash
 rsync -a --delete /home/ataraxia/code/comelit-man/custom_components/comelit_man/ /mnt/ha-config/custom_components/comelit_man/
 ```
-- **Python changes** (any `.py` file): full HA restart required — use `ha_restart` MCP call; do NOT poll after, tell user to confirm when ready
-- **Non-Python changes** (strings.json, translations): reload only — `ha_reload_config component=core`
+- **Python changes** (any `.py` file): full HA restart required — `curl -s -X POST -H "Authorization: Bearer $(cat ~/.ha-token)" http://192.168.113.3:8123/api/services/homeassistant/restart`; do NOT poll after, tell user to confirm when ready
+- **Non-Python changes** (strings.json, translations): reload only — `curl -s -X POST -H "Authorization: Bearer $(cat ~/.ha-token)" http://192.168.113.3:8123/api/services/homeassistant/reload_core_config`
+
+All live-HA interaction uses the REST API directly (`http://192.168.113.3:8123/api/`, long-lived token in `~/.ha-token`) — no MCP server. States: `GET /api/states/<entity_id>`; services: `POST /api/services/<domain>/<service>`; error log: `GET /api/error_log`.
 
 ### Step 2b — Validate on live HA (after user confirms restart complete)
 Invoke `ha-integration-validator` agent: "Validate comelit_man on live HA"
@@ -157,16 +159,16 @@ git push origin dev
 
 ## Quality Scale
 
-**Tier status (v1.0.2):**
-- Bronze — EFFECTIVE PASS (`brands` accepted-FAIL, won't fix; all other rules PASS)
-- Silver — **MET** (BL-023 DONE: 98% total coverage, rtsp_server.py 100%, 759 tests)
-- Gold — **MET** (19/19 applicable rules PASS)
-- Platinum — **MET** (all 3 rules PASS)
+**Tier status (v1.5.0, Sweep 6 — 2026-08-28):**
+- Bronze — **MET** (`brands` now PASS: local brand images per Core 2026.3)
+- Silver — **MET** (100% coverage: 4014/4014 stmts, 1064 tests, all 32 files)
+- Gold — **NOT MET** (16/21 PASS; `docs-examples` + `docs-use-cases` FAIL — automation examples lost in README rewrites; `exception-translations` PARTIAL — untranslated raise sites; all three user-deferred 2026-08-28, BL-039/BL-040)
+- Platinum — **MET** (0 `type: ignore`, mypy strict clean)
 
 Full audit checklist: `memory/comelit_man_audit.md`
 Quality scale rules: https://developers.home-assistant.io/docs/core/integration-quality-scale/rules
 
-No remaining quality-scale work. Coverage is 100% across all files.
+Remaining quality-scale work (all user-deferred): BL-039 restore automation examples/use-cases to README; BL-040 add translation keys to remaining raise sites; BL-041 raise CI cov gate 83→95+. Coverage is 100% across all files.
 
 ---
 
