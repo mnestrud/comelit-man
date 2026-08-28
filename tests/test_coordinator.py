@@ -1246,44 +1246,49 @@ class TestNotifyVideoStateChange:
 
 
 class TestGo2RtcRegistration:
+    """go2rtc calls use HA's shared aiohttp session (Platinum: inject-websession)."""
+
+    @staticmethod
+    def _session(status: int = 200):
+        resp = MagicMock()
+        resp.status = status
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.put = MagicMock(return_value=resp)
+        session.delete = MagicMock(return_value=resp)
+        return session
+
     @pytest.mark.asyncio
     async def test_register_puts_bare_rtsp_url(self):
-        """_register_go2rtc_stream PUTs the bare RTSP URL (backchannel is
-        negotiated via the Require header, not a source flag)."""
+        """Backchannel is negotiated via the Require header, not a source flag."""
         coord = _make_coordinator()
         coord._rtsp_url = "rtsp://127.0.0.1:8557/intercom"
+        session = self._session()
 
-        mock_response = MagicMock()
-        mock_response.status = 200
-        mock_session = AsyncMock()
-        mock_session.put = AsyncMock(return_value=mock_response)
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("custom_components.comelit_man.coordinator.aiohttp.ClientSession", return_value=mock_session):
+        with patch(
+            "custom_components.comelit_man.coordinator.async_get_clientsession",
+            return_value=session,
+        ):
             await coord._register_go2rtc_stream()
 
-        mock_session.put.assert_called_once()
-        call_kwargs = mock_session.put.call_args
-        params = call_kwargs[1]["params"]
+        session.put.assert_called_once()
+        params = session.put.call_args.kwargs["params"]
         assert params["src"] == "rtsp://127.0.0.1:8557/intercom"
         assert "comelit_man_" in params["name"]
 
     @pytest.mark.asyncio
     async def test_register_warns_on_http_error(self):
-        """A 401/4xx from go2rtc logs a warning instead of false success."""
+        """A 401/4xx logs a warning instead of reporting false success."""
         coord = _make_coordinator()
         coord._rtsp_url = "rtsp://127.0.0.1:8557/intercom"
-
-        mock_response = MagicMock()
-        mock_response.status = 401
-        mock_session = AsyncMock()
-        mock_session.put = AsyncMock(return_value=mock_response)
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
+        session = self._session(status=401)
 
         with (
-            patch("custom_components.comelit_man.coordinator.aiohttp.ClientSession", return_value=mock_session),
+            patch(
+                "custom_components.comelit_man.coordinator.async_get_clientsession",
+                return_value=session,
+            ),
             patch("custom_components.comelit_man.coordinator._LOGGER") as mock_logger,
         ):
             await coord._register_go2rtc_stream()
@@ -1292,48 +1297,37 @@ class TestGo2RtcRegistration:
 
     @pytest.mark.asyncio
     async def test_register_graceful_when_go2rtc_unavailable(self):
-        """_register_go2rtc_stream does not raise when go2rtc is not running."""
         coord = _make_coordinator()
         coord._rtsp_url = "rtsp://127.0.0.1:8557/intercom"
+        session = MagicMock()
+        session.put = MagicMock(side_effect=OSError("connection refused"))
 
-        mock_session = AsyncMock()
-        mock_session.put = AsyncMock(side_effect=OSError("connection refused"))
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("custom_components.comelit_man.coordinator.aiohttp.ClientSession", return_value=mock_session):
+        with patch(
+            "custom_components.comelit_man.coordinator.async_get_clientsession",
+            return_value=session,
+        ):
             await coord._register_go2rtc_stream()  # must not raise
 
     @pytest.mark.asyncio
     async def test_deregister_deletes_stream(self):
-        """_deregister_go2rtc_stream sends DELETE to go2rtc API."""
         coord = _make_coordinator()
+        session = self._session()
 
-        mock_session = AsyncMock()
-        mock_session.delete = AsyncMock()
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("custom_components.comelit_man.coordinator.aiohttp.ClientSession", return_value=mock_session):
+        with patch(
+            "custom_components.comelit_man.coordinator.async_get_clientsession",
+            return_value=session,
+        ):
             await coord._deregister_go2rtc_stream()
 
-        mock_session.delete.assert_called_once()
+        session.delete.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_register_skips_when_no_rtsp_url(self):
-        """_register_go2rtc_stream returns immediately if rtsp_url is not set."""
         coord = _make_coordinator()
         coord._rtsp_url = None
-
-        with patch("custom_components.comelit_man.coordinator.aiohttp.ClientSession") as mock_cls:
+        with patch("custom_components.comelit_man.coordinator.async_get_clientsession") as get_session:
             await coord._register_go2rtc_stream()
-        mock_cls.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# _on_inbound_ring dedup (Phase 1: ring retransmit suppression)
-# ---------------------------------------------------------------------------
-
+        get_session.assert_not_called()
 
 class TestInboundRingDedup:
     def test_first_ring_schedules_task(self):

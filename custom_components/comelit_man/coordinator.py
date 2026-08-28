@@ -18,6 +18,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .auth import authenticate
@@ -696,12 +697,12 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         # source flag is unnecessary with that negotiation in place.
         src = self._rtsp_url
         try:
-            async with aiohttp.ClientSession() as session:
-                resp = await session.put(
-                    "http://127.0.0.1:1984/api/streams",
-                    params={"name": name, "src": src},
-                    timeout=aiohttp.ClientTimeout(total=5),
-                )
+            session = async_get_clientsession(self.hass)
+            async with session.put(
+                "http://127.0.0.1:1984/api/streams",
+                params={"name": name, "src": src},
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
                 if resp.status >= 400:
                     # e.g. 401 when go2rtc's API has auth configured — a
                     # static entry in go2rtc.yaml then has to provide the
@@ -721,12 +722,13 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         """Remove our stream registration from go2rtc on shutdown."""
         name = f"comelit_man_{self.config_entry.entry_id}"  # type: ignore[union-attr]
         with contextlib.suppress(Exception):
-            async with aiohttp.ClientSession() as session:
-                await session.delete(
-                    "http://127.0.0.1:1984/api/streams",
-                    params={"name": name},
-                    timeout=aiohttp.ClientTimeout(total=5),
-                )
+            session = async_get_clientsession(self.hass)
+            async with session.delete(
+                "http://127.0.0.1:1984/api/streams",
+                params={"name": name},
+                timeout=aiohttp.ClientTimeout(total=5),
+            ):
+                pass
             _LOGGER.debug("Deregistered go2rtc stream: %s", name)
 
     @property
