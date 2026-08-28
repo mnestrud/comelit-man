@@ -410,3 +410,114 @@ class TestDhcpFlow:
 
         assert result["type"] == "form"
         assert result["errors"]["base"] == "token_extraction_failed"
+
+
+# ---------------------------------------------------------------------------
+# Dedicated-user provisioning branch of the user step
+# ---------------------------------------------------------------------------
+
+
+class TestProvisioningInUserStep:
+    def _make_flow(self):
+        from custom_components.comelit_man.config_flow import ComelitLocalConfigFlow
+
+        flow = ComelitLocalConfigFlow()
+        hass = MagicMock()
+        hass.config_entries.flow.async_progress_by_handler.return_value = []
+        hass.config_entries.async_entries.return_value = []
+        hass.config_entries.async_entry_for_domain_unique_id.return_value = None
+        flow.hass = hass
+        flow.context = {}
+        flow._async_current_entries = lambda include_ignore=False: []
+        return flow
+
+    @staticmethod
+    def _user_input(**overrides):
+        data = {
+            "name": "Intercom",
+            "host": HOST,
+            "port": PORT,
+            "http_port": 8080,
+            "token": "",
+            "password": "comelit",
+            "create_dedicated_user": True,
+        }
+        data.update(overrides)
+        return data
+
+    @pytest.mark.asyncio
+    async def test_provisions_when_opted_in_and_no_token(self):
+        """The provisioned token is what gets stored."""
+        flow = self._make_flow()
+        client = _mock_client()
+        minted = "d" * 32
+
+        with (
+            patch(
+                "custom_components.comelit_man.config_flow.provision_user",
+                new_callable=AsyncMock,
+                return_value=minted,
+            ) as provision,
+            patch("custom_components.comelit_man.config_flow.extract_token", new_callable=AsyncMock) as extract,
+            patch("custom_components.comelit_man.config_flow.IconaBridgeClient", return_value=client),
+            patch("custom_components.comelit_man.config_flow.authenticate", new_callable=AsyncMock),
+        ):
+            result = await flow.async_step_user(user_input=self._user_input())
+
+        provision.assert_awaited_once()
+        extract.assert_not_called()  # provisioning replaces extraction
+        assert result["type"] == "create_entry"
+        assert result["data"]["token"] == minted
+
+    @pytest.mark.asyncio
+    async def test_provisioning_failure_shows_error(self):
+        """A failed provisioning re-shows the form with provisioning_failed."""
+        flow = self._make_flow()
+
+        with patch(
+            "custom_components.comelit_man.config_flow.provision_user",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("no free slot"),
+        ):
+            result = await flow.async_step_user(user_input=self._user_input())
+
+        assert result["type"] == "form"
+        assert result["errors"]["base"] == "provisioning_failed"
+
+    @pytest.mark.asyncio
+    async def test_existing_token_skips_provisioning(self):
+        """Supplying a token wins over the checkbox."""
+        flow = self._make_flow()
+        client = _mock_client()
+
+        with (
+            patch("custom_components.comelit_man.config_flow.provision_user", new_callable=AsyncMock) as provision,
+            patch("custom_components.comelit_man.config_flow.IconaBridgeClient", return_value=client),
+            patch("custom_components.comelit_man.config_flow.authenticate", new_callable=AsyncMock),
+        ):
+            result = await flow.async_step_user(user_input=self._user_input(token=TOKEN))
+
+        provision.assert_not_called()
+        assert result["type"] == "create_entry"
+        assert result["data"]["token"] == TOKEN
+
+    @pytest.mark.asyncio
+    async def test_opt_out_falls_back_to_extraction(self):
+        flow = self._make_flow()
+        client = _mock_client()
+
+        with (
+            patch("custom_components.comelit_man.config_flow.provision_user", new_callable=AsyncMock) as provision,
+            patch(
+                "custom_components.comelit_man.config_flow.extract_token",
+                new_callable=AsyncMock,
+                return_value=TOKEN,
+            ) as extract,
+            patch("custom_components.comelit_man.config_flow.IconaBridgeClient", return_value=client),
+            patch("custom_components.comelit_man.config_flow.authenticate", new_callable=AsyncMock),
+        ):
+            result = await flow.async_step_user(user_input=self._user_input(create_dedicated_user=False))
+
+        provision.assert_not_called()
+        extract.assert_awaited_once()
+        assert result["data"]["token"] == TOKEN
