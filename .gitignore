@@ -36,6 +36,7 @@ memory/protocol_reference.md
 # Home Assistant
 *.log
 
-docs/
+docs/*
+!docs/PROTOCOL.md
 
 .claude
