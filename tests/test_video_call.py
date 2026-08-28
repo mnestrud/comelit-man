@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import struct
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -1947,3 +1947,146 @@ class TestForwardRingFloorTag:
         rings = []
         self._session(lambda a, t: rings.append(a))._forward_ring(self._tagged_ring(b"PP"))
         assert rings == ["SB100001"]
+
+
+# ---------------------------------------------------------------------------
+# Remaining branches: short reads, timeouts, handoff, inbound media router
+# ---------------------------------------------------------------------------
+
+
+def _bare_session() -> VideoCallSession:
+    session = VideoCallSession.__new__(VideoCallSession)
+    session._active = True
+    session._client = None
+    session._rtp_receiver = None
+    session._rtsp_server = None
+    session._external_rtsp = False
+    session._ctpp_lock = asyncio.Lock()
+    session._call_counter = 0
+    session._answer_handoff = None
+    session._on_ring = None
+    session._config = MagicMock()
+    return session
+
+
+class TestShortResponseGuards:
+    @pytest.mark.asyncio
+    async def test_codec_exchange_stops_on_short_response(self):
+        session = _bare_session()
+        client = MagicMock()
+        client.send_binary = AsyncMock()
+        client.read_response = AsyncMock(return_value=b"\x01")  # < 2 bytes
+
+        counter = await session._run_codec_exchange(client, MagicMock(), "SB0000061", "SB100001", 0x10000000)
+        assert counter == 0x10000000
+
+    @pytest.mark.asyncio
+    async def test_ack_device_rtpc_link_stops_on_short_response(self):
+        session = _bare_session()
+        client = MagicMock()
+        client.send_binary = AsyncMock()
+        client.read_response = AsyncMock(return_value=b"\x01")
+
+        await session._ack_device_rtpc_link(client, MagicMock(), "SB0000061", "SB100001", 0x10000000)
+        client.send_binary.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_codec_exchange_tolerates_timeout(self):
+        """A quiet device during codec negotiation is not fatal."""
+        session = _bare_session()
+        client = MagicMock()
+        client.send_binary = AsyncMock()
+        client.read_response = AsyncMock(side_effect=TimeoutError)
+
+        counter = await session._run_codec_exchange(client, MagicMock(), "SB0000061", "SB100001", 0x10000000)
+        assert isinstance(counter, int)
+
+
+class TestTcpVideoLoopTimeout:
+    @pytest.mark.asyncio
+    async def test_timeout_continues_until_receiver_stops(self):
+        """A quiet RTPC2 channel keeps the loop alive, it does not feed the receiver."""
+        receiver = MagicMock()
+        type(receiver).running = PropertyMock(side_effect=[True, True, False])
+        client = MagicMock()
+        calls = 0
+
+        async def read(channel):
+            nonlocal calls
+            calls += 1
+            raise TimeoutError
+
+        client.read_response = read
+        await VideoCallSession._tcp_video_loop(client, MagicMock(), receiver)
+        assert calls == 2
+        receiver.receive_tcp_rtp.assert_not_called()
+
+
+class TestAnswerHandoffRouting:
+    @pytest.mark.asyncio
+    async def test_non_call_end_routed_to_handoff_queue(self):
+        """While answering, 0x1840 traffic goes to the answer sequence."""
+        session = _bare_session()
+        session._answer_handoff = asyncio.Queue()
+        frame = struct.pack("<H", 0x1840) + struct.pack("<I", 0x1000) + struct.pack(">H", 0x000A)
+
+        client = MagicMock()
+        client.send_binary = AsyncMock()
+        frames = [frame]
+
+        async def read(channel):
+            if frames:
+                return frames.pop(0)
+            session._active = False
+            return b""
+
+        client.read_response = read
+        await session._ctpp_monitor_loop(
+            client,
+            MagicMock(),
+            "SB0000031",
+            "SB100001",
+            0x10000000,
+            rtpc1_server_id=0xABCD,
+            media_req_id=0x1234,
+        )
+        assert session._answer_handoff.get_nowait() == frame
+        client.send_binary.assert_not_called()  # handoff consumes it instead of ACKing
+
+
+class TestInboundMediaRouter:
+    @pytest.mark.asyncio
+    async def test_routes_both_channels_and_skips_short_frames(self):
+        receiver = MagicMock()
+        type(receiver).running = PropertyMock(side_effect=[True, False])
+        rtpc1 = MagicMock()
+        rtpc1.response_queue = asyncio.Queue()
+        rtpc2 = MagicMock()
+        rtpc2.response_queue = asyncio.Queue()
+        rtpc1.response_queue.put_nowait(b"\x80\x08" + bytes(20))  # audio, long enough
+        rtpc2.response_queue.put_nowait(b"\x01\x02")  # too short, ignored
+
+        await VideoCallSession._tcp_inbound_media_router(MagicMock(), rtpc1, rtpc2, receiver)
+
+        assert receiver.receive_tcp_rtp.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_empty_queues_are_harmless(self):
+        receiver = MagicMock()
+        type(receiver).running = PropertyMock(side_effect=[True, False])
+        rtpc1 = MagicMock()
+        rtpc1.response_queue = asyncio.Queue()
+        rtpc2 = MagicMock()
+        rtpc2.response_queue = asyncio.Queue()
+
+        await VideoCallSession._tcp_inbound_media_router(MagicMock(), rtpc1, rtpc2, receiver)
+        receiver.receive_tcp_rtp.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_router_swallows_errors(self):
+        receiver = MagicMock()
+        type(receiver).running = PropertyMock(return_value=True)
+        rtpc1 = MagicMock()
+        rtpc1.response_queue = MagicMock()
+        rtpc1.response_queue.get_nowait = MagicMock(side_effect=RuntimeError("boom"))
+        await VideoCallSession._tcp_inbound_media_router(MagicMock(), rtpc1, MagicMock(), receiver)
