@@ -22,18 +22,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 import re
-import struct
-from typing import Any, NamedTuple
+from typing import NamedTuple
+from urllib.parse import quote
 
 import aiohttp
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .exceptions import TokenExtractionError
-from .protocol import HEADER_MAGIC, MessageType
 from .token import download_latest_backup, login, read_users_cfg
 
 _LOGGER = logging.getLogger(__name__)
@@ -185,10 +183,11 @@ async def _update_field(
     value: str,
 ) -> None:
     """Set one field on a user slot."""
-    params = {f"mspUsersMap_.{target.path}_{field}": value}
+    # Build the query manually: aiohttp encodes spaces as "+", and the device
+    # stores that literally (a name came back as "HA+Provision+Test").
+    query = f"mspUsersMap_.{target.path}_{field}={quote(value, safe='')}"
     async with session.post(
-        f"{base_url}/update.html",
-        params=params,
+        f"{base_url}/update.html?{query}",
         headers={"Referer": f"{base_url}/users.html"},
         timeout=_REQUEST_TIMEOUT,
     ) as resp:
@@ -215,11 +214,12 @@ async def _generate_activation_code(
 ) -> str:
     """Ask the device to generate an activation code, then read it back.
 
-    The code is read from the user table rather than a pairing file: this
-    firmware has no `user-file.mug` endpoint (it answers "Invalid request",
-    and does so with HTTP 200 and an HTML body, so the status code alone
-    proves nothing).  The generated code lands in field 18 of the slot,
-    which the device's own users page renders next to the activation status.
+    The pending code is rendered on the users page next to the slot's
+    activation status — it is *not* written to the user table (field 18 holds
+    a longer value on already-activated users and stays empty here), and this
+    firmware has no `user-file.mug` endpoint: every form of that request
+    answers "Invalid request", with HTTP 200 and an HTML body, so a status
+    check would not notice.
     """
     async with session.post(
         f"{base_url}/create-actcode.html",
@@ -231,85 +231,70 @@ async def _generate_activation_code(
         if resp.status != 200 or "Invalid request" in body:
             raise TokenExtractionError(f"Activation code generation failed (HTTP {resp.status}) for slot {target.path}")
 
-    archive = await download_latest_backup(session, base_url)
-    for entry in parse_user_slots(read_users_cfg(archive)):
-        if entry.map_index == target.map_index and entry.slot == target.slot:
-            if entry.activation_code:
-                return entry.activation_code
-            raise TokenExtractionError(
-                f"Device generated no activation code for slot {target.path} (field {_FIELD_ACTIVATION_CODE} is empty)"
-            )
-    raise TokenExtractionError(f"Slot {target.path} disappeared from the user table")
+    async with session.get(f"{base_url}/users.html", timeout=_REQUEST_TIMEOUT) as resp:
+        if resp.status != 200:
+            raise TokenExtractionError(f"Reading the users page failed with status {resp.status}")
+        html = await resp.text()
+
+    code = _extract_activation_code(html, target)
+    if not code:
+        raise TokenExtractionError(f"Device generated no activation code for slot {target.path}")
+    return code
+
+
+def _extract_activation_code(html: str, target: UserSlot) -> str:
+    """Pull the pending activation code for a slot out of the users page.
+
+    Every row carries its own enable checkbox (`mspUsersMap_.<slot>_4=`), so
+    that is used to bound the row; the pending code is rendered inside a
+    <strong> in the status cell.  Anchoring on the "Generate activation code"
+    button instead does not work — once a code is pending, that button is no
+    longer emitted for the row.
+    """
+    row_start = html.find(f"mspUsersMap_.{target.path}_4=")
+    if row_start == -1:
+        return ""
+    next_row = html.find("_4=", row_start + len(f"mspUsersMap_.{target.path}_4="))
+    row = html[row_start : next_row if next_row != -1 else len(html)]
+    match = re.search(r"<strong>([^<]*)</strong>", row)
+    return match.group(1).strip() if match else ""
 
 
 async def _redeem_activation_code(host: str, port: int, code: str, description: str) -> str:
     """Redeem an activation code on the UAUT channel and return the token."""
-    reader, writer = await asyncio.open_connection(host, port)
+    # Local import: client imports protocol, and provisioning is imported by
+    # the config flow before the coordinator exists.
+    from .channels import ChannelType
+    from .client import IconaBridgeClient
+
+    client = IconaBridgeClient(host, port)
     try:
-        # Open UAUT (channel type 7) with sequence 1 — the device ignores any
-        # other sequence on a channel open.
-        body = bytearray()
-        body += struct.pack("<HH", MessageType.COMMAND, 1)
-        body += struct.pack("<I", 7)
-        body += b"UAUT"
-        body += struct.pack("<H", 1)
-        body += b"\x00"
-        writer.write(HEADER_MAGIC + struct.pack("<HH", len(body), 0) + b"\x00\x00" + bytes(body))
-        await writer.drain()
-
-        open_ack = await asyncio.wait_for(reader.read(4096), timeout=_ACTIVATION_TIMEOUT)
-        if len(open_ack) < 10:
-            raise TokenExtractionError("Device did not acknowledge the UAUT channel")
-        channel_id = struct.unpack_from("<H", open_ack, 8)[0]
-
-        request = {
-            "message": "user-activation",
-            "activation-code": code,
-            "description": description,
-            "message-type": "request",
-            "message-id": 1,
-        }
-        payload = json.dumps(request, separators=(",", ":")).encode() + b"\n"
-        writer.write(HEADER_MAGIC + struct.pack("<HH", len(payload), channel_id) + b"\x00\x00" + payload)
-        await writer.drain()
-
-        # The device may emit unrelated frames first; read a few.
-        for _ in range(4):
-            data = await asyncio.wait_for(reader.read(8192), timeout=_ACTIVATION_TIMEOUT)
-            if not data:
-                break
-            response = _find_activation_response(data)
-            if response is None:
-                continue
-            if response.get("response-code") != 200:
-                raise TokenExtractionError(
-                    f"Activation rejected by device: {response.get('response-string', response)}"
-                )
-            token = response.get("user-token")
-            if token:
-                return str(token)
-        raise TokenExtractionError("Device returned no token for the activation code")
+        await asyncio.wait_for(client.connect(), timeout=_ACTIVATION_TIMEOUT)
+        channel = await client.open_channel("UAUT", ChannelType.UAUT)
+        response = await asyncio.wait_for(
+            client.send_json(
+                channel,
+                {
+                    "message": "user-activation",
+                    "activation-code": code,
+                    "description": description,
+                    "message-type": "request",
+                    "message-id": 2,
+                },
+            ),
+            timeout=_ACTIVATION_TIMEOUT,
+        )
+    except TokenExtractionError:
+        raise
+    except Exception as err:
+        raise TokenExtractionError(f"Activation request failed: {type(err).__name__}: {err}") from err
     finally:
-        writer.close()
-        wait_closed = getattr(writer, "wait_closed", None)
-        if wait_closed is not None:
-            with contextlib.suppress(Exception):
-                await wait_closed()
+        with contextlib.suppress(Exception):
+            await client.disconnect()
 
-
-def _find_activation_response(data: bytes) -> dict[str, Any] | None:
-    """Pull a user-activation JSON response out of a raw read."""
-    start = data.find(b"{")
-    while start != -1:
-        end = data.rfind(b"}")
-        if end <= start:
-            return None
-        try:
-            payload = json.loads(data[start : end + 1])
-        except ValueError:
-            start = data.find(b"{", start + 1)
-            continue
-        if isinstance(payload, dict) and payload.get("message") == "user-activation":
-            return payload
-        return None
-    return None
+    if response.get("response-code") != 200:
+        raise TokenExtractionError(f"Activation rejected by device: {response.get('response-string', response)}")
+    token = response.get("user-token")
+    if not token:
+        raise TokenExtractionError("Device accepted the activation code but returned no token")
+    return str(token)

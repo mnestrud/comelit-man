@@ -79,7 +79,7 @@ Read directly from the device on 2026-08-28 (**device-verified**):
   fix and succeed after it
 - §3.2 the complete `users.cfg` slot layout, field numbering, slot count, and
   the fact that the type fields do not reliably indicate a free slot
-- §13.3's read half (slot discovery); its four write steps remain unverified
+- §13.3 in full — the complete identity-minting sequence was executed end to end, a token minted and authenticated, and the test users removed
 - §12's address-regex note — the widened pattern was diffed against the old
   one across every CTPP message in both captures before being adopted
 
@@ -772,7 +772,7 @@ payloads elsewhere in the stream.
 ## 13. Other channels and unexplored surface
 
 > §13.1–13.2 are **code-derived or secondhand** — not observed on the wire
-> here. §13.3 is partly device-verified; see the note there.
+> here. §13.3 is fully device-verified.
 
 ### 13.1 Unexplored channels
 
@@ -807,39 +807,48 @@ has no pending pairing file and its slot would look free and be overwritten.
 |---|---|---|
 | Read the user table | §3.1 backup → §3.2 parse | **Device-verified** |
 | Choose a free slot | no name and no token; never slot 0 | **Device-verified** |
-| Create the user | `POST /update.html?mspUsersMap_.<map>.<slot>_<field>=<value>` — field 5 = 2 (Apps), field 6 = name, field 4 = 1 (enabled) | **Format device-verified**, not executed |
-| Generate a code | `POST /create-actcode.html?user=<map>.<slot>` | **Format device-verified**, not executed |
-| Read the code | Re-read the backup; the code is in **field 18** of the slot | **Format device-verified**, not executed |
-| Redeem it | `UAUT` channel, newline-terminated JSON `{"message":"user-activation","activation-code":…,"description":…,"message-type":"request","message-id":1}` → `response-code` 200 carries `user-token` | Secondhand |
+| Create the user | `POST /update.html?mspUsersMap_.<map>.<slot>_<field>=<value>` — field 5 = 2 (Apps), field 6 = name, field 4 = 1 (enabled) | **Device-verified** |
+| Generate a code | `POST /create-actcode.html?user=<map>.<slot>` | **Device-verified** |
+| Read the code | `GET /users.html`, take the `<strong>` inside the slot's row | **Device-verified** |
+| Redeem it | `UAUT` channel: `{"message":"user-activation","activation-code":…,"description":…,"message-type":"request","message-id":2}` → `response-code` 200 carries `user-token` | **Device-verified** |
 
-Note the slot separator: the address in the URL is `<map>.<slot>` (a **dot**,
-e.g. `0.2`), not the underscore that the field suffix uses. Both forms appear
-in one URL: `mspUsersMap_.0.2_5`.
+The whole sequence was run end to end on 2026-08-28: it created a user, minted
+a token, and that token authenticated and read the device configuration. Test
+users were removed afterwards.
 
-Field semantics, read off the controls on the device's users page:
+Details that cost time to find:
 
-| Field | Control | Values |
-|---|---|---|
-| 4 | Enable checkbox | 1 enabled, 2 disabled |
-| 5 | Device type | 0 none, 1 Internal Unit, 2 Apps, 3 Phone |
-| 6 / 11 / 12 | Description / contact email / contact phone | free text |
-| 18 | Activation code | 10 characters, present once generated |
-
-There is **no `user-file.mug` endpoint on this firmware** — every form of that
-request answers "Invalid request", and does so with **HTTP 200 and an HTML
-body**, so a status-code check alone will not catch it. Read the generated code
-from field 18 instead. (Another implementation reads a `.mug` pairing file;
-that presumably applies to different firmware.)
+- **Slot separator.** URLs address a slot as `<map>.<slot>` (a **dot**, e.g.
+  `0.2`), while the field suffix uses an underscore. Both appear in one
+  parameter: `mspUsersMap_.0.2_5`.
+- **Encode spaces as `%20`.** A form encoder that emits `+` for spaces will
+  have the device store the literal plus sign — a name came back as
+  `HA+Provision+Test`.
+- **Where the pending code lives.** It is rendered on `users.html` inside the
+  slot's row, **not** stored in the user table. Field 18 holds a longer
+  (10-character) value on already-activated users and stays empty for a
+  pending code, so reading it finds nothing. Anchor the scrape on the row's
+  own `mspUsersMap_.<slot>_4=` checkbox: once a code is pending the row no
+  longer emits a "Generate activation code" button, so anchoring on that
+  button silently fails.
+- **There is no `user-file.mug` endpoint** on this firmware. Every form of the
+  request answers "Invalid request" — with **HTTP 200 and an HTML body**, so a
+  status check will not notice. (Another implementation reads such a file;
+  that presumably applies to different firmware.)
+- **The redemption message is `user-activation`** with an `activation-code`
+  field, not the `user-cloud-activation` / `cloud-activation-code` pair some
+  notes describe. Codes are 6 characters.
+- **The backup archive lags a write.** After `POST /update.html`, a
+  create-backup/download cycle can still return the pre-write table, so verify
+  writes against `users.html` rather than a fresh backup.
+- **A new identity gets its own subaddress.** The provisioned user came back
+  with `apt-subaddress` 2 where the phone holds 1, so the VIP address changes
+  from `SB0000031` to `SB0000032`.
 
 To undo a provisioned user the page offers `reset-user.html?user=<map>.<slot>`
 ("Reset activation") and the field-4 checkbox to disable it.
 
-> The read steps were exercised against the reference device. The write steps
-> have their **URL and field formats confirmed from the device's own users page
-> markup**, but have not been executed — a mistake here modifies the user
-> table. The redemption message is the least certain part: one source documents
-> `user-cloud-activation` with a `cloud-activation-code` field, while the
-> implementation this was taken from sends `user-activation`.
+> Every step above has now been executed against the reference device.
 
 ---
 
