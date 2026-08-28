@@ -10,7 +10,7 @@ from homeassistant.components.binary_sensor import (
 )
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_call_later
 
 from .coordinator import ComelitLocalConfigEntry, ComelitLocalCoordinator
@@ -29,7 +29,7 @@ RING_ACTIVE_SECONDS = 30
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ComelitLocalConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up binary sensors."""
     coordinator = entry.runtime_data

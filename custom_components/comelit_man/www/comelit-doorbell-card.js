@@ -95,6 +95,18 @@ class ComelitDoorbellCard extends HTMLElement {
     return 4;
   }
 
+  getGridOptions() {
+    // Sections view sizing.  The card is a 5:3 video surface with controls
+    // over it, so it needs the full column width and a minimum height that
+    // keeps the Answer / Open Door buttons reachable.
+    return {
+      rows: 8,
+      min_rows: 6,
+      columns: "full",
+      min_columns: 6,
+    };
+  }
+
   static getStubConfig() {
     return {
       doorbell_entity: "event.comelit_intercom_doorbell",
@@ -173,11 +185,13 @@ class ComelitDoorbellCard extends HTMLElement {
   }
 
   _openDoor() {
-    if (this._hass && this._config?.door_entity) {
-      this._hass.callService("button", "press", {
-        entity_id: this._config.door_entity,
-      });
-    }
+    const entityId = this._config?.door_entity;
+    if (!this._hass || !entityId) return;
+    // door_entity may be either the door button or the lock entity for the
+    // same relay — dispatch on its domain.
+    const domain = entityId.split(".")[0];
+    const [service, target] = domain === "lock" ? ["lock", "open"] : ["button", "press"];
+    this._hass.callService(service, target, { entity_id: entityId });
   }
 
   _callStop() {
@@ -713,4 +727,32 @@ window.customCards.push({
   name: "Comelit Doorbell",
   description:
     "Doorbell answer station — built-in WebRTC (native HA signaling + cloud TURN), two-way audio on HTTPS origins.",
+  // Offer the card in the picker when the user is adding a doorbell event
+  // entity, prefilled with the matching intercom entities from the same
+  // device so it works without hand-editing YAML.
+  getEntitySuggestion: (hass, entityId) => {
+    const state = hass.states[entityId];
+    if (!entityId.startsWith("event.") || state?.attributes?.device_class !== "doorbell") {
+      return undefined;
+    }
+    const deviceId = hass.entities?.[entityId]?.device_id;
+    const sameDevice = (prefix, match) =>
+      Object.keys(hass.states).find(
+        (id) =>
+          id.startsWith(prefix) &&
+          (!deviceId || hass.entities?.[id]?.device_id === deviceId) &&
+          (!match || id.includes(match))
+      );
+
+    const config = { type: "custom:comelit-doorbell-card", doorbell_entity: entityId };
+    const camera = sameDevice("camera.", "live_feed") || sameDevice("camera.");
+    const answer = sameDevice("button.", "answer");
+    const stop = sameDevice("button.", "stop_video");
+    const door = sameDevice("lock.") || sameDevice("button.", "lock");
+    if (camera) config.camera_entity = camera;
+    if (answer) config.answer_entity = answer;
+    if (stop) config.stop_entity = stop;
+    if (door) config.door_entity = door;
+    return { config };
+  },
 });

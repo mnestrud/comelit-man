@@ -11,7 +11,7 @@ from homeassistant import config_entries
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_TOKEN
 
 if TYPE_CHECKING:
-    from homeassistant.components.dhcp import DhcpServiceInfo  # type: ignore[attr-defined]
+    from homeassistant.helpers.service_info.dhcp import DhcpServiceInfo
 
 from .auth import authenticate
 from .client import IconaBridgeClient
@@ -318,8 +318,13 @@ class ComelitLocalConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
 
-class ComelitLocalOptionsFlow(config_entries.OptionsFlow):
-    """Handle options for Comelit Local (e.g. enable/disable notifications)."""
+class ComelitLocalOptionsFlow(config_entries.OptionsFlowWithReload):
+    """Handle options for Comelit Local (e.g. enable/disable notifications).
+
+    OptionsFlowWithReload reloads the entry itself when options change; an
+    explicit update listener is the deprecated way to do that and HA refuses
+    to allow both.
+    """
 
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
         self._config_entry = config_entry
