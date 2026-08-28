@@ -289,35 +289,24 @@ Then restart HA. Debug logs include TCP connection events, channel opens, keepal
 
 ## Changelog
 
-### 0.1.4
+Full history: [CHANGELOG.md](CHANGELOG.md). Recent highlights:
 
-> **⚠ Breaking change — entity IDs have changed**
->
-> Entity IDs are now derived from the integration's **title** instead of the hardcoded string `"Comelit Intercom"`.
-> If you added the integration before this version, your entity IDs may have changed (e.g. from
-> `button.comelit_intercom_actuator` to `button.comelit_192_168_1_111_actuator` if no custom name was set).
->
-> **Fix:** remove and re-add the integration, giving it a friendly name (e.g. `Front Door`) in the new Name field.
-> Entities will then be stable going forward (e.g. `button.front_door_actuator`).
+### 1.5.0
+- **Dedicated device user** — opt-in during setup: the integration creates its own account on the intercom and mints its own token, so Home Assistant and the Comelit app no longer kick each other off a shared identity
+- **Lock entities, ring sensors, per-caller doorbell entities** — doors are also locks (HomeKit/voice), last-ring + ring-count sensors restore across restarts, and each call origin gets its own event entity
+- **Broader device support** — apartment-block numeric addresses, kit-mode dropped prefixes, floor-call origin tag
+- **Fixed token auto-extraction** — the backup scan matched `facerecognitionusers.cfg` instead of `users.cfg`, breaking setup with a blank token field
 
-- **Custom integration name** — new optional "Name" field in the config flow sets the integration title and entity prefix; leave blank to use the host IP
-- **Options flow** — enable or disable doorbell notifications after setup via Settings → Integrations → Configure without removing and re-adding the integration
-- **Reliable doorbell detection** — replaced the FCM-based PUSH mechanism with a persistent CTPP channel listener (VIP events); actual call events are now received as binary messages on the device's local TCP channel, not via cloud FCM
-- **Doorbell notification card** — new `comelit-doorbell-card` auto-registered on startup; shows ring alert with Answer/Dismiss buttons and transitions to live stream when answered
-- **Door open during active video** — pressing a door button while video is active sends a single message on the existing CTPP channel (PCAP-verified Android app behaviour); no second TCP connection
-- **Faster door open** — when notifications are enabled, the CTPP channel is already open so door open skips the init handshake entirely (~30 ms vs ~2 s)
-- **Single shared TCP connection** — video signaling, VIP event listening, and door control share the coordinator's TCP connection; eliminates conflicts when the device only accepts one client at a time
-- **Door auto-stop** — pressing a door button while video is active automatically stops the video session 10 s later
-- **Faster time-to-first-frame** — RTSP `PLAY` response is gated until video RTP is flowing, preventing HA's stream worker from erroring on an empty stream; RTCP Sender Reports eliminate "no reference clock" delays in go2rtc, VLC, and browsers
-- **Accurate camera state** — `is_streaming` property reflects the active session so the Lovelace card transitions correctly and go2rtc attaches via WebRTC on the first video session
-- **TCP keepalive probe** — push-info re-sent every 90 s keeps the connection alive during idle periods; prevents false reconnect cycles when the device is reachable but quiet
+### 1.4.0
+- **Two-way audio validated end-to-end** — talk-back from the doorbell card to the entrance speaker, with transport-matched mic TX, 20 ms re-chunking, and PCMU→PCMA conversion
+- **Doorbell card is a full answer station** — built-in WebRTC player over HA's native signaling; works locally and remotely (Nabu Casa TURN); mic on HTTPS origins
+- **Rings during an active call fire events; real missed-call detection; video ends when nobody is watching**
 
-### 0.1.3
-- **Video renewal** — inline re-establishment on CALL_END (~30s) without TCP reconnect; video is uninterrupted
-- **Custom Lovelace card** — play-button UI auto-registered on HA startup; no manual resource configuration needed
-- **Concurrent session protection** — a second video start while one is in progress is immediately rejected, preventing CTPP negotiation conflicts
-- **TCP video fallback** — video works via TCP (RTPC2) when UDP is blocked by NAT/firewall
-- **Consistent entity naming** — all entities use the `comelit_intercom_` prefix (e.g., `button.comelit_intercom_actuator`, `camera.comelit_intercom_live_feed`)
+### 1.2.0 and earlier
+- 1.2.0 — inbound video auto-starts on ring; audio sender wired to the answer flow
+- 1.1.x — inbound call answer, `ring` standard event type, go2rtc backchannel groundwork
+- 1.0.x — first stable release; quality-scale hardening, strict typing, coverage
+- 0.1.4 — **breaking:** entity IDs derive from the integration title (see [CHANGELOG.md](CHANGELOG.md#014) if upgrading from pre-1.0)
 
 ## Acknowledgments
 

@@ -1246,44 +1246,49 @@ class TestNotifyVideoStateChange:
 
 
 class TestGo2RtcRegistration:
+    """go2rtc calls use HA's shared aiohttp session (Platinum: inject-websession)."""
+
+    @staticmethod
+    def _session(status: int = 200):
+        resp = MagicMock()
+        resp.status = status
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.put = MagicMock(return_value=resp)
+        session.delete = MagicMock(return_value=resp)
+        return session
+
     @pytest.mark.asyncio
     async def test_register_puts_bare_rtsp_url(self):
-        """_register_go2rtc_stream PUTs the bare RTSP URL (backchannel is
-        negotiated via the Require header, not a source flag)."""
+        """Backchannel is negotiated via the Require header, not a source flag."""
         coord = _make_coordinator()
         coord._rtsp_url = "rtsp://127.0.0.1:8557/intercom"
+        session = self._session()
 
-        mock_response = MagicMock()
-        mock_response.status = 200
-        mock_session = AsyncMock()
-        mock_session.put = AsyncMock(return_value=mock_response)
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("custom_components.comelit_man.coordinator.aiohttp.ClientSession", return_value=mock_session):
+        with patch(
+            "custom_components.comelit_man.coordinator.async_get_clientsession",
+            return_value=session,
+        ):
             await coord._register_go2rtc_stream()
 
-        mock_session.put.assert_called_once()
-        call_kwargs = mock_session.put.call_args
-        params = call_kwargs[1]["params"]
+        session.put.assert_called_once()
+        params = session.put.call_args.kwargs["params"]
         assert params["src"] == "rtsp://127.0.0.1:8557/intercom"
         assert "comelit_man_" in params["name"]
 
     @pytest.mark.asyncio
     async def test_register_warns_on_http_error(self):
-        """A 401/4xx from go2rtc logs a warning instead of false success."""
+        """A 401/4xx logs a warning instead of reporting false success."""
         coord = _make_coordinator()
         coord._rtsp_url = "rtsp://127.0.0.1:8557/intercom"
-
-        mock_response = MagicMock()
-        mock_response.status = 401
-        mock_session = AsyncMock()
-        mock_session.put = AsyncMock(return_value=mock_response)
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
+        session = self._session(status=401)
 
         with (
-            patch("custom_components.comelit_man.coordinator.aiohttp.ClientSession", return_value=mock_session),
+            patch(
+                "custom_components.comelit_man.coordinator.async_get_clientsession",
+                return_value=session,
+            ),
             patch("custom_components.comelit_man.coordinator._LOGGER") as mock_logger,
         ):
             await coord._register_go2rtc_stream()
@@ -1292,47 +1297,37 @@ class TestGo2RtcRegistration:
 
     @pytest.mark.asyncio
     async def test_register_graceful_when_go2rtc_unavailable(self):
-        """_register_go2rtc_stream does not raise when go2rtc is not running."""
         coord = _make_coordinator()
         coord._rtsp_url = "rtsp://127.0.0.1:8557/intercom"
+        session = MagicMock()
+        session.put = MagicMock(side_effect=OSError("connection refused"))
 
-        mock_session = AsyncMock()
-        mock_session.put = AsyncMock(side_effect=OSError("connection refused"))
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("custom_components.comelit_man.coordinator.aiohttp.ClientSession", return_value=mock_session):
+        with patch(
+            "custom_components.comelit_man.coordinator.async_get_clientsession",
+            return_value=session,
+        ):
             await coord._register_go2rtc_stream()  # must not raise
 
     @pytest.mark.asyncio
     async def test_deregister_deletes_stream(self):
-        """_deregister_go2rtc_stream sends DELETE to go2rtc API."""
         coord = _make_coordinator()
+        session = self._session()
 
-        mock_session = AsyncMock()
-        mock_session.delete = AsyncMock()
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("custom_components.comelit_man.coordinator.aiohttp.ClientSession", return_value=mock_session):
+        with patch(
+            "custom_components.comelit_man.coordinator.async_get_clientsession",
+            return_value=session,
+        ):
             await coord._deregister_go2rtc_stream()
 
-        mock_session.delete.assert_called_once()
+        session.delete.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_register_skips_when_no_rtsp_url(self):
-        """_register_go2rtc_stream returns immediately if rtsp_url is not set."""
         coord = _make_coordinator()
         coord._rtsp_url = None
-
-        with patch("custom_components.comelit_man.coordinator.aiohttp.ClientSession") as mock_cls:
+        with patch("custom_components.comelit_man.coordinator.async_get_clientsession") as get_session:
             await coord._register_go2rtc_stream()
-        mock_cls.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# _on_inbound_ring dedup (Phase 1: ring retransmit suppression)
-# ---------------------------------------------------------------------------
+        get_session.assert_not_called()
 
 
 class TestInboundRingDedup:
@@ -1646,3 +1641,208 @@ class TestAutoRestartViewerGate:
         with patch("custom_components.comelit_man.coordinator.VideoCallSession") as vcs:
             await coord._auto_restart_video()
         vcs.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# async_start_inbound_video — the passive inbound path
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncStartInboundVideo:
+    def _coord(self, *, with_rtsp: bool = True):
+        coord = _make_coordinator(with_client=True)
+        events: list = []
+        coord._push_callbacks[events.append] = None
+        coord._notify_video_state_change = AsyncMock()
+        coord._ensure_vip_listener = AsyncMock()
+        if with_rtsp:
+            rtsp = MagicMock()
+            rtsp.client_count = 0
+            rtsp.mark_ready = MagicMock()
+            rtsp.mark_not_ready = MagicMock()
+            rtsp.disconnect_clients = MagicMock()
+            rtsp.backchannel_queue = MagicMock()
+            coord._rtsp_server = rtsp
+        return coord, events
+
+    @staticmethod
+    def _session(*, start_error=None, frame=b"\xff\xd8jpg"):
+        session = MagicMock()
+        session.start_inbound = AsyncMock(side_effect=start_error)
+        session.stop = AsyncMock()
+        receiver = MagicMock()
+        receiver.latest_frame = frame
+        receiver.attach_backchannel_queue = MagicMock()
+        session.rtp_receiver = receiver
+        return session
+
+    @pytest.mark.asyncio
+    async def test_happy_path_publishes_session_and_fires_ring(self):
+        coord, events = self._coord()
+        session = self._session()
+
+        with patch("custom_components.comelit_man.coordinator.VideoCallSession", return_value=session):
+            await coord.async_start_inbound_video("SB100001", 0x1234)
+
+        session.start_inbound.assert_awaited_once()
+        assert coord._video_session is session
+        assert coord._video_ready_event.is_set()
+        coord._rtsp_server.mark_ready.assert_called_once()
+        # ring fires only after video is flowing
+        assert [e.event_type for e in events] == ["ring"]
+        assert coord._pending_inbound_ring == "SB100001"
+
+    @pytest.mark.asyncio
+    async def test_snapshot_captured_before_ring(self):
+        coord, events = self._coord()
+        session = self._session(frame=b"\xff\xd8warm")
+
+        with patch("custom_components.comelit_man.coordinator.VideoCallSession", return_value=session):
+            await coord.async_start_inbound_video("SB100001", 0x1234)
+
+        assert coord.last_ring_snapshot == b"\xff\xd8warm"
+
+    @pytest.mark.asyncio
+    async def test_snapshot_awaited_when_no_warm_frame(self):
+        coord, _events = self._coord()
+        session = self._session(frame=None)
+        session.rtp_receiver.get_jpeg_frame = AsyncMock(return_value=b"\xff\xd8fresh")
+
+        with patch("custom_components.comelit_man.coordinator.VideoCallSession", return_value=session):
+            await coord.async_start_inbound_video("SB100001", 0x1234)
+
+        assert coord.last_ring_snapshot == b"\xff\xd8fresh"
+
+    @pytest.mark.asyncio
+    async def test_snapshot_failure_is_tolerated(self):
+        coord, events = self._coord()
+        session = self._session(frame=None)
+        session.rtp_receiver.get_jpeg_frame = AsyncMock(side_effect=TimeoutError)
+
+        with patch("custom_components.comelit_man.coordinator.VideoCallSession", return_value=session):
+            await coord.async_start_inbound_video("SB100001", 0x1234)
+
+        assert coord.last_ring_snapshot is None
+        assert [e.event_type for e in events] == ["ring"]
+
+    @pytest.mark.asyncio
+    async def test_backchannel_queue_attached(self):
+        coord, _events = self._coord()
+        session = self._session()
+
+        with patch("custom_components.comelit_man.coordinator.VideoCallSession", return_value=session):
+            await coord.async_start_inbound_video("SB100001", 0x1234)
+
+        session.rtp_receiver.attach_backchannel_queue.assert_called_once_with(coord._rtsp_server.backchannel_queue)
+
+    @pytest.mark.asyncio
+    async def test_start_failure_fires_missed_call_and_restores_listener(self):
+        coord, events = self._coord()
+        session = self._session(start_error=RuntimeError("device busy"))
+
+        with patch("custom_components.comelit_man.coordinator.VideoCallSession", return_value=session):
+            await coord.async_start_inbound_video("SB100001", 0x1234)
+
+        assert [e.event_type for e in events] == ["missed_call"]
+        assert coord._video_session is None
+        assert coord._last_ring_mono is None  # cleared so idle frame can't double-fire
+        coord._ensure_vip_listener.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_listener_paused_for_the_session(self):
+        coord, _events = self._coord()
+        listener = MagicMock()
+        listener.stop_task = AsyncMock()
+        coord._vip_listener = listener
+        session = self._session()
+
+        with patch("custom_components.comelit_man.coordinator.VideoCallSession", return_value=session):
+            await coord.async_start_inbound_video("SB100001", 0x1234)
+
+        listener.stop_task.assert_awaited_once()
+        assert coord._vip_listener is None
+
+    @pytest.mark.asyncio
+    async def test_listener_stop_failure_does_not_abort(self):
+        coord, _events = self._coord()
+        listener = MagicMock()
+        listener.stop_task = AsyncMock(side_effect=RuntimeError("already gone"))
+        coord._vip_listener = listener
+        session = self._session()
+
+        with patch("custom_components.comelit_man.coordinator.VideoCallSession", return_value=session):
+            await coord.async_start_inbound_video("SB100001", 0x1234)
+
+        assert coord._video_session is session
+
+    @pytest.mark.asyncio
+    async def test_no_config_returns_early(self):
+        coord, events = self._coord()
+        coord._config = None
+        with patch("custom_components.comelit_man.coordinator.VideoCallSession") as vcs:
+            await coord.async_start_inbound_video("SB100001", 0x1234)
+        vcs.assert_not_called()
+        assert events == []
+
+    @pytest.mark.asyncio
+    async def test_concurrent_start_is_dropped(self):
+        coord, events = self._coord()
+        await coord._video_start_lock.acquire()
+        try:
+            with patch("custom_components.comelit_man.coordinator.VideoCallSession") as vcs:
+                await coord.async_start_inbound_video("SB100001", 0x1234)
+            vcs.assert_not_called()
+        finally:
+            coord._video_start_lock.release()
+
+    @pytest.mark.asyncio
+    async def test_no_client_returns_early(self):
+        coord, _events = self._coord()
+        coord._client = None
+        with patch("custom_components.comelit_man.coordinator.VideoCallSession") as vcs:
+            await coord.async_start_inbound_video("SB100001", 0x1234)
+        vcs.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_works_without_rtsp_server(self):
+        coord, events = self._coord(with_rtsp=False)
+        session = self._session()
+
+        with patch("custom_components.comelit_man.coordinator.VideoCallSession", return_value=session):
+            await coord.async_start_inbound_video("SB100001", 0x1234)
+
+        assert coord._video_session is session
+        assert [e.event_type for e in events] == ["ring"]
+
+
+class TestCoordinatorRemainingPaths:
+    @pytest.mark.asyncio
+    async def test_outbound_start_failure_restores_listener_and_reraises(self):
+        """A failed outbound start must not leave the VIP listener stopped."""
+        coord = _make_coordinator(with_client=True)
+        coord._ensure_vip_listener = AsyncMock()
+        coord._notify_video_state_change = AsyncMock()
+        session = MagicMock()
+        session.start = AsyncMock(side_effect=RuntimeError("UDPM timeout"))
+        session.stop = AsyncMock()
+
+        with (
+            patch("custom_components.comelit_man.coordinator.VideoCallSession", return_value=session),
+            pytest.raises(RuntimeError, match="UDPM timeout"),
+        ):
+            await coord.async_start_video(auto_timeout=True)
+
+        coord._ensure_vip_listener.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_update_fails_when_reconnect_leaves_no_config(self):
+        """Defensive branch: reconnect returned without populating config."""
+        from homeassistant.helpers.update_coordinator import UpdateFailed
+
+        coord = _make_coordinator(with_client=True)
+        coord._client.connected = False
+        coord._config = None
+        coord._reconnect = AsyncMock()
+
+        with pytest.raises(UpdateFailed, match="without a device configuration"):
+            await coord._async_update_data()

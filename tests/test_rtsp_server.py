@@ -2280,6 +2280,45 @@ class TestReadClientStream:
         await server._read_client_stream(reader, client)
         assert server.backchannel_queue.get_nowait() == b"\xaa" * 160
 
+    @pytest.mark.asyncio
+    async def test_quiet_client_keeps_the_reader_alive(self):
+        """A 30s read timeout is a normal idle client, not a disconnect."""
+        server = LocalRtspServer()
+        server._running = True
+        client = _TcpClient(writer=MagicMock(), backchannel_ch=4)
+        calls = 0
+
+        class _TimeoutOnceReader:
+            async def read(self, n: int) -> bytes:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise TimeoutError
+                return b""
+
+        await server._read_client_stream(_TimeoutOnceReader(), client)
+        assert calls == 2
+
+    @pytest.mark.asyncio
+    async def test_partial_interleaved_header_waits_for_more_bytes(self):
+        """Fewer than 4 bytes of a '$' frame must not be parsed as a length."""
+        server = LocalRtspServer()
+        server._running = True
+        client = _TcpClient(writer=MagicMock(), backchannel_ch=4)
+        frame = _interleave(4, _rtp())
+        reader = self._ChunkReader([frame[:2], frame[2:]])
+        await server._read_client_stream(reader, client)
+        assert server.backchannel_queue.get_nowait() == b"\xaa" * 160
+
+    @pytest.mark.asyncio
+    async def test_partial_rtsp_line_waits_for_the_newline(self):
+        server = LocalRtspServer()
+        server._running = True
+        client = _TcpClient(writer=MagicMock(), backchannel_ch=4)
+        reader = self._ChunkReader([b"TEAR", b"DOWN rtsp://x RTSP/1.0\r\n"])
+        await server._read_client_stream(reader, client)
+        assert server.backchannel_queue.empty()
+
 
 class TestOnBackchannelRtp:
     def test_pcma_payload_queued(self):
@@ -2327,6 +2366,16 @@ class TestOnBackchannelRtp:
         assert server.backchannel_queue.get_nowait() == b"\x03" * 160
 
 
+class TestTruncatedRtpExtension:
+    def test_extension_header_shorter_than_four_bytes_is_dropped(self):
+        """A truncated RTP extension must not index past the end of the packet."""
+        server = LocalRtspServer()
+        # X=1, PT=8, 12-byte header and only 2 bytes of the 4-byte extension header
+        rtp = struct.pack("!BBHII", 0x90, 8, 1, 160, 0xDEADBEEF) + b"\xbe\xde"
+        server._on_backchannel_rtp(rtp)
+        assert server.backchannel_queue.empty()
+
+
 class TestBackchannelPcmuConversion:
     def test_pcmu_payload_converted_to_alaw(self):
         from custom_components.comelit_man.rtsp_server import _ULAW_TO_ALAW
@@ -2340,3 +2389,27 @@ class TestBackchannelPcmuConversion:
         server = LocalRtspServer()
         server._on_backchannel_rtp(_rtp(pt=8, payload=b"\xd5" * 160))
         assert server.backchannel_queue.get_nowait() == b"\xd5" * 160
+
+
+class TestLinear2Alaw:
+    """Direct checks on the µ-law→A-law helper table's math."""
+
+    def test_full_scale_input_saturates(self):
+        """Magnitudes above the top segment clamp to the A-law maximum."""
+        from custom_components.comelit_man.rtsp_server import _linear2alaw
+
+        assert _linear2alaw(0x7FFFF) == 0x7F ^ 0xD5
+        assert _linear2alaw(-0x7FFFF) == 0x7F ^ 0x55
+
+    def test_silence_codes_map_to_each_other(self):
+        from custom_components.comelit_man.rtsp_server import _ULAW_TO_ALAW
+
+        assert _ULAW_TO_ALAW[0xFF] == 0xD5
+
+
+class TestClientCount:
+    def test_counts_active_media_clients(self):
+        server = LocalRtspServer()
+        assert server.client_count == 0
+        server._active_clients.append(_TcpClient(writer=MagicMock()))
+        assert server.client_count == 1

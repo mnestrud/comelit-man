@@ -300,3 +300,166 @@ class TestUserSlot:
 
     def test_not_free_with_token_only(self):
         assert UserSlot(0, 4, "", "a" * 32, "").is_free is False
+
+
+# ---------------------------------------------------------------------------
+# Error paths and the hass-session branch
+# ---------------------------------------------------------------------------
+
+
+class TestProvisionErrorPaths:
+    @pytest.mark.asyncio
+    async def test_uses_hass_shared_session_when_available(self):
+        """With hass, the shared client session is used, not a new one."""
+        shared = MagicMock()
+        with (
+            patch(
+                "custom_components.comelit_man.provisioning.async_get_clientsession",
+                return_value=shared,
+            ) as get_session,
+            patch(
+                "custom_components.comelit_man.provisioning._provision",
+                new_callable=AsyncMock,
+                return_value="f" * 32,
+            ) as prov,
+            patch("aiohttp.ClientSession") as new_session,
+        ):
+            token = await provision_user("1.2.3.4", "pw", hass=MagicMock())
+        assert token == "f" * 32
+        get_session.assert_called_once()
+        new_session.assert_not_called()
+        assert prov.await_args[0][0] is shared
+
+    @pytest.mark.asyncio
+    async def test_default_password_applied(self):
+        """Omitting the password falls back to the device default."""
+        with (
+            patch(
+                "custom_components.comelit_man.provisioning._provision",
+                new_callable=AsyncMock,
+                return_value="f" * 32,
+            ) as prov,
+            patch("aiohttp.ClientSession", return_value=_ctx(MagicMock())),
+        ):
+            await provision_user("1.2.3.4")
+        assert prov.await_args[0][4] == "comelit"
+
+    @pytest.mark.asyncio
+    async def test_field_update_failure_raises(self):
+        from custom_components.comelit_man.provisioning import UserSlot, _update_field
+
+        resp = MagicMock()
+        resp.status = 500
+        resp.text = AsyncMock(return_value="")
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.post = MagicMock(return_value=resp)
+
+        with pytest.raises(TokenExtractionError, match="Setting user field 6 failed"):
+            await _update_field(session, "http://d", UserSlot(0, 2, "", "", ""), 6, "x")
+
+    @pytest.mark.asyncio
+    async def test_users_page_read_failure_raises(self):
+        from custom_components.comelit_man.provisioning import UserSlot, _generate_activation_code
+
+        ok = MagicMock()
+        ok.status = 200
+        ok.text = AsyncMock(return_value="")
+        ok.__aenter__ = AsyncMock(return_value=ok)
+        ok.__aexit__ = AsyncMock(return_value=False)
+        bad = MagicMock()
+        bad.status = 503
+        bad.text = AsyncMock(return_value="")
+        bad.__aenter__ = AsyncMock(return_value=bad)
+        bad.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.post = MagicMock(return_value=ok)
+        session.get = MagicMock(return_value=bad)
+
+        with pytest.raises(TokenExtractionError, match="Reading the users page failed"):
+            await _generate_activation_code(session, "http://d", UserSlot(0, 2, "", "", ""))
+
+
+class TestRedeemActivationCode:
+    """The UAUT redemption leg, with the ICONA client mocked."""
+
+    def _client(self, response=None, *, connect_error=None):
+        client = MagicMock()
+        client.connect = AsyncMock(side_effect=connect_error)
+        client.disconnect = AsyncMock()
+        client.open_channel = AsyncMock(return_value=MagicMock())
+        client.send_json = AsyncMock(return_value=response or {})
+        return client
+
+    @pytest.mark.asyncio
+    async def test_returns_token_on_success(self):
+        from custom_components.comelit_man.provisioning import _redeem_activation_code
+
+        client = self._client({"response-code": 200, "user-token": "a" * 32})
+        with patch("custom_components.comelit_man.client.IconaBridgeClient", return_value=client):
+            token = await _redeem_activation_code("1.2.3.4", 64100, "abc123", "HA")
+        assert token == "a" * 32
+        client.disconnect.assert_awaited_once()
+        sent = client.send_json.await_args[0][1]
+        assert sent["message"] == "user-activation"
+        assert sent["activation-code"] == "abc123"
+
+    @pytest.mark.asyncio
+    async def test_rejection_raises_with_device_reason(self):
+        from custom_components.comelit_man.provisioning import _redeem_activation_code
+
+        client = self._client({"response-code": 403, "response-string": "Invalid code"})
+        with (
+            patch("custom_components.comelit_man.client.IconaBridgeClient", return_value=client),
+            pytest.raises(TokenExtractionError, match="Invalid code"),
+        ):
+            await _redeem_activation_code("1.2.3.4", 64100, "bad", "HA")
+
+    @pytest.mark.asyncio
+    async def test_accepted_without_token_raises(self):
+        from custom_components.comelit_man.provisioning import _redeem_activation_code
+
+        client = self._client({"response-code": 200})
+        with (
+            patch("custom_components.comelit_man.client.IconaBridgeClient", return_value=client),
+            pytest.raises(TokenExtractionError, match="returned no token"),
+        ):
+            await _redeem_activation_code("1.2.3.4", 64100, "abc", "HA")
+
+    @pytest.mark.asyncio
+    async def test_connection_failure_wrapped(self):
+        from custom_components.comelit_man.provisioning import _redeem_activation_code
+
+        client = self._client(connect_error=OSError("refused"))
+        with (
+            patch("custom_components.comelit_man.client.IconaBridgeClient", return_value=client),
+            pytest.raises(TokenExtractionError, match="Activation request failed"),
+        ):
+            await _redeem_activation_code("1.2.3.4", 64100, "abc", "HA")
+
+    @pytest.mark.asyncio
+    async def test_disconnect_failure_is_suppressed(self):
+        from custom_components.comelit_man.provisioning import _redeem_activation_code
+
+        client = self._client({"response-code": 200, "user-token": "b" * 32})
+        client.disconnect = AsyncMock(side_effect=OSError("already closed"))
+        with patch("custom_components.comelit_man.client.IconaBridgeClient", return_value=client):
+            assert await _redeem_activation_code("1.2.3.4", 64100, "abc", "HA") == "b" * 32
+
+
+class TestRedeemPassesThroughOwnErrors:
+    @pytest.mark.asyncio
+    async def test_token_extraction_error_not_rewrapped(self):
+        """A TokenExtractionError from the client keeps its own message."""
+        from custom_components.comelit_man.provisioning import _redeem_activation_code
+
+        client = MagicMock()
+        client.connect = AsyncMock()
+        client.disconnect = AsyncMock()
+        client.open_channel = AsyncMock(side_effect=TokenExtractionError("channel refused"))
+        with (
+            patch("custom_components.comelit_man.client.IconaBridgeClient", return_value=client),
+            pytest.raises(TokenExtractionError, match="channel refused"),
+        ):
+            await _redeem_activation_code("1.2.3.4", 64100, "abc", "HA")

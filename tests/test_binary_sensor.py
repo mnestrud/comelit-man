@@ -135,3 +135,14 @@ class TestRinging:
         await sensor.async_will_remove_from_hass()
         cancel.assert_called_once()
         assert sensor._cancel_clear is None
+
+    @pytest.mark.asyncio
+    async def test_added_to_hass_registers_push_callback(self):
+        coordinator = _coordinator()
+        remove = MagicMock()
+        coordinator.add_push_callback = MagicMock(return_value=remove)
+        sensor = _ringing(coordinator)
+        with patch.object(sensor, "async_on_remove") as on_remove:
+            await sensor.async_added_to_hass()
+        coordinator.add_push_callback.assert_called_once_with(sensor._on_push)
+        on_remove.assert_called_once_with(remove)

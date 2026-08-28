@@ -80,6 +80,31 @@ async def test_camera_image_returns_frame_when_active(camera):
     assert result == fake_frame
 
 
+@pytest.mark.asyncio
+async def test_camera_image_returns_placeholder_when_receiver_missing(camera):
+    """An active session whose receiver has already been torn down shows the placeholder."""
+    session = MagicMock()
+    session.active = True
+    session.rtp_receiver = None
+    camera.coordinator.video_session = session
+
+    assert await camera.async_camera_image() is PLACEHOLDER_JPEG
+
+
+@pytest.mark.asyncio
+async def test_camera_image_falls_back_to_latest_frame_on_timeout(camera):
+    """A slow decoder yields the last decoded frame rather than nothing."""
+    stale = b"\xff\xd8stale\xff\xd9"
+    session = MagicMock()
+    session.active = True
+    session.rtp_receiver = MagicMock()
+    session.rtp_receiver.get_jpeg_frame = AsyncMock(side_effect=TimeoutError)
+    session.rtp_receiver.latest_frame = stale
+    camera.coordinator.video_session = session
+
+    assert await camera.async_camera_image() == stale
+
+
 # ---------------------------------------------------------------------------
 # stream_source
 # ---------------------------------------------------------------------------
@@ -429,6 +454,47 @@ class TestWebRtcSignaling:
         camera.close_webrtc_session("sess1")
         await asyncio.sleep(0)
         assert "sess1" not in camera._webrtc_sessions
+
+    @pytest.mark.asyncio
+    async def test_non_text_frame_ends_the_listener(self, camera):
+        """A BINARY/CLOSE frame from go2rtc stops the loop; later frames are ignored."""
+        import aiohttp as _aiohttp
+
+        _wire_hass(camera)
+        ws = _FakeWs(
+            [
+                _FakeWsMsg(None, msg_type=_aiohttp.WSMsgType.BINARY),
+                _FakeWsMsg({"type": "webrtc/answer", "value": "v=0\r\nanswer"}),
+            ]
+        )
+        sent = []
+        with patch(
+            "custom_components.comelit_man.camera.async_get_clientsession",
+            return_value=_session_with_ws(ws),
+        ):
+            await camera.async_handle_async_webrtc_offer("sdp", "sess_bin", sent.append)
+            await asyncio.sleep(0.05)
+        assert sent == []
+        camera.close_webrtc_session("sess_bin")
+        await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_listener_swallows_stream_errors(self, camera):
+        """A malformed frame must not surface as an unhandled background-task error."""
+        _wire_hass(camera)
+        bad = _FakeWsMsg({"type": "webrtc/answer", "value": "x"})
+        bad.json = MagicMock(side_effect=ValueError("not json"))
+        ws = _FakeWs([bad])
+        sent = []
+        with patch(
+            "custom_components.comelit_man.camera.async_get_clientsession",
+            return_value=_session_with_ws(ws),
+        ):
+            await camera.async_handle_async_webrtc_offer("sdp", "sess_bad", sent.append)
+            await asyncio.sleep(0.05)
+        assert sent == []
+        camera.close_webrtc_session("sess_bad")
+        await asyncio.sleep(0)
 
     @pytest.mark.asyncio
     async def test_go2rtc_error_message_forwarded(self, camera):
