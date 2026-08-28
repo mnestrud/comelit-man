@@ -1329,6 +1329,7 @@ class TestGo2RtcRegistration:
             await coord._register_go2rtc_stream()
         get_session.assert_not_called()
 
+
 class TestInboundRingDedup:
     def test_first_ring_schedules_task(self):
         coord = _make_coordinator()
