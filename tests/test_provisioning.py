@@ -43,6 +43,14 @@ def _users_cfg(occupied_slots: dict[int, str] | None = None, count: int = 16) ->
     return "\n".join(lines)
 
 
+def _cfg_pair(code: str = "zx9y8w7v6u") -> list[str]:
+    """users.cfg before and after code generation; free target is slot 0.2."""
+    taken = {1: _occupied("phone", "a" * 32, "a@b.c")}
+    before = _users_cfg(taken)
+    after = _users_cfg({**taken, 2: _EMPTY.replace('18:4:""', f'18:4:"{code}"')})
+    return [before, after]
+
+
 class TestParseUserSlots:
     def test_parses_all_slots(self):
         assert len(parse_user_slots(_users_cfg())) == 16
@@ -62,7 +70,7 @@ class TestParseUserSlots:
         assert parse_user_slots(cfg)[3].is_free is False
 
     def test_slot_path_format(self):
-        assert parse_user_slots(_users_cfg())[7].path == "0_7"
+        assert parse_user_slots(_users_cfg())[7].path == "0.7"
 
     def test_ignores_unrelated_lines(self):
         cfg = 'recUserList.0 = 2:4:"ryan" 3:2:1\n' + _users_cfg()
@@ -80,7 +88,7 @@ class TestParseUserSlots:
 class TestFindFreeSlot:
     def test_picks_first_free_slot_after_reserved(self):
         cfg = _users_cfg({1: _occupied("phone", "a" * 32, "a@b.c")})
-        assert find_free_slot(parse_user_slots(cfg)).path == "0_2"
+        assert find_free_slot(parse_user_slots(cfg)).path == "0.2"
 
     def test_never_returns_slot_zero(self):
         """Slot 0 is the wall monitor even when it looks empty."""
@@ -90,7 +98,7 @@ class TestFindFreeSlot:
 
     def test_skips_occupied_slots(self):
         cfg = _users_cfg({1: _occupied("a", "a" * 32, "a@b.c"), 2: _occupied("b", "b" * 32, "b@c.d")})
-        assert find_free_slot(parse_user_slots(cfg)).path == "0_3"
+        assert find_free_slot(parse_user_slots(cfg)).path == "0.3"
 
     def test_raises_when_table_full(self):
         occupied = {i: _occupied(f"u{i}", f"{i:032d}", "x@y.z") for i in range(16)}
@@ -122,7 +130,7 @@ class TestActivationResponseParsing:
 class TestProvisionUser:
     """End-to-end flow with the device mocked."""
 
-    def _session(self, *, mug_body: str | None = None, actcode_status: int = 200):
+    def _session(self, *, actcode_status: int = 200, actcode_body: str = "ok"):
         session = MagicMock()
         responses: dict[str, MagicMock] = {}
 
@@ -137,13 +145,10 @@ class TestProvisionUser:
 
         def post(url, **kwargs):
             if "create-actcode" in url:
-                return _resp(actcode_status)
+                return _resp(actcode_status, actcode_body)
             return _resp(200, "Access granted")
 
         def get(url, **kwargs):
-            if "user-file.mug" in url:
-                body = mug_body if mug_body is not None else json.dumps({"activation-code": "ABC123"})
-                return _resp(200, body)
             return _resp(200, "")
 
         session.post = MagicMock(side_effect=post)
@@ -154,7 +159,6 @@ class TestProvisionUser:
     @pytest.mark.asyncio
     async def test_happy_path_returns_token(self):
         session = self._session()
-        cfg = _users_cfg({1: _occupied("phone", "a" * 32, "a@b.c")})
         with (
             patch("custom_components.comelit_man.provisioning.login", new_callable=AsyncMock),
             patch(
@@ -162,7 +166,7 @@ class TestProvisionUser:
                 new_callable=AsyncMock,
                 return_value=b"archive",
             ),
-            patch("custom_components.comelit_man.provisioning.read_users_cfg", return_value=cfg),
+            patch("custom_components.comelit_man.provisioning.read_users_cfg", side_effect=_cfg_pair()),
             patch(
                 "custom_components.comelit_man.provisioning._redeem_activation_code",
                 new_callable=AsyncMock,
@@ -173,12 +177,11 @@ class TestProvisionUser:
             token = await provision_user("1.2.3.4", "pw", name="Home Assistant")
         assert token == "f" * 32
         redeem.assert_awaited_once()
-        assert redeem.await_args[0][2] == "ABC123"
+        assert redeem.await_args[0][2] == "zx9y8w7v6u"
 
     @pytest.mark.asyncio
     async def test_targets_first_free_slot(self):
         session = self._session()
-        cfg = _users_cfg({1: _occupied("phone", "a" * 32, "a@b.c")})
         with (
             patch("custom_components.comelit_man.provisioning.login", new_callable=AsyncMock),
             patch(
@@ -186,7 +189,7 @@ class TestProvisionUser:
                 new_callable=AsyncMock,
                 return_value=b"archive",
             ),
-            patch("custom_components.comelit_man.provisioning.read_users_cfg", return_value=cfg),
+            patch("custom_components.comelit_man.provisioning.read_users_cfg", side_effect=_cfg_pair()),
             patch(
                 "custom_components.comelit_man.provisioning._redeem_activation_code",
                 new_callable=AsyncMock,
@@ -200,7 +203,7 @@ class TestProvisionUser:
         assert targeted, "no parameterised POSTs recorded"
         for call in targeted:
             key = next(iter(call.kwargs["params"]))
-            assert "0_2" in key or call.kwargs["params"].get("user") == "0_2"
+            assert "0.2" in key or call.kwargs["params"].get("user") == "0.2"
 
     @pytest.mark.asyncio
     async def test_full_table_raises_before_touching_device(self):
@@ -222,24 +225,8 @@ class TestProvisionUser:
 
     @pytest.mark.asyncio
     async def test_missing_activation_code_raises(self):
-        session = self._session(mug_body=json.dumps({"something-else": 1}))
-        cfg = _users_cfg()
-        with (
-            patch("custom_components.comelit_man.provisioning.login", new_callable=AsyncMock),
-            patch(
-                "custom_components.comelit_man.provisioning.download_latest_backup",
-                new_callable=AsyncMock,
-                return_value=b"archive",
-            ),
-            patch("custom_components.comelit_man.provisioning.read_users_cfg", return_value=cfg),
-            patch("aiohttp.ClientSession", return_value=_ctx(session)),
-            pytest.raises(TokenExtractionError, match="no activation code"),
-        ):
-            await provision_user("1.2.3.4", "pw")
-
-    @pytest.mark.asyncio
-    async def test_non_json_pairing_file_raises(self):
-        session = self._session(mug_body="<html>error</html>")
+        """Device accepted the request but left field 18 empty."""
+        session = self._session()
         with (
             patch("custom_components.comelit_man.provisioning.login", new_callable=AsyncMock),
             patch(
@@ -249,7 +236,47 @@ class TestProvisionUser:
             ),
             patch("custom_components.comelit_man.provisioning.read_users_cfg", return_value=_users_cfg()),
             patch("aiohttp.ClientSession", return_value=_ctx(session)),
-            pytest.raises(TokenExtractionError, match="not JSON"),
+            pytest.raises(TokenExtractionError, match="no activation code"),
+        ):
+            await provision_user("1.2.3.4", "pw")
+
+    @pytest.mark.asyncio
+    async def test_activation_code_read_from_field_18(self):
+        """The generated code is read back from the user table, not a .mug file."""
+        session = self._session()
+        with (
+            patch("custom_components.comelit_man.provisioning.login", new_callable=AsyncMock),
+            patch(
+                "custom_components.comelit_man.provisioning.download_latest_backup",
+                new_callable=AsyncMock,
+                return_value=b"archive",
+            ),
+            patch("custom_components.comelit_man.provisioning.read_users_cfg", side_effect=_cfg_pair()),
+            patch(
+                "custom_components.comelit_man.provisioning._redeem_activation_code",
+                new_callable=AsyncMock,
+                return_value="f" * 32,
+            ) as redeem,
+            patch("aiohttp.ClientSession", return_value=_ctx(session)),
+        ):
+            token = await provision_user("1.2.3.4", "pw")
+        assert token == "f" * 32
+        assert redeem.await_args[0][2] == "zx9y8w7v6u"
+
+    @pytest.mark.asyncio
+    async def test_invalid_request_body_detected(self):
+        """This firmware answers bad requests with HTTP 200 + an HTML error."""
+        session = self._session(actcode_body="<td>Invalid request</td>")
+        with (
+            patch("custom_components.comelit_man.provisioning.login", new_callable=AsyncMock),
+            patch(
+                "custom_components.comelit_man.provisioning.download_latest_backup",
+                new_callable=AsyncMock,
+                return_value=b"archive",
+            ),
+            patch("custom_components.comelit_man.provisioning.read_users_cfg", return_value=_users_cfg()),
+            patch("aiohttp.ClientSession", return_value=_ctx(session)),
+            pytest.raises(TokenExtractionError, match="Activation code generation failed"),
         ):
             await provision_user("1.2.3.4", "pw")
 

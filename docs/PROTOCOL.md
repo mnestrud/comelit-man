@@ -807,17 +807,39 @@ has no pending pairing file and its slot would look free and be overwritten.
 |---|---|---|
 | Read the user table | §3.1 backup → §3.2 parse | **Device-verified** |
 | Choose a free slot | no name and no token; never slot 0 | **Device-verified** |
-| Create the user | `POST /update.html?mspUsersMap_.<map>_<slot>_<field>=<value>` — field 5 kind, field 6 name | Unverified |
-| Generate a code | `POST /create-actcode.html?user=<map>_<slot>` | Unverified |
-| Read the code | `GET /user-file.mug?user=<map>_<slot>` → JSON with `activation-code` | Unverified |
-| Redeem it | `UAUT` channel, newline-terminated JSON `{"message":"user-activation","activation-code":…,"description":…,"message-type":"request","message-id":1}` → `response-code` 200 carries `user-token` | Unverified |
+| Create the user | `POST /update.html?mspUsersMap_.<map>.<slot>_<field>=<value>` — field 5 = 2 (Apps), field 6 = name, field 4 = 1 (enabled) | **Format device-verified**, not executed |
+| Generate a code | `POST /create-actcode.html?user=<map>.<slot>` | **Format device-verified**, not executed |
+| Read the code | Re-read the backup; the code is in **field 18** of the slot | **Format device-verified**, not executed |
+| Redeem it | `UAUT` channel, newline-terminated JSON `{"message":"user-activation","activation-code":…,"description":…,"message-type":"request","message-id":1}` → `response-code` 200 carries `user-token` | Secondhand |
 
-> The read half was exercised against the reference device; the four write
-> steps are ported from another implementation and have not been run against
-> hardware, because a mistake here modifies the device's user table. Note also
-> that one source documents the redemption message as `user-cloud-activation`
-> with a `cloud-activation-code` field, while the implementation this was taken
-> from sends `user-activation`.
+Note the slot separator: the address in the URL is `<map>.<slot>` (a **dot**,
+e.g. `0.2`), not the underscore that the field suffix uses. Both forms appear
+in one URL: `mspUsersMap_.0.2_5`.
+
+Field semantics, read off the controls on the device's users page:
+
+| Field | Control | Values |
+|---|---|---|
+| 4 | Enable checkbox | 1 enabled, 2 disabled |
+| 5 | Device type | 0 none, 1 Internal Unit, 2 Apps, 3 Phone |
+| 6 / 11 / 12 | Description / contact email / contact phone | free text |
+| 18 | Activation code | 10 characters, present once generated |
+
+There is **no `user-file.mug` endpoint on this firmware** — every form of that
+request answers "Invalid request", and does so with **HTTP 200 and an HTML
+body**, so a status-code check alone will not catch it. Read the generated code
+from field 18 instead. (Another implementation reads a `.mug` pairing file;
+that presumably applies to different firmware.)
+
+To undo a provisioned user the page offers `reset-user.html?user=<map>.<slot>`
+("Reset activation") and the field-4 checkbox to disable it.
+
+> The read steps were exercised against the reference device. The write steps
+> have their **URL and field formats confirmed from the device's own users page
+> markup**, but have not been executed — a mistake here modifies the user
+> table. The redemption message is the least certain part: one source documents
+> `user-cloud-activation` with a `cloud-activation-code` field, while the
+> implementation this was taken from sends `user-activation`.
 
 ---
 

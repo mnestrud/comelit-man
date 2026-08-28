@@ -54,7 +54,18 @@ _FIELD_RE = re.compile(r"(\d+):(\d+):(?:\"([^\"]*)\"|(\S+))")
 # Slot 0 belongs to the wall monitor / primary internal unit.  Never claim it.
 _RESERVED_SLOT = 0
 
-_USER_KIND_APPS = 2  # field 5: app-class identity (what a phone or HA uses)
+# Field semantics read off the device's users.html controls:
+#   field 4  — 1 enabled / 2 disabled  ("#" checkbox)
+#   field 5  — device type: 0 none, 1 Internal Unit, 2 Apps, 3 Phone
+#   field 6  — description (name), 11 contact email, 12 contact phone
+#   field 18 — the activation code, once generated
+_FIELD_ENABLED = 4
+_FIELD_KIND = 5
+_FIELD_NAME = 6
+_FIELD_ACTIVATION_CODE = 18
+
+_ENABLED = 1
+_USER_KIND_APPS = 2  # app-class identity (what a phone or HA uses)
 
 
 class UserSlot(NamedTuple):
@@ -65,6 +76,7 @@ class UserSlot(NamedTuple):
     name: str
     token: str
     email: str
+    activation_code: str = ""
 
     @property
     def is_free(self) -> bool:
@@ -73,8 +85,12 @@ class UserSlot(NamedTuple):
 
     @property
     def path(self) -> str:
-        """Slot identifier as the web UI addresses it (e.g. "0_3")."""
-        return f"{self.map_index}_{self.slot}"
+        """Slot identifier as the web UI addresses it (e.g. "0.3").
+
+        Read off the device's own users.html, which emits
+        `update.html?mspUsersMap_.0.2_5=` and `create-actcode.html?user=0.2`.
+        """
+        return f"{self.map_index}.{self.slot}"
 
 
 def parse_user_slots(users_cfg: str) -> list[UserSlot]:
@@ -96,6 +112,7 @@ def parse_user_slots(users_cfg: str) -> list[UserSlot]:
                 name=fields.get(6, ""),
                 token=fields.get(9, ""),
                 email=fields.get(11, ""),
+                activation_code=fields.get(18, ""),
             )
         )
     return slots
@@ -185,9 +202,10 @@ async def _create_user(
     target: UserSlot,
     name: str,
 ) -> None:
-    """Populate a free slot with an app-class user."""
-    await _update_field(session, base_url, target, 5, str(_USER_KIND_APPS))
-    await _update_field(session, base_url, target, 6, name)
+    """Populate a free slot with an enabled app-class user."""
+    await _update_field(session, base_url, target, _FIELD_KIND, str(_USER_KIND_APPS))
+    await _update_field(session, base_url, target, _FIELD_NAME, name)
+    await _update_field(session, base_url, target, _FIELD_ENABLED, str(_ENABLED))
 
 
 async def _generate_activation_code(
@@ -195,34 +213,33 @@ async def _generate_activation_code(
     base_url: str,
     target: UserSlot,
 ) -> str:
-    """Ask the device for an activation code and read it back."""
+    """Ask the device to generate an activation code, then read it back.
+
+    The code is read from the user table rather than a pairing file: this
+    firmware has no `user-file.mug` endpoint (it answers "Invalid request",
+    and does so with HTTP 200 and an HTML body, so the status code alone
+    proves nothing).  The generated code lands in field 18 of the slot,
+    which the device's own users page renders next to the activation status.
+    """
     async with session.post(
         f"{base_url}/create-actcode.html",
         params={"user": target.path},
         headers={"Referer": f"{base_url}/users.html"},
         timeout=_REQUEST_TIMEOUT,
     ) as resp:
-        if resp.status != 200:
-            raise TokenExtractionError(f"Activation code generation failed with status {resp.status}")
-
-    async with session.get(
-        f"{base_url}/user-file.mug",
-        params={"user": target.path},
-        timeout=_REQUEST_TIMEOUT,
-    ) as resp:
-        if resp.status != 200:
-            raise TokenExtractionError(f"Reading the pairing file failed with status {resp.status}")
         body = await resp.text()
+        if resp.status != 200 or "Invalid request" in body:
+            raise TokenExtractionError(f"Activation code generation failed (HTTP {resp.status}) for slot {target.path}")
 
-    try:
-        payload = json.loads(body)
-    except ValueError as err:
-        raise TokenExtractionError(f"Pairing file was not JSON: {body[:200]}") from err
-
-    code = payload.get("activation-code")
-    if not code:
-        raise TokenExtractionError(f"Pairing file contained no activation code: {sorted(payload)}")
-    return str(code)
+    archive = await download_latest_backup(session, base_url)
+    for entry in parse_user_slots(read_users_cfg(archive)):
+        if entry.map_index == target.map_index and entry.slot == target.slot:
+            if entry.activation_code:
+                return entry.activation_code
+            raise TokenExtractionError(
+                f"Device generated no activation code for slot {target.path} (field {_FIELD_ACTIVATION_CODE} is empty)"
+            )
+    raise TokenExtractionError(f"Slot {target.path} disappeared from the user table")
 
 
 async def _redeem_activation_code(host: str, port: int, code: str, description: str) -> str:
