@@ -4,13 +4,15 @@ Reverse-engineered notes for the ICONA Bridge protocol as spoken by Comelit ViP
 intercoms over **TCP/UDP port 64100**, plus the Home Assistant media plumbing
 that carries the resulting streams to a browser.
 
-Everything below is verified against a **6701W** (firmware 2.x) by packet
-capture unless explicitly marked otherwise. Where community notes for other
-models disagree, both observations are recorded — see
+The reference device is a **6701W** (firmware 2.x). Claims here carry different
+evidence weights — see [Provenance](#0-provenance-and-verification-status)
+before relying on any of them. Where community notes for other models disagree,
+both observations are recorded — see
 [Firmware and model differences](#12-firmware-and-model-differences).
 
 Contents:
 
+0. [Provenance and verification status](#0-provenance-and-verification-status)
 1. [Framing](#1-framing)
 2. [Channels](#2-channels)
 3. [Authentication and configuration](#3-authentication-and-configuration)
@@ -24,6 +26,53 @@ Contents:
 11. [Home Assistant end-to-end: RTSP, go2rtc, WebRTC](#11-home-assistant-end-to-end-rtsp-go2rtc-webrtc)
 12. [Firmware and model differences](#12-firmware-and-model-differences)
 13. [Other channels and unexplored surface](#13-other-channels-and-unexplored-surface)
+
+---
+
+## 0. Provenance and verification status
+
+Not every statement here rests on the same evidence. Four tiers:
+
+| Tier | Meaning |
+|---|---|
+| **PCAP-confirmed** | Re-verified 2026-08-28 by parsing this repo's captures (`inbound_call.pcap`, `test_inbound_run9.pcap` — gitignored, kept locally) |
+| **Live-validated** | Observed working (or failing) against the device through the integration's own debug logs during development |
+| **Code-derived** | Transcribed from `custom_components/comelit_man/` implementation and its docstrings. The implementation demonstrably works, but the specific byte-level claim was not independently re-checked against a capture |
+| **Secondhand** | Reported by other projects for hardware not available here. Treat as a lead, not fact |
+
+Checks re-run against both captures on 2026-08-28 — all **confirmed**, none refuted:
+
+- §1 framing layout (4377 + 1783 messages parsed cleanly under it)
+- §2 channel-open sequence is 1 (`{1: 12, 2: 1}` and `{1: 11, 2: 1}` — the lone
+  seq-2 is the client's answer to a device-initiated open, as documented)
+- §5 event ACK timestamp = `transform(device_ts)`; the ACKs that *don't* match
+  are exactly the renewal pair, which uses the separate init-derived regime
+- §4.3 renewal answered with a `0x1800` + `0x1820` pair
+- §4.4 ring is `0x18C0` action `0x0028`
+- §8 inbound `video_config` carries **320×240**
+- §9 H.264 is payload type 99 (1253 + 567 packets)
+- §10 PCMA is payload type 8 in 160-byte frames
+- §12 this device uses `SB`-prefixed addressing (`SB000003`, `SB0000031`,
+  `SB100001`)
+- §9 media transport asymmetry between call types (measured separately: 889 UDP
+  mic frames in the app's UDP-media call; TCP-only media in the inbound capture)
+
+Not covered by the captures on hand:
+
+- **Ring retransmission sharing a timestamp** (§4.4) — each capture contains a
+  single `0x18C0` frame. This claim is instead **live-validated**: a mid-call
+  ring on 2026-08-27 produced five forwarded frames all carrying
+  `ring_ts=0x7621014E`, which is what the deduplication key relies on.
+- **Door-open-during-video byte layout** (§6) — no door open occurs in either
+  capture; the layout is **code-derived** from a docstring citing a capture not
+  retained here.
+- §3 JSON message shapes, §6 door sequences, §7 the full outbound ordering,
+  §13 FRCG / discovery / provisioning — **code-derived** or **secondhand**.
+- §12's whole table beyond the `SB` row — **secondhand**.
+
+§11 (Home Assistant end-to-end) is **live-validated**: every claim in it was
+established by making the corresponding failure happen and then fixing it,
+confirmed by device-side logs and an independent `aiortc` client.
 
 ---
 
@@ -607,7 +656,9 @@ connection only while it has a consumer.
 ## 12. Firmware and model differences
 
 Recorded because they are the likely failure points on hardware other than the
-one this was developed against.
+one this was developed against. **Only the 6701W column is verified here** —
+everything in the right-hand column is secondhand (see
+[Provenance](#0-provenance-and-verification-status)).
 
 | Behaviour | 6701W (this repo, PCAP-verified) | Other models (community reports) |
 |---|---|---|
@@ -623,6 +674,9 @@ hardware; a regex of the form `(?:SB)?[0-9A-Fa-f]{6,9}` covers both.
 ---
 
 ## 13. Other channels and unexplored surface
+
+> Everything in this section is **code-derived or secondhand** — none of it has
+> been observed on the wire here.
 
 **FRCG — face recognition.** The device runs a face-recognition pipeline
 locally. On a ring it captures a face image and emits, on the `FRCG` channel

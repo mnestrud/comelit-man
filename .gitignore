@@ -29,6 +29,7 @@ test_output.txt
 *.pcap
 compare_pcap2.py
 parse_pcap.py
+validate_protocol_doc.py
 compare_output.txt
 tshark_*.txt
 memory/protocol_reference.md
