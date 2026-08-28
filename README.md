@@ -5,10 +5,12 @@ Home Assistant custom component for the **Comelit 6701W** WiFi video intercom. C
 ## Features
 
 - **Remote door opening** — open doors/gates from Home Assistant
-- **Live intercom video** — view the door camera stream directly in HA dashboards via local RTSP
-- **Doorbell events** — automations trigger on ring or missed call
-- **Custom Lovelace card** — play-button UI auto-registered on startup; starts video on click, stops on navigation away
-- **100% local** — all communication stays on your LAN, no cloud required
+- **Live intercom video** — view the door camera stream directly in HA dashboards via local RTSP + WebRTC
+- **Two-way audio** — hear the entrance and talk back from the doorbell card (mic requires an HTTPS origin — see below)
+- **Doorbell events** — automations trigger on ring, missed call, or door opened; passive inbound video starts on ring without answering (other stations keep ringing until you do)
+- **Answer-station card** — built-in WebRTC player using HA's native signaling; works on the local URL and remotely via Nabu Casa TURN
+- **Last-ring snapshot** — image entity holding a JPEG captured as each ring's video starts
+- **100% local** — all call handling stays on your LAN; the cloud is only involved when you view remotely
 
 ## Requirements
 
@@ -90,6 +92,9 @@ The integration does not persist any state outside the config entry, so no manua
 | `camera.comelit_intercom_<name>` | RTSP stream from each additional configured camera |
 | `event.comelit_intercom_doorbell` | Fires `ring`, `missed_call`, and `door_opened` events for automations |
 | `button.comelit_intercom_answer_doorbell` | Start two-way audio on an active inbound call |
+| `image.comelit_intercom_last_ring_snapshot` | JPEG captured from video as the last ring arrived |
+
+`missed_call` fires when a ring's passive video session ends without the Answer button being pressed (~2 minutes after the ring), or immediately if inbound video fails to start.
 
 ### Lovelace Cards
 
@@ -104,22 +109,32 @@ start_entity: button.comelit_intercom_start_video_feed  # optional
 stop_entity: button.comelit_intercom_stop_video_feed
 ```
 
-**Doorbell notification card** — shows a pulsing alert with Answer/Dismiss buttons when someone rings; auto-dismisses after `dismiss_after` seconds:
+**Doorbell answer-station card** — a complete answer surface with a built-in WebRTC player. Video and entrance audio play through HA's native WebRTC signaling (`camera/webrtc/*` over the authenticated websocket), so it works identically on your local URL and remotely — ICE configuration, including Nabu Casa TURN when subscribed, comes from HA:
 
 ```yaml
 type: custom:comelit-doorbell-card
 doorbell_entity: event.comelit_intercom_doorbell
 camera_entity: camera.comelit_intercom_live_feed
-start_entity: button.comelit_intercom_answer_doorbell  # starts two-way audio
+answer_entity: button.comelit_intercom_answer_doorbell
 stop_entity: button.comelit_intercom_stop_video_feed
+door_entity: button.comelit_intercom_entrance_lock  # optional — adds Open Door buttons
 dismiss_after: 30  # optional, default 30s
 ```
 
-States: **Idle** (thumbnail + doorbell badge) → **Ringing** (pulsing icon + Answer/Dismiss) → **Answered** (live stream + stop button).
+States: **Idle** (thumbnail + doorbell badge) → **Ringing** (live video muted + Answer / Open Door / Dismiss) → **Answered** (video + entrance audio, mic chip, hang-up).
+
+**Two-way audio / microphone:** browsers only allow microphone capture on a secure (HTTPS) origin — this is a Chromium rule with no workaround, and it applies inside the companion app too. In practice:
+
+| Connection | See + hear | Talk back |
+|---|---|---|
+| Local `http://` URL | ✅ | ❌ — the card shows "mic needs HTTPS" |
+| HTTPS (Nabu Casa remote, or local TLS) | ✅ | ✅ — tap the mic chip after Answer |
+
+Pressing **Answer** unmutes entrance audio, tells the device to open its audio channel, and (on HTTPS) starts transmitting your mic. Latency for talk-back is bounded to well under a second.
 
 ### Doorbell Notifications
 
-When someone rings the doorbell, `event.comelit_intercom_doorbell` fires a `ring` event. Video starts automatically (the integration answers the inbound call). Use automations to send notifications, open the door, or take snapshots.
+When someone rings the doorbell, `event.comelit_intercom_doorbell` fires a `ring` event. Video starts automatically as a **passive** viewer — the call is not answered and other intercom stations keep ringing until you press Answer. Video sessions end on their own when nobody is watching. Use automations to send notifications, open the door, or take snapshots.
 
 **Basic notification:**
 
