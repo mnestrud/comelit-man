@@ -16,6 +16,7 @@ async def authenticate(client: IconaBridgeClient, token: str) -> None:
 
     Opens the UAUT channel, sends an access request, and verifies response code 200.
     """
+    client._set_authenticated(False)
     channel = await client.open_channel("UAUT", ChannelType.UAUT)
 
     msg = {
@@ -26,11 +27,19 @@ async def authenticate(client: IconaBridgeClient, token: str) -> None:
     }
 
     response = await client.send_json(channel, msg)
-    _LOGGER.debug("Auth response: %s", response)
+    _LOGGER.debug("Authentication response received")
 
     code = response.get("response-code", 0)
     if code != 200:
         reason = response.get("response-string", "Unknown error")
         raise AuthenticationError(f"Authentication failed: {code} {reason}")
 
+    if (
+        response.get("message") != "access"
+        or response.get("message-id") != int(ViperMessageId.UAUT)
+        or response.get("message-type") != "response"
+    ):
+        raise AuthenticationError("Authentication failed: invalid response")
+
+    client._set_authenticated(True)
     _LOGGER.info("Authenticated successfully")

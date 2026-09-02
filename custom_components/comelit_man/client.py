@@ -50,6 +50,7 @@ class IconaBridgeClient:
         self._callbacks: dict[int, asyncio.Future[bytes]] = {}
         self._push_callback: Callable[[dict[str, Any]], None] | None = None
         self._connected = False
+        self._authenticated = False
         self._disconnect_callback: Callable[[], None] | None = None
 
     @property
@@ -57,8 +58,18 @@ class IconaBridgeClient:
         """Return True if the TCP connection is active."""
         return self._connected
 
+    @property
+    def authenticated(self) -> bool:
+        """Return True after successful UAUT authentication on this connection."""
+        return self._connected and self._authenticated
+
+    def _set_authenticated(self, authenticated: bool) -> None:
+        """Record the result of a UAUT authentication attempt."""
+        self._authenticated = authenticated
+
     async def connect(self) -> None:
         """Open TCP connection to the device."""
+        self._authenticated = False
 
         try:
             self._reader, self._writer = await asyncio.wait_for(
@@ -95,6 +106,7 @@ class IconaBridgeClient:
         shutdown without risking a 30-40s hang on a dead socket.
         """
         self._connected = False
+        self._authenticated = False
         if self._receive_task:
             task, self._receive_task = self._receive_task, None
             task.cancel()
@@ -118,7 +130,7 @@ class IconaBridgeClient:
         """Send raw bytes to the device."""
         if not self._writer:
             raise ConnectionComelitError("Not connected")
-        _LOGGER.debug(f"Writing {len(data)} bytes: {data.hex(' ')}")
+        _LOGGER.debug("Writing %d bytes", len(data))
         self._writer.write(data)
         try:
             await self._writer.drain()
@@ -139,7 +151,9 @@ class IconaBridgeClient:
         )
         body = await self._reader.readexactly(body_length) if body_length > 0 else b""
         if is_json_body(body):
-            _LOGGER.debug("Read JSON body (%d bytes): %s", len(body), body.decode("utf-8", errors="replace")[:500])
+            # JSON responses can contain credentials and stable device
+            # identifiers. Log framing metadata only, never response content.
+            _LOGGER.debug("Read JSON body (%d bytes)", len(body))
         else:
             _LOGGER.debug("Read binary body (%d bytes): %s", len(body), body.hex(" ")[:200])
         return request_id, body
@@ -215,7 +229,7 @@ class IconaBridgeClient:
         if is_json_body(body):
             try:
                 msg = decode_json_body(body)
-                _LOGGER.debug("Unsolicited JSON on channel %d: %s", request_id, msg)
+                _LOGGER.debug("Unsolicited JSON on channel %d (%d bytes)", request_id, len(body))
                 if self._push_callback:
                     self._push_callback(msg)
             except Exception:
@@ -393,30 +407,34 @@ class IconaBridgeClient:
 
         async with channel.send_lock:
             _LOGGER.debug(
-                "send_json on %s (server_channel_id=%d): %s",
+                "Sending JSON on %s (server_channel_id=%d)",
                 channel.name,
                 channel.server_channel_id,
-                msg,
             )
 
             loop = asyncio.get_running_loop()
             future: asyncio.Future[bytes] = loop.create_future()
-            self._callbacks[channel.server_channel_id] = future
-
-            packet = encode_json_message(msg, channel.server_channel_id)
-            await self._send(packet)
-
+            callback_id = channel.server_channel_id
+            self._callbacks[callback_id] = future
             try:
-                body = await asyncio.wait_for(future, timeout=READ_TIMEOUT)
-            except TimeoutError:
-                _LOGGER.error(
-                    "Timeout on %s (server_channel_id=%d), pending_callbacks=%s",
-                    channel.name,
-                    channel.server_channel_id,
-                    list(self._callbacks.keys()),
-                )
-                self._callbacks.pop(channel.server_channel_id, None)
-                raise ProtocolError(f"Timeout waiting for response on {channel.name}") from None
+                packet = encode_json_message(msg, callback_id)
+                await self._send(packet)
+
+                try:
+                    body = await asyncio.wait_for(future, timeout=READ_TIMEOUT)
+                except TimeoutError:
+                    _LOGGER.error(
+                        "Timeout on %s (server_channel_id=%d), pending_callbacks=%s",
+                        channel.name,
+                        callback_id,
+                        list(self._callbacks.keys()),
+                    )
+                    raise ProtocolError(f"Timeout waiting for response on {channel.name}") from None
+            finally:
+                if self._callbacks.get(callback_id) is future:
+                    self._callbacks.pop(callback_id, None)
+                if not future.done():
+                    future.cancel()
 
         if is_json_body(body):
             return decode_json_body(body)

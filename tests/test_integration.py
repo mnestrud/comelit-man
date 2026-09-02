@@ -604,7 +604,7 @@ async def test_inbound_skip_callinit():
         pytest.skip("COMELIT_TOKEN not set")
 
     from custom_components.comelit_man.auth import authenticate
-    from custom_components.comelit_man.channels import ChannelType
+    from custom_components.comelit_man.channels import ChannelType, ViperMessageId
     from custom_components.comelit_man.client import IconaBridgeClient
     from custom_components.comelit_man.config_reader import get_device_config
     from custom_components.comelit_man.protocol import (
@@ -644,7 +644,7 @@ async def test_inbound_skip_callinit():
             {
                 "message": "server-info",
                 "message-type": "request",
-                "message-id": 4,
+                "message-id": int(ViperMessageId.SERVER_INFO),
             },
         )
         print("  Android init: INFO server-info done")
