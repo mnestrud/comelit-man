@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from custom_components.comelit_man.selector import ComelitCameraSelector
+from custom_components.comelit_man.select import ComelitCameraSelector
 
 
 def _make_selector(
@@ -106,7 +106,7 @@ class TestStateCallback:
 class TestSelectorSetupEntry:
     @pytest.mark.asyncio
     async def test_setup_entry_creates_selector_when_doors_exist(self):
-        from custom_components.comelit_man.selector import async_setup_entry
+        from custom_components.comelit_man.select import async_setup_entry
 
         coordinator = MagicMock()
         coordinator.device_config = MagicMock(doors=[MagicMock()])
@@ -120,7 +120,7 @@ class TestSelectorSetupEntry:
 
     @pytest.mark.asyncio
     async def test_setup_entry_no_config_adds_nothing(self):
-        from custom_components.comelit_man.selector import async_setup_entry
+        from custom_components.comelit_man.select import async_setup_entry
 
         coordinator = MagicMock()
         coordinator.device_config = None
@@ -132,7 +132,7 @@ class TestSelectorSetupEntry:
 
     @pytest.mark.asyncio
     async def test_setup_entry_no_doors_adds_nothing(self):
-        from custom_components.comelit_man.selector import async_setup_entry
+        from custom_components.comelit_man.select import async_setup_entry
 
         coordinator = MagicMock()
         coordinator.device_config = MagicMock(doors=[])
