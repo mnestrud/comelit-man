@@ -36,6 +36,7 @@ from .const import (
 from .ctpp import _CTR_INCR_BOTH, ctpp_init_sequence
 from .door import open_door
 from .exceptions import AuthenticationError, DoorOpenError
+from .go2rtc_helper import get_go2rtc
 from .models import DeviceConfig, Door, PushEvent
 from .push import register_push, send_push_keepalive
 from .rtsp_server import LocalRtspServer
@@ -827,9 +828,11 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         # source flag is unnecessary with that negotiation in place.
         src = self._rtsp_url
         try:
-            session = async_get_clientsession(self.hass)
+            session, go2rtc_url = get_go2rtc(
+                self.hass, async_get_clientsession(self.hass)
+            )
             async with session.put(
-                "http://127.0.0.1:1984/api/streams",
+                f"{go2rtc_url}/api/streams",
                 params={"name": name, "src": src},
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
@@ -852,9 +855,11 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         """Remove our stream registration from go2rtc on shutdown."""
         name = f"comelit_man_{self.config_entry.entry_id}"
         with contextlib.suppress(Exception):
-            session = async_get_clientsession(self.hass)
+            session, go2rtc_url = get_go2rtc(
+                self.hass, async_get_clientsession(self.hass)
+            )
             async with session.delete(
-                "http://127.0.0.1:1984/api/streams",
+                f"{go2rtc_url}/api/streams",
                 params={"name": name},
                 timeout=aiohttp.ClientTimeout(total=5),
             ):
