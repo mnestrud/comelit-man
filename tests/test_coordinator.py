@@ -71,6 +71,10 @@ def _make_coordinator(*, with_client: bool = False) -> ComelitLocalCoordinator:
     coordinator._push_callbacks = {}
     coordinator._on_stop_video = {}
     coordinator._on_video_state_change = {}
+    coordinator._camera_slots = {}
+    coordinator._camera_ssrc = None
+    coordinator._active_camera_slot = None
+    coordinator._camera_slot_mono = None
     coordinator._keepalive_task = None
     coordinator._connection_lost = False
     coordinator._ctpp_init_ts = 0
@@ -1846,3 +1850,126 @@ class TestCoordinatorRemainingPaths:
 
         with pytest.raises(UpdateFailed, match="without a device configuration"):
             await coord._async_update_data()
+
+
+# ---------------------------------------------------------------------------
+# Camera selector (SSRC tracking + toggle)
+# ---------------------------------------------------------------------------
+
+
+def _make_ssrc_coordinator() -> ComelitLocalCoordinator:
+    """Coordinator preconfigured for camera-slot tracking tests."""
+    coord = _make_coordinator()
+    coord._camera_slots = {}
+    coord._camera_ssrc = None
+    coord._active_camera_slot = None
+    coord._camera_slot_mono = None
+    return coord
+
+
+class TestAssignCameraSlot:
+    def test_first_ssrc_takes_cam1(self):
+        from custom_components.comelit_man.coordinator import _assign_camera_slot
+
+        assert _assign_camera_slot({}, None, 0x11111111) == "cam1"
+
+    def test_known_ssrc_keeps_slot(self):
+        from custom_components.comelit_man.coordinator import _assign_camera_slot
+
+        seen = {0x11111111: "cam2"}
+        assert _assign_camera_slot(seen, "cam2", 0x11111111) == "cam2"
+
+    def test_unseen_ssrc_takes_opposite_of_active(self):
+        from custom_components.comelit_man.coordinator import _assign_camera_slot
+
+        seen = {0x11111111: "cam1"}
+        assert _assign_camera_slot(seen, "cam1", 0x22222222) == "cam2"
+        seen2 = {0x22222222: "cam2"}
+        assert _assign_camera_slot(seen2, "cam2", 0x11111111) == "cam1"
+
+    def test_unseen_ssrc_without_active_uses_unused_slot(self):
+        from custom_components.comelit_man.coordinator import _assign_camera_slot
+
+        seen = {0x11111111: "cam2"}
+        assert _assign_camera_slot(seen, None, 0x33333333) == "cam1"
+
+
+class TestOnVideoSsrc:
+    def test_first_ssrc_sets_cam1_and_fires_task(self):
+        coord = _make_ssrc_coordinator()
+        coord._on_video_ssrc(0x11111111)
+        assert coord._active_camera_slot == "cam1"
+        assert coord._camera_ssrc == 0x11111111
+        assert coord._camera_slots == {0x11111111: "cam1"}
+
+    @pytest.mark.asyncio
+    async def test_alternating_ssrcs_swap_slots(self):
+        coord = _make_ssrc_coordinator()
+        coord._on_video_ssrc(0x11111111)
+        coord._on_video_ssrc(0x22222222)
+        assert coord._active_camera_slot == "cam2"
+        assert coord._camera_slots[0x22222222] == "cam2"
+        # Same SSRC again → the camera is known, no reassignment.
+        coord._on_video_ssrc(0x11111111)
+        assert coord._active_camera_slot == "cam1"
+
+    def test_same_ssrc_does_not_fire_state_change(self):
+        coord = _make_ssrc_coordinator()
+        coord._on_video_ssrc(0x11111111)
+        fired = []
+
+        async def fake_notify():
+            fired.append(True)
+
+        coord._notify_video_state_change = fake_notify
+        coord._on_video_ssrc(0x11111111)  # same SSRC → no change
+        assert not fired
+
+    def test_changed_slot_schedules_state_notification(self):
+        coord = _make_ssrc_coordinator()
+        calls = []
+
+        def fake_task(_hass, coro, name):
+            calls.append(name)
+            coro.close()
+
+        coord.config_entry.async_create_background_task.side_effect = fake_task
+        coord._on_video_state_change = {}
+        coord._on_video_ssrc(0x11111111)
+        assert calls == ["comelit-camera-slot-change"]
+
+
+class TestToggleCameraSelection:
+    @pytest.mark.asyncio
+    async def test_toggle_restarts_video_and_returns_slot(self):
+        coord = _make_ssrc_coordinator()
+        coord.async_start_video = AsyncMock(return_value=None)
+        coord._active_camera_slot = "cam2"
+        result = await coord.async_toggle_camera_selection()
+        coord.async_start_video.assert_awaited_once_with(auto_timeout=True, by_user=True)
+        assert result == "cam2"
+
+    @pytest.mark.asyncio
+    async def test_toggle_requires_config(self):
+        coord = _make_ssrc_coordinator()
+        coord._config = None
+        with pytest.raises(RuntimeError, match="Not configured"):
+            await coord.async_toggle_camera_selection()
+
+
+class TestCameraLabels:
+    def test_labels_default(self):
+        coord = _make_ssrc_coordinator()
+        labels = coord.camera_labels()
+        assert labels == {"cam1": "Camera 1", "cam2": "Camera 2"}
+
+    def test_labels_from_options(self):
+        coord = _make_ssrc_coordinator()
+        coord.config_entry.options = {
+            "enable_notifications": True,
+            "camera_1_label": "Urbanización",
+            "camera_2_label": "Casa",
+        }
+        assert coord.camera_labels() == {"cam1": "Urbanización", "cam2": "Casa"}
+        assert coord.slot_for_label("Casa") == "cam2"
+        assert coord.slot_for_label("unknown") is None

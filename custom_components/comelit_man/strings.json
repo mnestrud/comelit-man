@@ -12,6 +12,9 @@
       },
       "answer_doorbell": {
         "name": "Answer Doorbell"
+      },
+      "switch_camera": {
+        "name": "Switch Camera/Door"
       }
     },
     "camera": {
@@ -49,6 +52,11 @@
       "ring_count": {
         "name": "Ring count"
       }
+    },
+    "select": {
+      "camera_selector": {
+        "name": "Entrance Camera"
+      }
     }
   },
   "options": {
@@ -56,10 +64,14 @@
       "init": {
         "title": "Comelit Intercom Options",
         "data": {
-          "enable_notifications": "Enable doorbell notifications"
+          "enable_notifications": "Enable doorbell notifications",
+          "camera_1_label": "Label for camera 1",
+          "camera_2_label": "Label for camera 2"
         },
         "data_description": {
-          "enable_notifications": "Receive doorbell ring and missed call events from the intercom"
+          "enable_notifications": "Receive doorbell ring and missed call events from the intercom",
+          "camera_1_label": "Name shown for the first camera slot (e.g. \"Urbanization\"). The panel routes two cameras and two doors through a selector relay that advances on every call, so label these slots to match your installation.",
+          "camera_2_label": "Name shown for the second camera slot (e.g. \"House\"). See camera 1."
         }
       }
     }

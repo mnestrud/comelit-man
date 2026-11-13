@@ -1413,3 +1413,82 @@ class TestAudioSendLoopTcpTransport:
             side_effect=asyncio.CancelledError,
         ):
             await receiver._audio_send_loop(0x1234)
+
+
+# ---------------------------------------------------------------------------
+# Video SSRC tracking (camera selector)
+# ---------------------------------------------------------------------------
+
+
+def _make_rtp_packet_with_ssrc(payload: bytes, ssrc: int) -> bytes:
+    """Build a valid RTP packet with an explicit SSRC (bytes 8-11, BE)."""
+    header = struct.pack("!BBHI", 0x80, 0x60, 1, 0) + struct.pack("!I", ssrc)
+    return header + payload
+
+
+def _make_audio_rtp_packet(ssrc: int) -> bytes:
+    """Build a PCMA audio RTP packet (PT=8) with an explicit SSRC."""
+    header = struct.pack("!BBHI", 0x80, 0x88, 1, 0) + struct.pack("!I", ssrc)
+    return header + b"\xd5" * 8
+
+
+class TestVideoSsrcTracking:
+    def test_initial_ssrc_is_none(self):
+        receiver = RtpReceiver("127.0.0.1")
+        assert receiver.video_ssrc is None
+        assert receiver.on_video_ssrc is None
+
+    def test_first_video_packet_sets_ssrc_and_fires_callback(self):
+        receiver = RtpReceiver("127.0.0.1")
+        seen = []
+        receiver.on_video_ssrc = seen.append
+        nal_payload = b"\x67\x42\x00\x1f\x01"
+        receiver._process_rtp(_make_rtp_packet_with_ssrc(nal_payload, 0x1234ABCD))
+        assert receiver.video_ssrc == 0x1234ABCD
+        assert seen == [0x1234ABCD]
+
+    def test_same_ssrc_does_not_refire(self):
+        receiver = RtpReceiver("127.0.0.1")
+        seen = []
+        receiver.on_video_ssrc = seen.append
+        nal_payload = b"\x67\x42\x00\x1f\x01"
+        receiver._process_rtp(_make_rtp_packet_with_ssrc(nal_payload, 0x1234ABCD))
+        receiver._process_rtp(_make_rtp_packet_with_ssrc(nal_payload, 0x1234ABCD))
+        assert seen == [0x1234ABCD]
+
+    def test_ssrc_change_fires_again(self):
+        receiver = RtpReceiver("127.0.0.1")
+        seen = []
+        receiver.on_video_ssrc = seen.append
+        nal_payload = b"\x67\x42\x00\x1f\x01"
+        receiver._process_rtp(_make_rtp_packet_with_ssrc(nal_payload, 0x11111111))
+        receiver._process_rtp(_make_rtp_packet_with_ssrc(nal_payload, 0x22222222))
+        assert seen == [0x11111111, 0x22222222]
+
+    def test_audio_packet_does_not_touch_video_ssrc(self):
+        receiver = RtpReceiver("127.0.0.1")
+        seen = []
+        receiver.on_video_ssrc = seen.append
+        receiver._process_rtp(_make_audio_rtp_packet(0x55555555))
+        assert receiver.video_ssrc is None
+        assert seen == []
+
+    def test_callback_exception_is_suppressed(self):
+        receiver = RtpReceiver("127.0.0.1")
+
+        def boom(_ssrc):
+            raise RuntimeError("callback error")
+
+        receiver.on_video_ssrc = boom
+        nal_payload = b"\x67\x42\x00\x1f\x01"
+        receiver._process_rtp(_make_rtp_packet_with_ssrc(nal_payload, 0x1234ABCD))
+        assert receiver.video_ssrc == 0x1234ABCD
+
+    def test_minimum_length_packet_tracks_ssrc(self):
+        """A 13-byte packet (minimum accepted by callers) still yields an SSRC."""
+        receiver = RtpReceiver("127.0.0.1")
+        seen = []
+        receiver.on_video_ssrc = seen.append
+        receiver._process_rtp(struct.pack("!BBHI", 0x80, 0x60, 1, 0) + struct.pack("!I", 0x01020304) + b"\x00")
+        assert receiver.video_ssrc == 0x01020304
+        assert seen == [0x01020304]

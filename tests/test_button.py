@@ -11,6 +11,7 @@ from custom_components.comelit_man.button import (
     ComelitDoorButton,
     ComelitStartVideoButton,
     ComelitStopVideoButton,
+    ComelitSwitchCameraButton,
 )
 from custom_components.comelit_man.models import Door
 
@@ -250,12 +251,13 @@ class TestButtonSetupEntry:
         entry.entry_id = "entry_abc"
         added: list = []
         await async_setup_entry(MagicMock(), entry, lambda ents: added.extend(ents))
-        # 1 door button + start video + stop video + answer doorbell = 4
-        assert len(added) == 4
+        # 1 door button + start video + stop video + answer doorbell + switch camera = 5
+        assert len(added) == 5
         assert isinstance(added[0], ComelitDoorButton)
         assert isinstance(added[1], ComelitStartVideoButton)
         assert isinstance(added[2], ComelitStopVideoButton)
         assert isinstance(added[3], ComelitAnswerDoorbellButton)
+        assert isinstance(added[4], ComelitSwitchCameraButton)
 
     @pytest.mark.asyncio
     async def test_setup_entry_no_config_adds_nothing(self):
@@ -309,3 +311,27 @@ class TestComelitAnswerDoorbellButton:
         btn = _make_answer_button()
         btn.coordinator.async_answer_inbound = AsyncMock(side_effect=RuntimeError("no session"))
         await btn.async_press()  # must not raise
+
+
+def _make_switch_button() -> ComelitSwitchCameraButton:
+    """Create a ComelitSwitchCameraButton with a mocked coordinator."""
+    coordinator = MagicMock()
+    coordinator.async_toggle_camera_selection = AsyncMock(return_value="cam2")
+
+    btn = ComelitSwitchCameraButton.__new__(ComelitSwitchCameraButton)
+    btn.coordinator = coordinator
+    return btn
+
+
+class TestComelitSwitchCameraButton:
+    @pytest.mark.asyncio
+    async def test_press_toggles_selector(self):
+        btn = _make_switch_button()
+        await btn.async_press()
+        btn.coordinator.async_toggle_camera_selection.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_press_does_not_raise_on_exception(self):
+        btn = _make_switch_button()
+        btn.coordinator.async_toggle_camera_selection = AsyncMock(side_effect=RuntimeError("boom"))
+        await btn.async_press()  # must not propagate

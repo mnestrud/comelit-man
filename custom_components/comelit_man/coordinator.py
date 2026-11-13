@@ -25,7 +25,14 @@ from .auth import authenticate
 from .channels import ChannelType
 from .client import IconaBridgeClient
 from .config_reader import get_device_config
-from .const import CONF_ENABLE_NOTIFICATIONS, DOMAIN
+from .const import (
+    CONF_CAMERA_LABEL_1,
+    CONF_CAMERA_LABEL_2,
+    CONF_ENABLE_NOTIFICATIONS,
+    DEFAULT_CAMERA_LABEL_1,
+    DEFAULT_CAMERA_LABEL_2,
+    DOMAIN,
+)
 from .ctpp import _CTR_INCR_BOTH, ctpp_init_sequence
 from .door import open_door
 from .exceptions import AuthenticationError, DoorOpenError
@@ -45,6 +52,31 @@ RING_DEDUP_WINDOW = 120.0
 # A device 0x1840/0x0000 (idle) counts as a missed call only when it follows
 # a ring this recently; otherwise it is video-teardown / CTPP-init tail.
 MISSED_CALL_WINDOW = 45.0
+
+
+def _assign_camera_slot(seen: dict[int, str], active: str | None, ssrc: int) -> str:
+    """Map a video SSRC to a camera slot ("cam1"/"cam2").
+
+    Pure function of the learned mapping and the active slot so the policy
+    is easy to unit test. Rules:
+    - Known SSRC keeps its slot (same camera re-selected).
+    - First-ever SSRC takes cam1.
+    - Unseen SSRC takes the slot opposite to the currently active one — the
+      panel alternates cameras on every new call, and after a power cut both
+      SSRCs change, so "the other one than before" is the best available
+      guess for which physical camera is now streaming.
+    """
+    known = seen.get(ssrc)
+    if known is not None:
+        return known
+    if not seen:
+        return "cam1"
+    if active == "cam1":
+        return "cam2"
+    if active == "cam2":
+        return "cam1"
+    used = set(seen.values())
+    return "cam2" if "cam1" in used else "cam1"
 
 
 class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
@@ -128,6 +160,16 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         # — without it, picture-entity locks to the transport it picked
         # at first stream_source() call and never upgrades from MJPEG.
         self._on_video_state_change: dict[Callable[[], Awaitable[None]], None] = {}
+        # Camera selector tracking. The entrance panel routes two physical
+        # cameras (and the door strike) through a selector relay that
+        # advances on every new call; each camera encodes RTP with its own
+        # SSRC, so the SSRC identifies which camera — and therefore which
+        # door — is currently active. Slots are "cam1"/"cam2" and the
+        # user-facing labels live in entry options.
+        self._camera_slots: dict[int, str] = {}  # video ssrc -> slot
+        self._camera_ssrc: int | None = None
+        self._active_camera_slot: str | None = None
+        self._camera_slot_mono: float | None = None  # last slot change (monotonic)
 
     @property
     def device_config(self) -> DeviceConfig | None:
@@ -344,6 +386,78 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             except Exception:
                 _LOGGER.exception("Error in video state change callback")
 
+    @property
+    def active_camera_slot(self) -> str | None:
+        """Return the currently active camera slot ("cam1"/"cam2"), or None."""
+        return self._active_camera_slot
+
+    @property
+    def camera_ssrc(self) -> int | None:
+        """Return the last video RTP SSRC seen, or None when not streaming."""
+        return self._camera_ssrc
+
+    @property
+    def camera_slot_map(self) -> dict[int, str]:
+        """Return the learned video-SSRC -> camera-slot mapping."""
+        return dict(self._camera_slots)
+
+    @property
+    def camera_slot_changed_at(self) -> float | None:
+        """Return the monotonic time of the last camera-slot change."""
+        return self._camera_slot_mono
+
+    def camera_labels(self) -> dict[str, str]:
+        """Return the user-facing label for each camera slot (from options)."""
+        return {
+            "cam1": self.config_entry.options.get(CONF_CAMERA_LABEL_1) or DEFAULT_CAMERA_LABEL_1,
+            "cam2": self.config_entry.options.get(CONF_CAMERA_LABEL_2) or DEFAULT_CAMERA_LABEL_2,
+        }
+
+    def slot_for_label(self, label: str) -> str | None:
+        """Return the camera slot whose user label matches, or None."""
+        for slot, slot_label in self.camera_labels().items():
+            if slot_label == label:
+                return slot
+        return None
+
+    def _on_video_ssrc(self, ssrc: int) -> None:
+        """Track which camera is streaming from the video RTP SSRC.
+
+        Called by the active session's RtpReceiver whenever the video SSRC
+        changes (including the first video packet of a session). The panel's
+        selector relay advances on every new call and each of its two cameras
+        encodes with a distinct SSRC, so a new SSRC means the other camera —
+        and the other door — became active.
+        """
+        new_slot = _assign_camera_slot(self._camera_slots, self._active_camera_slot, ssrc)
+        self._camera_ssrc = ssrc
+        if new_slot != self._active_camera_slot:
+            self._camera_slots[ssrc] = new_slot
+            self._active_camera_slot = new_slot
+            self._camera_slot_mono = time.monotonic()
+            _LOGGER.info("Camera selector: active camera is now %s (ssrc=0x%08X)", new_slot, ssrc)
+            self.config_entry.async_create_background_task(
+                self.hass,
+                self._notify_video_state_change(),
+                "comelit-camera-slot-change",
+            )
+
+    async def async_toggle_camera_selection(self) -> str | None:
+        """Advance the entrance panel's camera/door selector relay.
+
+        The panel switches between its two physical cameras — routing the
+        door strike accordingly — on every new call. Stopping the current
+        session and starting a fresh one advances the selector; the newly
+        active camera is identified by its RTP SSRC once video flows.
+
+        Returns the active slot after the toggle ("cam1"/"cam2"), or None
+        if the new camera's SSRC hasn't been seen yet.
+        """
+        if not self._config:
+            raise RuntimeError("Not configured")
+        await self.async_start_video(auto_timeout=True, by_user=True)
+        return self._active_camera_slot
+
     def _on_push_event(self, event: PushEvent) -> None:
         """Dispatch a push event to all registered callbacks."""
         for cb in list(self._push_callbacks):
@@ -466,6 +580,13 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 _LOGGER.info("Video session ready in %.1fs", time.monotonic() - t0)
                 if self._rtsp_server and session.rtp_receiver:
                     session.rtp_receiver.attach_backchannel_queue(self._rtsp_server.backchannel_queue)
+                if session.rtp_receiver is not None:
+                    # The readiness gate awaited the first video NAL, so the
+                    # SSRC is already known — seed the slot tracking now and
+                    # keep the hook for mid-session changes.
+                    session.rtp_receiver.on_video_ssrc = self._on_video_ssrc
+                    if session.rtp_receiver.video_ssrc is not None:
+                        self._on_video_ssrc(session.rtp_receiver.video_ssrc)
                 self._video_session = session
                 self._video_ready_event.set()
                 # Unblock PLAY handlers that have been waiting inside the RTSP
@@ -655,6 +776,10 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
 
             if self._rtsp_server and session.rtp_receiver:
                 session.rtp_receiver.attach_backchannel_queue(self._rtsp_server.backchannel_queue)
+            if session.rtp_receiver is not None:
+                session.rtp_receiver.on_video_ssrc = self._on_video_ssrc
+                if session.rtp_receiver.video_ssrc is not None:
+                    self._on_video_ssrc(session.rtp_receiver.video_ssrc)
             self._video_session = session
             self._video_ready_event.set()
             if self._rtsp_server:

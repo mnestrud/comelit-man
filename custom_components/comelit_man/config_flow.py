@@ -15,7 +15,18 @@ if TYPE_CHECKING:
 
 from .auth import authenticate
 from .client import IconaBridgeClient
-from .const import CONF_CREATE_USER, CONF_ENABLE_NOTIFICATIONS, CONF_HTTP_PORT, DEFAULT_HTTP_PORT, DEFAULT_PORT, DOMAIN
+from .const import (
+    CONF_CAMERA_LABEL_1,
+    CONF_CAMERA_LABEL_2,
+    CONF_CREATE_USER,
+    CONF_ENABLE_NOTIFICATIONS,
+    CONF_HTTP_PORT,
+    DEFAULT_CAMERA_LABEL_1,
+    DEFAULT_CAMERA_LABEL_2,
+    DEFAULT_HTTP_PORT,
+    DEFAULT_PORT,
+    DOMAIN,
+)
 from .exceptions import (
     AuthenticationError,
 )
@@ -335,7 +346,15 @@ class ComelitLocalOptionsFlow(config_entries.OptionsFlowWithReload):
             return self.async_create_entry(title="", data=user_input)
 
         current = self._config_entry.options.get(CONF_ENABLE_NOTIFICATIONS, True)
+        label_1 = self._config_entry.options.get(CONF_CAMERA_LABEL_1) or DEFAULT_CAMERA_LABEL_1
+        label_2 = self._config_entry.options.get(CONF_CAMERA_LABEL_2) or DEFAULT_CAMERA_LABEL_2
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema({vol.Required(CONF_ENABLE_NOTIFICATIONS, default=current): bool}),
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_ENABLE_NOTIFICATIONS, default=current): bool,
+                    vol.Optional(CONF_CAMERA_LABEL_1, default=label_1): str,
+                    vol.Optional(CONF_CAMERA_LABEL_2, default=label_2): str,
+                }
+            ),
         )

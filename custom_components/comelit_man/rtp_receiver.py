@@ -9,10 +9,11 @@ import logging
 import secrets
 import struct
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable
 
 from .protocol import HEADER_SIZE, ICONA_BRIDGE_PORT
 
@@ -120,6 +121,14 @@ class RtpReceiver:
         # Latest decoded JPEG frame
         self._latest_frame: bytes | None = None
         self._frame_event = asyncio.Event()
+
+        # Video SSRC tracking (RTP header bytes 8-11 of video packets).
+        # The entrance panel alternates between two physical cameras across
+        # successive calls; each camera encodes with its own SSRC, so the
+        # SSRC identifies which camera is currently streaming. Set by the
+        # coordinator to get notified when the value changes.
+        self.video_ssrc: int | None = None
+        self.on_video_ssrc: Callable[[int], None] | None = None
 
         self._running = False
         self._control_seq = 0
@@ -427,6 +436,17 @@ class RtpReceiver:
         # we pass it through so downstream gets the device's native pacing
         # instead of our invented timeline.
         rtp_ts = struct.unpack_from("!I", rtp, 4)[0]
+
+        # Video SSRC (bytes 8-11, big-endian). The panel's two physical
+        # cameras stream with distinct SSRCs, so a change here means the
+        # entrance panel switched camera (selector relay advanced).
+        if len(rtp) >= 12:
+            ssrc = struct.unpack_from("!I", rtp, 8)[0]
+            if ssrc != self.video_ssrc:
+                self.video_ssrc = ssrc
+                if self.on_video_ssrc is not None:
+                    with contextlib.suppress(Exception):
+                        self.on_video_ssrc(ssrc)
 
         nal_data = rtp[12:]  # Skip 12-byte RTP header
         if not nal_data:

@@ -29,6 +29,7 @@ PLATFORMS = [
     Platform.EVENT,
     Platform.IMAGE,
     Platform.LOCK,
+    Platform.SELECT,
     Platform.SENSOR,
 ]
 
