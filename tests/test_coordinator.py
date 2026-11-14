@@ -2150,3 +2150,123 @@ class TestHaManagedGo2rtc:
         got_session, url = get_go2rtc(MagicMock(data={DATA_GO2RTC: MagicMock(session=None)}), "fallback")
         assert got_session == "fallback"
         assert url == LEGACY_API_URL
+
+
+class TestOpenEntrance:
+    """v2 open_entrance choreography: route the selector, then fire the door."""
+
+    def _prepare(self, *, slot="cam1", session_active=True, doors=None, labels=True):
+        from custom_components.comelit_man import coordinator as coord_mod
+
+        coord = _make_coordinator(with_client=True)
+        if labels:
+            coord.config_entry.options = {
+                "enable_notifications": True,
+                "camera_1_label": "Urbanización",
+                "camera_2_label": "Casa",
+            }
+        session = MagicMock()
+        session.active = session_active
+        coord._video_session = session
+        coord._active_camera_slot = slot
+        coord._config.doors = doors if doors is not None else [MagicMock()]
+        coord.async_start_video = AsyncMock()
+        coord.async_stop_video = AsyncMock()
+        coord.async_toggle_camera_selection = AsyncMock(
+            side_effect=lambda: coord._active_camera_slot  # unchanged by default
+        )
+        coord.async_open_door = AsyncMock()
+        coord._poll_patch = patch.object(coord_mod, "CAMERA_WAIT_POLL", 0.01)
+        coord._timeout_patch = patch.object(coord_mod, "CAMERA_SWITCH_TIMEOUT", 0.05)
+        coord._poll_patch.start()
+        coord._timeout_patch.start()
+        return coord
+
+    @pytest.mark.asyncio
+    async def test_unknown_label_raises(self):
+        coord = self._prepare()
+        with pytest.raises(RuntimeError, match="Unknown entrance label"):
+            await coord.async_open_entrance("Despensa")
+        coord.async_open_door.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_not_connected_raises(self):
+        coord = self._prepare()
+        coord._client = None
+        with pytest.raises(RuntimeError, match="Not connected"):
+            await coord.async_open_entrance("Urbanización")
+
+    @pytest.mark.asyncio
+    async def test_already_routed_opens_directly(self):
+        coord = self._prepare(slot="cam1")
+        await coord.async_open_entrance("Urbanización")
+        coord.async_start_video.assert_not_awaited()
+        coord.async_toggle_camera_selection.assert_not_awaited()
+        coord.async_open_door.assert_awaited_once_with(coord._config.doors[0])
+
+    @pytest.mark.asyncio
+    async def test_starts_video_when_no_session(self):
+        coord = self._prepare(session_active=False)
+        # Start brings the session up and the first SSRC lands on cam1.
+        coord.async_start_video.side_effect = lambda **kw: setattr(
+            coord, "_active_camera_slot", "cam1"
+        )
+        await coord.async_open_entrance("Urbanización")
+        coord.async_start_video.assert_awaited_once()
+        coord.async_toggle_camera_selection.assert_not_awaited()
+        coord.async_open_door.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_switches_once_when_wrong_camera(self):
+        coord = self._prepare(slot="cam2")
+        coord.async_toggle_camera_selection.side_effect = lambda: setattr(
+            coord, "_active_camera_slot", "cam1"
+        )
+        await coord.async_open_entrance("Urbanización")
+        coord.async_toggle_camera_selection.assert_awaited_once()
+        coord.async_open_door.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_stuck_selector_raises_without_opening(self):
+        coord = self._prepare(slot="cam2")
+        with pytest.raises(RuntimeError, match="did not reach"):
+            await coord.async_open_entrance("Urbanización")
+        coord.async_open_door.assert_not_awaited()
+        assert coord.async_toggle_camera_selection.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_stop_after_ends_session(self):
+        coord = self._prepare(slot="cam2")
+        coord.async_toggle_camera_selection.side_effect = lambda: setattr(
+            coord, "_active_camera_slot", "cam1"
+        )
+        await coord.async_open_entrance("Urbanización", stop_after=True)
+        coord.async_stop_video.assert_awaited_once()
+        coord.async_open_door.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_session_and_no_video_raises(self):
+        coord = self._prepare(session_active=False, slot=None)
+        coord.async_start_video.side_effect = None  # slot stays None
+        with pytest.raises(RuntimeError, match="did not start streaming"):
+            await coord.async_open_entrance("Urbanización")
+        coord.async_open_door.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_doors_raises(self):
+        coord = self._prepare(slot="cam1", doors=[])
+        with pytest.raises(RuntimeError, match="No doors"):
+            await coord.async_open_entrance("Urbanización")
+
+    @pytest.mark.asyncio
+    async def test_matching_door_selected_by_label(self):
+        casa_door = MagicMock()
+        casa_door.name = "Puerta casa"
+        urban_door = MagicMock()
+        urban_door.name = "Portón urbanización"
+        coord = self._prepare(slot="cam1", doors=[urban_door, casa_door])
+        coord.async_toggle_camera_selection.side_effect = lambda: setattr(
+            coord, "_active_camera_slot", "cam2"
+        )
+        await coord.async_open_entrance("Casa")
+        coord.async_open_door.assert_awaited_once_with(casa_door)

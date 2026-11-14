@@ -56,6 +56,11 @@ MISSED_CALL_WINDOW = 45.0
 # Hardware settling cooldown between video sessions (seconds).
 RELAY_SETTLE_COOLDOWN = 1.5
 
+# open_entrance choreography: how long to wait for the (new) camera's first
+# video SSRC after a start/toggle, and how often to poll the active slot.
+CAMERA_SWITCH_TIMEOUT = 12.0
+CAMERA_WAIT_POLL = 0.25
+
 
 def _assign_camera_slot(seen: dict[int, str], active: str | None, ssrc: int) -> str:
     """Map a video SSRC to a camera slot ("cam1"/"cam2").
@@ -464,6 +469,94 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             await self.async_stop_video()
         await self.async_start_video(auto_timeout=True, by_user=True, force_restart=True)
         return self._active_camera_slot
+
+    async def _wait_for_active_camera_slot(
+        self,
+        target: str | None = None,
+        timeout: float = CAMERA_SWITCH_TIMEOUT,
+    ) -> str | None:
+        """Wait for the active camera slot to be known (and match target if given).
+
+        The slot is assigned by _on_video_ssrc when the first video packet of
+        the (new) session arrives. With ``target`` set, resolves only when the
+        routed camera matches; returns None on timeout.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            slot = self._active_camera_slot
+            if slot is not None and (target is None or slot == target):
+                return slot
+            await asyncio.sleep(CAMERA_WAIT_POLL)
+        return self._active_camera_slot if target is None else None
+
+    async def async_open_entrance(self, label: str, *, stop_after: bool = False) -> None:
+        """Open the door routed to the entrance identified by a camera label.
+
+        v2 choreography — make sure the panel's physical selector relay routes
+        the requested camera/door pair before firing the door relay, so "abrir
+        urbanización" can never strike the wrong door:
+
+        1. Resolve ``label`` to a camera slot via the configured labels.
+        2. Ensure a video session is running and its camera is identified.
+        3. While the active slot differs from the target: advance the selector
+           (one stop + force-restart call = one relay click) and wait for the
+           new camera's SSRC. Bounded to 3 advances (two slots + margin) so a
+           misbehaving panel cannot hammer the relay.
+        4. Fire the door relay on the active call (0x1840/0x000D when video is
+           flowing; the standard open path otherwise).
+        5. ``stop_after`` ends the session; by default it stays on (its own
+           120 s timeout applies) so you can keep watching the entrance.
+        """
+        if not self._config or not self._client:
+            raise RuntimeError("Not connected")
+        target = self.slot_for_label(label)
+        if target is None:
+            raise RuntimeError(f"Unknown entrance label: {label!r}")
+
+        session = self._video_session
+        if session is None or not session.active:
+            await self.async_start_video(auto_timeout=True, by_user=True)
+            if await self._wait_for_active_camera_slot(timeout=CAMERA_SWITCH_TIMEOUT) is None:
+                raise RuntimeError(
+                    "Camera did not start streaming — cannot determine the active entrance"
+                )
+
+        for attempt in range(3):
+            if self._active_camera_slot == target:
+                break
+            _LOGGER.info(
+                "open_entrance: advancing selector towards %s (attempt %d, active=%s)",
+                label,
+                attempt + 1,
+                self._active_camera_slot,
+            )
+            await self.async_toggle_camera_selection()
+            if await self._wait_for_active_camera_slot(target=target) is not None:
+                break
+        else:
+            raise RuntimeError(
+                f"Selector did not reach {label!r} — active camera is {self._active_camera_slot}"
+            )
+
+        doors = self._config.doors
+        if not doors:
+            raise RuntimeError("No doors configured on the panel")
+        door = doors[0]
+        if len(doors) > 1:
+            matches = [d for d in doors if label.lower() in (d.name or "").lower()]
+            if matches:
+                door = matches[0]
+            else:
+                _LOGGER.warning(
+                    "open_entrance: %d doors and none named %r — opening the first",
+                    len(doors),
+                    label,
+                )
+        await self.async_open_door(door)
+        _LOGGER.info("open_entrance: door relay fired for %r (camera %s)", label, target)
+
+        if stop_after:
+            await self.async_stop_video()
 
     def _on_push_event(self, event: PushEvent) -> None:
         """Dispatch a push event to all registered callbacks."""

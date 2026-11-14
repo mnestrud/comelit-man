@@ -170,5 +170,25 @@
       "title": "Authentication failed",
       "description": "Comelit Man cannot connect to {name} — the token is invalid or expired. Go to Settings → Integrations → Comelit Man and choose Re-authenticate."
     }
+  },
+  "services": {
+    "open_entrance": {
+      "name": "Open entrance",
+      "description": "Make sure the entrance panel's camera/door selector routes the requested destination, then fire the door relay.",
+      "fields": {
+        "label": {
+          "name": "Destination",
+          "description": "Camera label identifying the destination (one of the camera selector options)."
+        },
+        "stop_after": {
+          "name": "Stop video after",
+          "description": "End the video session right after the door relay fires."
+        },
+        "config_entry_id": {
+          "name": "Config entry",
+          "description": "Target a specific Comelit entry when several are configured."
+        }
+      }
+    }
   }
 }

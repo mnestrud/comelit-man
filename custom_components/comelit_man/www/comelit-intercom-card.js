@@ -12,6 +12,15 @@
  *      camera_entity: camera.comelit_intercom_live_feed
  *      start_entity: button.comelit_intercom_start_video   # optional
  *      stop_entity:  button.comelit_intercom_stop_video_feed
+ *
+ *   Optional quick-open chips (v2): a row of buttons under the video, one per
+ *   destination. Each chip calls the comelit_man.open_entrance service, which
+ *   routes the panel's camera/door selector to that camera and fires the door
+ *   relay (starting the video session first if needed). With select_entity
+ *   set, the chip whose label matches the selector's current option is
+ *   highlighted.
+ *      open_options: ["Urbanización", "Casa"]
+ *      select_entity: select.comelit_intercom_camera_selector   # optional
  */
 class ComelitIntercomCard extends HTMLElement {
   constructor() {
@@ -30,6 +39,7 @@ class ComelitIntercomCard extends HTMLElement {
     this._startRequested = false;
     this._liveCard = null;
     this._onLocationChanged = null;
+    this._pendingChip = null;
     this.attachShadow({ mode: "open" });
   }
 
@@ -70,6 +80,7 @@ class ComelitIntercomCard extends HTMLElement {
     }
     // Populate the thumbnail once on first render so the idle view isn't blank.
     if (firstSync && !nowStreaming) this._refreshThumbnail();
+    this._syncChips();
   }
 
   connectedCallback() {
@@ -101,6 +112,8 @@ class ComelitIntercomCard extends HTMLElement {
       camera_entity: "camera.comelit_intercom_live_feed",
       start_entity: "button.comelit_intercom_start_video",
       stop_entity: "button.comelit_intercom_stop_video_feed",
+      select_entity: "select.comelit_intercom_camera_selector",
+      open_options: ["Camera 1", "Camera 2"],
     };
   }
 
@@ -190,6 +203,31 @@ class ComelitIntercomCard extends HTMLElement {
         }
         .stop-btn:hover { background: rgba(180, 0, 0, 0.75); }
         .stop-btn svg { fill: #fff; width: 16px; height: 16px; }
+
+        /* Quick-open chips (v2) — one button per destination */
+        .chips {
+          display: none; /* shown when open_options is configured */
+          gap: 8px;
+          flex-wrap: wrap;
+          padding: 8px 10px;
+        }
+        .chip {
+          padding: 6px 14px;
+          border-radius: 18px;
+          border: none;
+          background: rgba(0, 0, 0, 0.55);
+          color: #fff;
+          font-size: 13px;
+          font-weight: 500;
+          cursor: pointer;
+          transition: background 0.15s, opacity 0.15s;
+        }
+        .chip:hover { background: rgba(0, 0, 0, 0.8); }
+        .chip.active { background: var(--primary-color, #03a9f4); }
+        .chip.pending {
+          opacity: 0.6;
+          pointer-events: none;
+        }
       </style>
 
       <ha-card>
@@ -212,6 +250,9 @@ class ComelitIntercomCard extends HTMLElement {
           </button>
           <div id="stream-slot"></div>
         </div>
+
+        <!-- Quick-open chips (populated from open_options, if configured) -->
+        <div class="chips" id="chips"></div>
       </ha-card>
     `;
 
@@ -222,6 +263,60 @@ class ComelitIntercomCard extends HTMLElement {
       e.stopPropagation();
       this._requestStop();
     });
+    this._renderChips();
+  }
+
+  // -------------------------------------------------------------------------
+  // Quick-open chips (v2)
+  // -------------------------------------------------------------------------
+
+  _renderChips() {
+    const container = this.shadowRoot.getElementById("chips");
+    if (!container) return;
+    container.innerHTML = "";
+    const options = Array.isArray(this._config?.open_options)
+      ? this._config.open_options
+      : [];
+    if (!options.length) return;
+    container.style.display = "flex";
+    for (const option of options) {
+      const btn = document.createElement("button");
+      btn.className = "chip";
+      btn.textContent = option;
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this._openEntrance(option, btn);
+      });
+      container.appendChild(btn);
+    }
+    this._syncChips();
+  }
+
+  _syncChips() {
+    if (!this._hass) return;
+    const container = this.shadowRoot.getElementById("chips");
+    if (!container) return;
+    const selectState = this._config?.select_entity
+      ? this._hass.states[this._config.select_entity]?.state
+      : null;
+    for (const btn of container.querySelectorAll(".chip")) {
+      btn.classList.toggle("active", !!selectState && btn.textContent === selectState);
+    }
+  }
+
+  async _openEntrance(option, btn) {
+    if (!this._hass || this._pendingChip) return;
+    this._pendingChip = option;
+    if (btn) btn.classList.add("pending");
+    try {
+      await this._hass.callService("comelit_man", "open_entrance", { label: option });
+    } catch (err) {
+      console.error(`comelit-intercom-card: open_entrance('${option}') failed`, err);
+    } finally {
+      this._pendingChip = null;
+      if (btn) btn.classList.remove("pending");
+      this._syncChips();
+    }
   }
 
   // -------------------------------------------------------------------------
