@@ -39,6 +39,7 @@ def _make_config() -> DeviceConfig:
 def _make_coordinator(*, with_client: bool = False) -> ComelitLocalCoordinator:
     """Create a coordinator with all HA dependencies mocked out."""
     hass = MagicMock()
+    hass.data = {}  # no HA-managed go2rtc by default → legacy fallback path
     coordinator = ComelitLocalCoordinator.__new__(ComelitLocalCoordinator)
     coordinator.hass = hass
     coordinator.host = "127.0.0.1"
@@ -75,6 +76,8 @@ def _make_coordinator(*, with_client: bool = False) -> ComelitLocalCoordinator:
     coordinator._camera_ssrc = None
     coordinator._active_camera_slot = None
     coordinator._camera_slot_mono = None
+    coordinator._last_video_stop_mono = 0.0
+    coordinator._auto_restart_timestamps = []
     coordinator._keepalive_task = None
     coordinator._connection_lost = False
     coordinator._ctpp_init_ts = 0
@@ -1946,7 +1949,7 @@ class TestToggleCameraSelection:
         coord.async_start_video = AsyncMock(return_value=None)
         coord._active_camera_slot = "cam2"
         result = await coord.async_toggle_camera_selection()
-        coord.async_start_video.assert_awaited_once_with(auto_timeout=True, by_user=True)
+        coord.async_start_video.assert_awaited_once_with(auto_timeout=True, by_user=True, force_restart=True)
         assert result == "cam2"
 
     @pytest.mark.asyncio
@@ -1973,3 +1976,177 @@ class TestCameraLabels:
         assert coord.camera_labels() == {"cam1": "Urbanización", "cam2": "Casa"}
         assert coord.slot_for_label("Casa") == "cam2"
         assert coord.slot_for_label("unknown") is None
+
+
+class TestVideoStartGuards:
+    """Duplicate-start guard + force_restart (camera selector toggle)."""
+
+    @pytest.mark.asyncio
+    async def test_start_video_returns_active_session_without_restart(self):
+        coord = _make_coordinator(with_client=True)
+        coord._video_start_lock = asyncio.Lock()
+        session = MagicMock()
+        session.active = True
+        coord._video_session = session
+        result = await coord.async_start_video()
+        assert result is session
+
+    @pytest.mark.asyncio
+    async def test_start_video_proceeds_when_session_inactive(self):
+        coord = _make_coordinator()
+        coord._video_start_lock = asyncio.Lock()
+        session = MagicMock()
+        session.active = False
+        coord._video_session = session
+        with pytest.raises(RuntimeError, match="Not connected"):
+            await coord.async_start_video()
+
+    @pytest.mark.asyncio
+    async def test_start_video_force_restart_bypasses_active_guard(self):
+        coord = _make_coordinator()
+        coord._video_start_lock = asyncio.Lock()
+        session = MagicMock()
+        session.active = True
+        coord._video_session = session
+        with pytest.raises(RuntimeError, match="Not connected"):
+            await coord.async_start_video(force_restart=True)
+
+    @pytest.mark.asyncio
+    async def test_toggle_stops_active_session_first(self):
+        coord = _make_ssrc_coordinator()
+        session = MagicMock()
+        coord._video_session = session
+        coord.async_stop_video = AsyncMock()
+        coord.async_start_video = AsyncMock()
+        await coord.async_toggle_camera_selection()
+        coord.async_stop_video.assert_awaited_once()
+        coord.async_start_video.assert_awaited_once_with(auto_timeout=True, by_user=True, force_restart=True)
+
+    @pytest.mark.asyncio
+    async def test_stop_video_records_settle_timestamp(self):
+        coord = _make_ssrc_coordinator()
+        session = MagicMock()
+        session.stop = AsyncMock()
+        coord._video_session = session
+        coord._rtsp_server = None
+        coord._pending_inbound_ring = None
+        coord._on_stop_video = {}
+        coord._video_start_lock = asyncio.Lock()
+        coord._ensure_vip_listener = AsyncMock()
+        coord._notify_video_state_change = AsyncMock()
+        await coord.async_stop_video()
+        assert coord._last_video_stop_mono > 0
+
+    @pytest.mark.asyncio
+    async def test_start_video_enforces_settle_cooldown(self):
+        import time as time_mod
+
+        coord = _make_coordinator(with_client=True)
+        coord._video_start_lock = asyncio.Lock()
+        coord._last_video_stop_mono = time_mod.monotonic()  # stopped just now
+        coord._vip_listener = None
+        mock_session = MagicMock()
+        mock_session.start = AsyncMock()
+        with (
+            patch("custom_components.comelit_man.coordinator.VideoCallSession", return_value=mock_session),
+            patch("custom_components.comelit_man.coordinator.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            await coord.async_start_video()
+        mock_sleep.assert_awaited()
+
+
+class TestAutoRestartRateLimit:
+    @pytest.mark.asyncio
+    async def test_rate_limit_stops_after_three_restarts_in_60s(self):
+        import time as time_mod
+
+        coord = _make_coordinator()
+        now = time_mod.monotonic()
+        coord._auto_restart_timestamps = [now - 5, now - 10, now - 20]
+        coord.async_stop_video = AsyncMock()
+        await coord._auto_restart_video()
+        coord.async_stop_video.assert_awaited_once()
+        assert len(coord._auto_restart_timestamps) == 3  # nothing appended
+
+    @pytest.mark.asyncio
+    async def test_restart_appends_timestamp_when_allowed(self):
+        coord = _make_coordinator(with_client=True)
+        coord._rtsp_server = MagicMock()
+        coord._rtsp_server.client_count = 1
+        before = len(coord._auto_restart_timestamps)
+        mock_session = MagicMock()
+        mock_session.start = AsyncMock()
+        with patch("custom_components.comelit_man.coordinator.VideoCallSession", return_value=mock_session):
+            await coord._auto_restart_video()
+        assert len(coord._auto_restart_timestamps) == before + 1
+
+    @pytest.mark.asyncio
+    async def test_old_timestamps_do_not_count(self):
+        import time as time_mod
+
+        coord = _make_coordinator()
+        now = time_mod.monotonic()
+        coord._auto_restart_timestamps = [now - 61, now - 70, now - 80]
+        coord._rtsp_server = MagicMock()
+        coord._rtsp_server.client_count = 0  # no watchers → clean stop path
+        coord.async_stop_video = AsyncMock()
+        await coord._auto_restart_video()
+        coord.async_stop_video.assert_awaited_once()  # from the no-watcher path
+        assert len(coord._auto_restart_timestamps) == 0  # expired ones pruned
+
+
+class TestHaManagedGo2rtc:
+    """get_go2rtc prefers HA's managed instance (unix socket + auth)."""
+
+    @pytest.mark.asyncio
+    async def test_register_uses_ha_managed_session_and_url(self):
+        from custom_components.comelit_man.go2rtc_helper import DATA_GO2RTC
+
+        coord = _make_coordinator()
+        coord._rtsp_url = "rtsp://127.0.0.1:8557/intercom"
+        unix_session = MagicMock()
+        resp = MagicMock()
+        resp.status = 200
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+        unix_session.put = MagicMock(return_value=resp)
+        unix_session.put.assert_not_called()  # sanity
+        coord.hass.data = {
+            DATA_GO2RTC: MagicMock(session=unix_session, url="http://unix:/tmp/go2rtc.sock:"),
+        }
+
+        with patch(
+            "custom_components.comelit_man.coordinator.async_get_clientsession",
+            return_value=MagicMock(),
+        ):
+            await coord._register_go2rtc_stream()
+
+        unix_session.put.assert_called_once()
+        url = unix_session.put.call_args.args[0]
+        assert url.startswith("http://unix:/tmp/go2rtc.sock:")
+
+    @pytest.mark.asyncio
+    async def test_get_go2rtc_falls_back_without_config(self):
+        from custom_components.comelit_man.go2rtc_helper import LEGACY_API_URL, get_go2rtc
+
+        session = MagicMock()
+        got_session, url = get_go2rtc(MagicMock(data={}), session)
+        assert got_session is session
+        assert url == LEGACY_API_URL
+
+    @pytest.mark.asyncio
+    async def test_get_go2rtc_prefers_managed_config(self):
+        from custom_components.comelit_man.go2rtc_helper import DATA_GO2RTC, get_go2rtc
+
+        managed = MagicMock(session="s1", url="http://unix:/run/g2/")
+        got_session, url = get_go2rtc(MagicMock(data={DATA_GO2RTC: managed}), "fallback")
+        assert got_session == "s1"
+        assert url == "http://unix:/run/g2"
+
+    @pytest.mark.asyncio
+    async def test_get_go2rtc_ignores_config_without_session(self):
+        from custom_components.comelit_man.go2rtc_helper import DATA_GO2RTC, LEGACY_API_URL, get_go2rtc
+
+        got_session, url = get_go2rtc(MagicMock(data={DATA_GO2RTC: MagicMock(session=None)}), "fallback")
+        assert got_session == "fallback"
+        assert url == LEGACY_API_URL

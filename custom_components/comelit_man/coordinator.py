@@ -53,6 +53,8 @@ RING_DEDUP_WINDOW = 120.0
 # A device 0x1840/0x0000 (idle) counts as a missed call only when it follows
 # a ring this recently; otherwise it is video-teardown / CTPP-init tail.
 MISSED_CALL_WINDOW = 45.0
+# Hardware settling cooldown between video sessions (seconds).
+RELAY_SETTLE_COOLDOWN = 1.5
 
 
 def _assign_camera_slot(seen: dict[int, str], active: str | None, ssrc: int) -> str:
@@ -171,6 +173,8 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         self._camera_ssrc: int | None = None
         self._active_camera_slot: str | None = None
         self._camera_slot_mono: float | None = None  # last slot change (monotonic)
+        self._last_video_stop_mono: float = 0.0  # hardware settling timestamp
+        self._auto_restart_timestamps: list[float] = []  # rate-limit auto-restarts
 
     @property
     def device_config(self) -> DeviceConfig | None:
@@ -456,7 +460,9 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         """
         if not self._config:
             raise RuntimeError("Not configured")
-        await self.async_start_video(auto_timeout=True, by_user=True)
+        if self._video_session is not None:
+            await self.async_stop_video()
+        await self.async_start_video(auto_timeout=True, by_user=True, force_restart=True)
         return self._active_camera_slot
 
     def _on_push_event(self, event: PushEvent) -> None:
@@ -493,7 +499,12 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                     self.config_entry.async_start_reauth(self.hass)
                 raise
 
-    async def async_start_video(self, auto_timeout: bool = True, by_user: bool = False) -> VideoCallSession:
+    async def async_start_video(
+        self,
+        auto_timeout: bool = True,
+        by_user: bool = False,
+        force_restart: bool = False,
+    ) -> VideoCallSession:
         """Start a video call session.
 
         Concurrent calls are dropped — the device can only negotiate one
@@ -508,6 +519,8 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                      since stopped video (prevents a stale async_create_task
                      from overriding a user stop and causing an infinite
                      go2rtc reconnect loop).
+            force_restart: Force tearing down and recreating an active session
+                           (used by camera selector toggle).
         """
         if not self._config:
             raise RuntimeError("Not configured")
@@ -518,7 +531,17 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 return self._video_session
             raise RuntimeError("Video start already in progress")
 
+        # If video is already streaming and active, do not tear it down and restart.
+        # Starting a second session when one is already flowing causes the physical
+        # entrance panel relay to cycle unnecessarily and desynchronizes video.
+        if not force_restart and self._video_session is not None and self._video_session.active:
+            _LOGGER.info("Video session already active and flowing — skipping duplicate start")
+            return self._video_session
+
         async with self._video_start_lock:
+            if not force_restart and self._video_session is not None and self._video_session.active:
+                return self._video_session
+
             if not self._client:
                 raise RuntimeError("Not connected")
 
@@ -544,6 +567,13 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
 
             self._video_stopped_by_user = False
             await self.async_stop_video()
+
+            # Enforce hardware settling cooldown so the physical relay doesn't get hammered
+            elapsed = time.monotonic() - self._last_video_stop_mono
+            if elapsed < RELAY_SETTLE_COOLDOWN:
+                wait_time = RELAY_SETTLE_COOLDOWN - elapsed
+                _LOGGER.debug("Hardware relay settling cooldown: waiting %.2fs", wait_time)
+                await asyncio.sleep(wait_time)
 
             # Pause the VIP listener task so it doesn't consume CTPP messages
             # meant for the video session. The CTPP channel itself stays open
@@ -627,11 +657,22 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         RuntimeError from that path is caught here to avoid HA logging an
         unhandled task exception for a normal, expected situation.
         """
+        now = time.monotonic()
+        self._auto_restart_timestamps = [t for t in self._auto_restart_timestamps if now - t < 60.0]
+        if len(self._auto_restart_timestamps) >= 3:
+            _LOGGER.warning(
+                "Auto-restart suppressed: 3 restarts occurred within 60s. "
+                "Stopping video session to protect hardware relay."
+            )
+            await self.async_stop_video()
+            return
+
         watchers = self._rtsp_server.client_count if self._rtsp_server else 0
         if watchers == 0:
             _LOGGER.info("Video session ended with no viewers — not restarting")
             await self.async_stop_video()
             return
+        self._auto_restart_timestamps.append(now)
         try:
             await self.async_start_video()
         except RuntimeError as err:
@@ -996,6 +1037,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 _LOGGER.exception("Error in stop-video callback")
 
         await session.stop(reason="user stopped")
+        self._last_video_stop_mono = time.monotonic()
         # Block future PLAYs until the next session is ready, and
         # kick any remaining RTSP clients (e.g. go2rtc) so they
         # reconnect fresh against a stream that already has video.

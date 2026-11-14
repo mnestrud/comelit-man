@@ -417,6 +417,7 @@ class _FakeWs:
 def _wire_hass(cam):
     """Give the entity a hass whose background tasks actually run."""
     hass = MagicMock()
+    hass.data = {}  # no HA-managed go2rtc → legacy fallback (patched session used)
     hass.async_create_background_task = lambda coro, name: asyncio.get_event_loop().create_task(coro)
     cam.hass = hass
     return hass
@@ -592,3 +593,30 @@ class TestWebRtcSignaling:
         await asyncio.sleep(0.05)
         assert ws.closed
         assert "sess7" not in camera._webrtc_sessions
+
+
+class TestWebRtcHaManagedGo2rtc:
+    """async_handle_async_webrtc_offer prefers HA's managed go2rtc session."""
+
+    @pytest.mark.asyncio
+    async def test_offer_uses_managed_unix_session(self):
+        from custom_components.comelit_man.go2rtc_helper import DATA_GO2RTC
+
+        camera = ComelitIntercomCamera(MagicMock(), "entry_x")
+        _wire_hass(camera)
+        unix_ws = _FakeWs([])
+        unix_session = _session_with_ws(unix_ws)
+        camera.hass.data = {
+            DATA_GO2RTC: MagicMock(session=unix_session, url="http://unix:/tmp/go2rtc.sock:"),
+        }
+
+        sent = []
+        with patch("custom_components.comelit_man.camera.async_get_clientsession", return_value=MagicMock()):
+            await camera.async_handle_async_webrtc_offer("v=0\r\noffer", "sess_u", sent.append)
+        await asyncio.sleep(0)
+
+        # The patched legacy session is irrelevant — the unix session is used.
+        camera.close_webrtc_session("sess_u")
+        await asyncio.sleep(0)
+        assert "sess_u" not in camera._webrtc_sessions
+        camera._webrtc_sessions.clear()

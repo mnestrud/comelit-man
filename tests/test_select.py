@@ -18,6 +18,8 @@ def _make_selector(
     coordinator = MagicMock()
     coordinator.camera_labels.return_value = labels or {"cam1": "Camera 1", "cam2": "Camera 2"}
     coordinator.active_camera_slot = active_slot
+    # Default: no label resolves (tests set explicit mappings when needed).
+    coordinator.slot_for_label.return_value = None
     coordinator.async_toggle_camera_selection = AsyncMock(return_value=active_slot)
     coordinator.camera_ssrc = 0x11111111
     coordinator.camera_slot_map = {0x11111111: "cam1"}
@@ -45,12 +47,14 @@ class TestSelectOption:
     @pytest.mark.asyncio
     async def test_selecting_other_option_toggles(self):
         select, coordinator = _make_selector(labels={"cam1": "A", "cam2": "B"}, active_slot="cam1")
+        coordinator.slot_for_label.return_value = "cam2"
         await select.async_select_option("B")
         coordinator.async_toggle_camera_selection.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_selecting_current_option_is_noop(self):
         select, coordinator = _make_selector(labels={"cam1": "A", "cam2": "B"}, active_slot="cam1")
+        coordinator.slot_for_label.return_value = "cam1"
         await select.async_select_option("A")
         coordinator.async_toggle_camera_selection.assert_not_awaited()
 
@@ -64,6 +68,7 @@ class TestSelectOption:
     async def test_selecting_when_state_unknown_toggles(self):
         """With no known active camera, any choice advances the selector."""
         select, coordinator = _make_selector(active_slot=None)
+        coordinator.slot_for_label.return_value = "cam1"
         await select.async_select_option("A")
         coordinator.async_toggle_camera_selection.assert_awaited_once()
 
@@ -84,6 +89,7 @@ class TestStateCallback:
         coordinator.add_video_state_change_callback.return_value = MagicMock()
         select.hass = MagicMock()
         select.async_write_ha_state = MagicMock()
+        select.coordinator_context = MagicMock()
 
         await select.async_added_to_hass()
 
@@ -97,6 +103,7 @@ class TestStateCallback:
         coordinator.add_video_state_change_callback.return_value = remover
         select.hass = MagicMock()
         select.async_write_ha_state = MagicMock()
+        select.coordinator_context = MagicMock()
         await select.async_added_to_hass()
 
         await select.async_will_remove_from_hass()

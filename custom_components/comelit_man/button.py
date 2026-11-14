@@ -119,6 +119,11 @@ class ComelitStartVideoButton(ComelitEntity, ButtonEntity):
         try:
             await self.coordinator.async_start_video(by_user=True)
             _LOGGER.debug("Video ready in %.1fs", time.monotonic() - t0)
+        except RuntimeError as err:
+            if "already in progress" in str(err) or "already active" in str(err):
+                _LOGGER.info("Intercom video start ignored: %s", err)
+                return
+            _LOGGER.exception("Failed to start intercom video after %.1fs", time.monotonic() - t0)
         except Exception:
             _LOGGER.exception("Failed to start intercom video after %.1fs", time.monotonic() - t0)
 
@@ -202,5 +207,10 @@ class ComelitSwitchCameraButton(ComelitEntity, ButtonEntity):
                 _LOGGER.info("Selector toggled — camera identification pending first video frame")
             else:
                 _LOGGER.info("Selector toggled — active camera is now %s", slot)
+        except RuntimeError as err:
+            if "already in progress" in str(err):
+                _LOGGER.info("Camera switch ignored: %s", err)
+                return
+            _LOGGER.exception("Failed to switch entrance camera/door")
         except Exception:
             _LOGGER.exception("Failed to switch entrance camera/door")
