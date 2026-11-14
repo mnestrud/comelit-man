@@ -268,6 +268,12 @@ ACTION_HANGUP = 0x002D  # '-' = hangup
 ACTION_DOOR_OPEN = 0x000D  # door open on active video CTPP channel (PCAP-verified)
 ACTION_CALL_ACCEPTED = 0x0002  # device→app on outbound; app→device on inbound answer
 ACTION_RTPC2_READY = 0x0003  # sent by app after RTPC2 opens on inbound answer (PCAP-verified)
+ACTION_CALL_RELEASE = 0x000E  # app→device end-call on the active CTPP channel
+ACTION_STOP_MEDIA = 0x0011  # stop audio/video media on the active call
+# Control ids the official app uses in stop-media messages (PCAP constants,
+# byte-verified in test_switch_cam.py end_call()).
+MEDIA_CTRL_AUDIO = 8009
+MEDIA_CTRL_VIDEO = 8010
 
 
 def _build_ctpp_video_msg(
@@ -524,6 +530,70 @@ def encode_door_open_during_video(
     buf += b"\xff\xff\xff\xff"
     buf += our_b
     buf += entr_b
+    return bytes(buf)
+
+
+def encode_call_release(
+    our_addr: str,
+    entrance_addr: str,
+    call_counter: int,
+) -> bytes:
+    """Encode RELEASE / end-call from our side on the active video CTPP channel.
+
+    Byte-verified against test_switch_cam.py ``end_call()`` (mk_tap framing):
+
+      [LE16 0x1840] [LE32 counter] [BE16 plen=3] [00 0E 00] [pad 1]
+      [4x 0xFF] [dst = our_addr x10] [src = entrance_addr x10]
+
+    Without this message the device keeps the call alive in its state
+    machine; the next call then gets CALL_END'ed after ~2 s and every
+    inline re-establishment runs a fresh call_init, advancing the
+    physical camera/door selector relay.
+    """
+    buf = bytearray()
+    buf += struct.pack("<H", 0x1840)
+    buf += struct.pack("<I", call_counter)
+    buf += struct.pack(">H", 3)  # payload length
+    buf += struct.pack(">H", ACTION_CALL_RELEASE)  # 00 0E
+    buf += b"\x00"  # action terminator
+    buf += b"\x00"  # pad payload to a 4-byte multiple
+    buf += b"\xff\xff\xff\xff"
+    buf += our_addr.encode("ascii").ljust(10, b"\x00")[:10]
+    buf += entrance_addr.encode("ascii").ljust(10, b"\x00")[:10]
+    return bytes(buf)
+
+
+def encode_stop_media_during_video(
+    our_addr: str,
+    entrance_addr: str,
+    call_counter: int,
+    *,
+    video: bool,
+) -> bytes:
+    """Encode stop-audio / stop-video on the active video CTPP channel.
+
+    Byte-verified against test_switch_cam.py ``end_call()``:
+
+      audio: [LE16 0x1840] [LE32 counter] [BE16 plen=10]
+             [00 11] [98 02] [LE32 0] [LE16 8009]
+      video: [LE16 0x1860] [LE32 counter] [BE16 plen=10]
+             [00 11] [94 02] [LE32 0] [LE16 8010]
+
+    Trailer matches mk_tap: separator + dst (our addr) + src (entrance).
+    """
+    buf = bytearray()
+    buf += struct.pack("<H", 0x1860 if video else 0x1840)
+    buf += struct.pack("<I", call_counter)
+    buf += struct.pack(">H", 10)  # payload length
+    buf += struct.pack(">H", ACTION_STOP_MEDIA)  # 00 11
+    buf += bytes((0x94, 0x02) if video else (0x98, 0x02))
+    buf += struct.pack("<I", 0)
+    buf += struct.pack("<H", MEDIA_CTRL_VIDEO if video else MEDIA_CTRL_AUDIO)
+    # mk_tap pads the payload to a 4-byte multiple before the separator.
+    buf += b"\x00\x00"
+    buf += b"\xff\xff\xff\xff"
+    buf += our_addr.encode("ascii").ljust(10, b"\x00")[:10]
+    buf += entrance_addr.encode("ascii").ljust(10, b"\x00")[:10]
     return bytes(buf)
 
 

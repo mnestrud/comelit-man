@@ -23,8 +23,10 @@ from .protocol import (
     encode_call_accepted,
     encode_call_ack,
     encode_call_init,
+    encode_call_release,
     encode_call_response_ack,
     encode_door_open_during_video,
+    encode_stop_media_during_video,
     encode_rtpc2_ready,
     encode_rtpc_link,
     encode_video_config,
@@ -37,6 +39,13 @@ _LOGGER = logging.getLogger(__name__)
 VIDEO_RESPONSE_TIMEOUT = 5.0  # device can be slow to respond to CTPP signaling
 VIDEO_SESSION_TIMEOUT = 120.0
 VIDEO_READY_TIMEOUT = 6.0  # max wait for first media packet after signaling
+
+# Minimum spacing between inline re-establishments. The device's lease timer
+# renews roughly every 30 s, so legitimate CALL_ENDs never arrive faster than
+# this. A faster CALL_END means the device is ending a stale/aborted call —
+# re-establishing on each one runs a fresh call_init, which advances the
+# physical camera/door selector relay (heard as repeated relay clicking).
+REESTABLISH_MIN_INTERVAL = 15.0
 
 # CTPP message counter increment constants (from PCAP analysis)
 # Bytes [4-5] in CTPP body encode two independent sub-counters:
@@ -82,6 +91,16 @@ class VideoCallSession:
     # disconnecting the shared client.
     _VIDEO_CHANNEL_NAMES = ("CTPP", "CSPB", "UDPM", "RTPC", "RTPC2", "RTPC_DEVICE", "RTPC_DEVICE_REEST")
 
+    # Defaults for attributes assigned in __init__. Test fixtures build
+    # sessions via __new__ and only set what they exercise, so teardown
+    # and monitor guards must have safe class-level values.
+    _our_addr: str | None = None
+    _peer_addr: str | None = None
+    _is_inbound: bool = False
+    _release_sent: bool = False
+    _last_reestablish_mono: float = 0.0
+    _skipped_call_ends: int = 0
+
     def __init__(
         self,
         client: IconaBridgeClient,
@@ -118,6 +137,18 @@ class VideoCallSession:
         # Protected by _ctpp_lock so concurrent senders don't collide on the wire.
         self._call_counter: int = 0
         self._ctpp_lock: asyncio.Lock = asyncio.Lock()
+        # Addresses used by the protocol teardown (RELEASE / stop media).
+        # Stored by start() (outbound: entrance as peer) and start_inbound()
+        # (inbound: our base address as peer, per PCAP2 message format).
+        self._our_addr: str | None = None
+        self._peer_addr: str | None = None
+        self._is_inbound: bool = False
+        # Set before the teardown messages go out so the CTPP monitor never
+        # re-establishes in response to the device's CALL_END reply.
+        self._release_sent: bool = False
+        # CALL_END flood control (see REESTABLISH_MIN_INTERVAL).
+        self._last_reestablish_mono: float = 0.0
+        self._skipped_call_ends: int = 0
         # Inbound-only: device RTPC placeholder registered during start_inbound().
         # Kept until answer_inbound() waits for it to open.
         self._inbound_device_rtpc: Channel | None = None
@@ -262,6 +293,9 @@ class VideoCallSession:
                     "entrance-address-book is empty — using our_addr as entrance_addr. "
                     "Video call may fail if device requires a distinct entrance address."
                 )
+            self._our_addr = our_addr
+            self._peer_addr = entrance_addr
+            self._is_inbound = False
 
             # Step 1: Open CTPP + CSPB channels (PCAP shows both are needed).
             # CRITICAL: Use ChannelType.UAUT (type=7) for ALL channels — the real
@@ -560,6 +594,57 @@ class VideoCallSession:
         _LOGGER.info("Stopping video call session (%s)", reason)
         await self._cleanup()
 
+    async def _send_teardown_messages(self) -> None:
+        """Best-effort protocol-level call teardown.
+
+        The official app ends a call with three TAP messages (byte-verified
+        in test_switch_cam.py end_call()): RELEASE (0x1840/0x000E), stop-audio
+        (0x1840/0x0011 subtype 0x98) and stop-video (0x1860/0x0011 subtype
+        0x94). Without them the device keeps the call in its state machine;
+        the next call then gets CALL_END'ed after ~2 s and every inline
+        re-establishment runs a fresh call_init — advancing the physical
+        camera/door selector relay (heard as the relay clicking every 2-3 s).
+
+        Only outbound sessions release: for a passive inbound call the ring
+        must keep reaching other stations, and the device ends those calls
+        itself when the visitor hangs up.
+        """
+        if self._release_sent or self._is_inbound:
+            return
+        if not self._our_addr or not self._peer_addr or self._call_counter == 0:
+            return
+        client = self._client
+        ctpp = client.get_channel("CTPP") if client is not None else None
+        if ctpp is None or not ctpp.is_open:
+            return
+        self._release_sent = True
+        try:
+            async with self._ctpp_lock:
+                self._call_counter = (self._call_counter + _CTR_INCR_BYTE4) & 0xFFFFFFFF
+                await client.send_binary(
+                    ctpp,
+                    encode_call_release(self._our_addr, self._peer_addr, self._call_counter),
+                )
+                self._call_counter = (self._call_counter + _CTR_INCR_BYTE4) & 0xFFFFFFFF
+                await client.send_binary(
+                    ctpp,
+                    encode_stop_media_during_video(
+                        self._our_addr, self._peer_addr, self._call_counter, video=False
+                    ),
+                )
+                self._call_counter = (self._call_counter + _CTR_INCR_BYTE4) & 0xFFFFFFFF
+                await client.send_binary(
+                    ctpp,
+                    encode_stop_media_during_video(
+                        self._our_addr, self._peer_addr, self._call_counter, video=True
+                    ),
+                )
+            _LOGGER.info("Call teardown sent (RELEASE + stop audio + stop video)")
+        except Exception:
+            # Never block teardown on a dead connection — the release is
+            # best-effort; the device drops the call on its own timer.
+            _LOGGER.debug("Call teardown messages could not be sent", exc_info=True)
+
     async def _cleanup(self) -> None:
         """Clean up all resources.
 
@@ -570,6 +655,15 @@ class VideoCallSession:
         self._active = False
         self._inbound_device_rtpc = None
         self._answer_handoff = None
+
+        # Protocol teardown FIRST, while the CTPP channel is still open and
+        # before the monitor task is cancelled. _active is already False and
+        # _release_sent is set inside, so the monitor ignores any CALL_END
+        # the device sends in reply. Bounded: a dead socket must not stall
+        # the whole cleanup (see the 2 s task-cancel timeouts below).
+        with contextlib.suppress(Exception, TimeoutError):
+            async with asyncio.timeout(3.0):
+                await self._send_teardown_messages()
 
         for task_attr in ("_timeout_task", "_tcp_task", "_ctpp_task"):
             task = getattr(self, task_attr)
@@ -664,6 +758,39 @@ class VideoCallSession:
                 if msg_type == 0x1840:
                     if action == 0x0003:
                         # CALL_END (sub=0x0000 = timer, sub=0x000E = door-open triggered)
+                        if not self._active or self._release_sent:
+                            # Teardown in progress (or already released): the
+                            # device's CALL_END acknowledges our RELEASE.
+                            # Re-establishing now would start a new call and
+                            # advance the physical selector relay.
+                            _LOGGER.debug(
+                                "CTPP monitor: CALL_END (sub=0x%04X) ignored — session released/ending",
+                                sub,
+                            )
+                            continue
+                        now = time.monotonic()
+                        if now - self._last_reestablish_mono < REESTABLISH_MIN_INTERVAL:
+                            self._skipped_call_ends += 1
+                            _LOGGER.debug(
+                                "CTPP monitor: CALL_END (sub=0x%04X) only %.1fs since last "
+                                "re-establish — treating as stale-call END (skip %d)",
+                                sub,
+                                now - self._last_reestablish_mono,
+                                self._skipped_call_ends,
+                            )
+                            if self._skipped_call_ends >= 3:
+                                _LOGGER.warning(
+                                    "CTPP monitor: 3 CALL_ENDs within %.0fs — device insists "
+                                    "the call is over; ending session instead of re-establishing",
+                                    REESTABLISH_MIN_INTERVAL,
+                                )
+                                self._active = False
+                                if self._on_call_end:
+                                    self._on_call_end()
+                                return
+                            continue
+                        self._skipped_call_ends = 0
+                        self._last_reestablish_mono = now
                         _LOGGER.debug(
                             "CTPP monitor: CALL_END received (sub=0x%04X) — re-establishing",
                             sub,
@@ -941,6 +1068,9 @@ class VideoCallSession:
             our_addr = f"{apt_addr}{apt_sub}"
             # All inbound CTPP messages use our_base_addr as callee (PCAP2-verified).
             our_base_addr = apt_addr
+            self._our_addr = our_addr
+            self._peer_addr = our_base_addr
+            self._is_inbound = True
 
             # Derive fresh_ts from ring_ts via device's proprietary transform (PCAP2-verified).
             _rb = bytearray(struct.pack("<I", ring_ts))
