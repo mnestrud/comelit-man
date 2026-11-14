@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -136,7 +137,10 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         await _init_resource(hass, url, str(version))
         _LOGGER.info("Comelit card registered at %s", url)
     hass.services.async_register(
-        DOMAIN, "open_entrance", _async_handle_open_entrance, schema=OPEN_ENTRANCE_SCHEMA
+        DOMAIN,
+        "open_entrance",
+        partial(_async_handle_open_entrance, hass),
+        schema=OPEN_ENTRANCE_SCHEMA,
     )
     return True
 
