@@ -1370,23 +1370,22 @@ class VideoCallSession:
             _LOGGER.debug("TCP inbound media router error", exc_info=True)
 
     async def async_open_door_on_ctpp(self, our_addr: str, entrance_addr: str, relay_index: int) -> None:
-        """Open a door by sending 0x1840/0x000D on the active video CTPP channel.
+        """Open a door by sending the byte-verified strike on the active video CTPP channel.
 
-        PCAP-verified: the Android app sends this single message on the existing
-        video CTPP channel — no separate channel open, no 6-step sequence.
-        The device ACKs with 0x1800/0x0000 and the relay activates.
+        Byte-verified against test_switch_cam.py ("DOOR OPEN ON CAM2"): a
+        single 0x1840/0x00A0 TAP with token 0 on the existing video channel —
+        no separate channel open, no 6-step sequence. (The earlier
+        0x1840/0x000D variant never struck the relay in field tests.)
         """
         ctpp = self._client.get_channel("CTPP")
         if ctpp is None or not self._active:
             raise RuntimeError("No active video CTPP channel")
         async with self._ctpp_lock:
-            self._call_counter += _CTR_INCR_BYTE4
-            payload = encode_door_open_during_video(our_addr, entrance_addr, self._call_counter, relay_index)
+            payload = encode_door_open_during_video(our_addr, entrance_addr, relay_index)
             await self._client.send_binary(ctpp, payload)
         _LOGGER.info(
-            "Door open sent on video CTPP (relay=%d, counter=0x%08X)",
+            "Door open sent on video CTPP (relay=%d)",
             relay_index,
-            self._call_counter,
         )
 
     async def _auto_timeout_loop(self) -> None:

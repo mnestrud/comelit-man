@@ -265,7 +265,7 @@ ACTION_VIDEO_CONFIG = 0x001A
 ACTION_PEER = 0x0070  # "accept call" / peer (answer sequence msg 1)
 ACTION_CONFIG_ACK = 0x000E  # supplemental config ACK (answer sequence msg 2)
 ACTION_HANGUP = 0x002D  # '-' = hangup
-ACTION_DOOR_OPEN = 0x000D  # door open on active video CTPP channel (PCAP-verified)
+ACTION_DOOR_OPEN = 0x00A0  # door strike on the active video CTPP channel (byte-verified in test_switch_cam.py)
 ACTION_CALL_ACCEPTED = 0x0002  # device→app on outbound; app→device on inbound answer
 ACTION_RTPC2_READY = 0x0003  # sent by app after RTPC2 opens on inbound answer (PCAP-verified)
 ACTION_CALL_RELEASE = 0x000E  # app→device end-call on the active CTPP channel
@@ -501,35 +501,33 @@ def encode_call_accepted(caller: str, callee: str, timestamp: int) -> bytes:
 def encode_door_open_during_video(
     our_addr: str,
     entrance_addr: str,
-    call_counter: int,
     relay_index: int,
 ) -> bytes:
-    """Encode a door open command for use on an active video CTPP channel.
+    """Encode the door strike sent on the active video CTPP channel.
 
-    PCAP-verified (camera_feed_with_open_door_local.pcap): during video the
-    Android app sends a SINGLE 0x1840/0x000D message on the existing video
-    CTPP channel — no separate channel open, no 6-step sequence.
+    Byte-verified against test_switch_cam.py ("DOOR OPEN ON CAM2", mk_tap
+    framing) — the sequence that actually fired the strike in a live call:
 
-    Body structure (48 bytes):
-      [LE16 0x1840] [LE32 counter] [BE16 0x000D] [BE16 0x002D]
-      [entrance_addr padded to 10] [LE32 relay_index] [4x 0xFF]
-      [our_addr padded to 10] [entrance_addr padded to 10]
+      [LE16 0x1840] [LE32 token = 0] [BE16 plen = 10]
+      [BE16 0x00A0] [LE16 relay_index] [2x 0x00] [LE32 0x0E10] [pad 2]
+      [4x 0xFF] [dst = our_addr x10] [src = entrance_addr x10]
 
-    relay_index: the door's output_index from the device config (PCAP shows 1
-    for the only door on that device; use door.output_index for our device).
+    (The earlier 0x1840/0x000D variant came from a PCAP but never opened
+    the door in field tests — replaced by this byte-verified sequence.)
     """
-    our_b = our_addr.encode("ascii").ljust(10, b"\x00")[:10]
-    entr_b = entrance_addr.encode("ascii").ljust(10, b"\x00")[:10]
     buf = bytearray()
     buf += struct.pack("<H", 0x1840)
-    buf += struct.pack("<I", call_counter)
-    buf += struct.pack(">H", ACTION_DOOR_OPEN)
-    buf += struct.pack(">H", 0x002D)
-    buf += entr_b
-    buf += struct.pack("<I", relay_index)
+    buf += struct.pack("<I", 0)  # token: verified as zero for the strike
+    buf += struct.pack(">H", 10)  # payload length
+    buf += struct.pack(">H", ACTION_DOOR_OPEN)  # 00 A0
+    buf += struct.pack("<H", relay_index)
+    buf += b"\x00\x00"
+    buf += struct.pack("<I", 0x0E10)  # strike hold value seen in the app trace
+    # mk_tap pads the payload to a 4-byte multiple before the separator.
+    buf += b"\x00\x00"
     buf += b"\xff\xff\xff\xff"
-    buf += our_b
-    buf += entr_b
+    buf += our_addr.encode("ascii").ljust(10, b"\x00")[:10]
+    buf += entrance_addr.encode("ascii").ljust(10, b"\x00")[:10]
     return bytes(buf)
 
 

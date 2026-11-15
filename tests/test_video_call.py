@@ -686,14 +686,18 @@ class TestAsyncOpenDoorOnCtpp:
 
     @pytest.mark.asyncio
     async def test_happy_path_sends_door_open(self):
-        """Happy path: sends door-open payload and increments counter."""
+        """Happy path: sends the byte-verified strike payload (token 0, no counter bump)."""
         session = self._make_session()
         session._client.get_channel = MagicMock(return_value=MagicMock())
 
         await session.async_open_door_on_ctpp("SB0000061", "SB100001", 0)
 
         session._client.send_binary.assert_called_once()
-        assert session._call_counter == 0x10000000 + _CTR_INCR_BYTE4
+        payload = session._client.send_binary.call_args[0][1]
+        assert struct.unpack_from("<H", payload, 0)[0] == 0x1840
+        assert struct.unpack_from(">H", payload, 8)[0] == 0x00A0
+        # The strike uses token 0 — the call counter stays untouched.
+        assert session._call_counter == 0x10000000
 
     @pytest.mark.asyncio
     async def test_raises_when_ctpp_none(self):

@@ -87,26 +87,45 @@ class TestEncodeDoorDuringVideo:
         result = encode_door_open_during_video(
             our_addr="SB000006",
             entrance_addr="SB100001",
-            call_counter=0x00010101,
             relay_index=1,
         )
         assert isinstance(result, bytes)
 
-    def test_starts_with_1840(self):
-        result = encode_door_open_during_video("SB000006", "SB100001", 0, 1)
-        msg_type = struct.unpack_from("<H", result, 0)[0]
-        assert msg_type == 0x1840
+    def test_starts_with_1840_and_zero_token(self):
+        result = encode_door_open_during_video("SB000006", "SB100001", 1)
+        assert struct.unpack_from("<H", result, 0)[0] == 0x1840
+        assert struct.unpack_from("<I", result, 2)[0] == 0
+        assert struct.unpack_from(">H", result, 6)[0] == 10  # payload length
 
-    def test_relay_index_encoded(self):
-        result = encode_door_open_during_video("SB000006", "SB100001", 0, 5)
-        # buf layout: 0x1840(2) + counter(4) + ACTION(2) + 0x002D(2) + entr_b(10) = 20
-        relay = struct.unpack_from("<I", result, 20)[0]
-        assert relay == 5
+    def test_action_and_relay_in_payload(self):
+        result = encode_door_open_during_video("SB000006", "SB100001", 5)
+        assert struct.unpack_from(">H", result, 8)[0] == 0x00A0
+        assert struct.unpack_from("<H", result, 10)[0] == 5
+        assert struct.unpack_from("<I", result, 14)[0] == 0x0E10
 
-    def test_addresses_present_in_payload(self):
-        result = encode_door_open_during_video("SB000006", "SB100001", 0, 1)
-        assert b"SB000006" in result
-        assert b"SB100001" in result
+    def test_addresses_in_trailer(self):
+        result = encode_door_open_during_video("SB000006", "SB100001", 1)
+        # trailer: 4x FF at 20..24, dst (our) 24..34, src (entrance) 34..44
+        assert result[20:24] == b"\xff\xff\xff\xff"
+        assert result[24:34] == b"SB000006\x00\x00"
+        assert result[34:44] == b"SB100001\x00\x00"
+
+    def test_byte_matches_test_switch_cam_reference(self):
+        """Byte-exact vs the mk_tap sequence that opened the door in a live call."""
+        expected = (
+            struct.pack("<H", 0x1840)
+            + struct.pack("<I", 0)
+            + struct.pack(">H", 10)
+            + struct.pack(">H", 0x00A0)
+            + struct.pack("<H", 1)
+            + b"\x00\x00"
+            + struct.pack("<I", 0x0E10)
+            + b"\x00\x00"  # payload padding
+            + b"\xff\xff\xff\xff"
+            + b"SB000006".ljust(10, b"\x00")
+            + b"SB100001".ljust(10, b"\x00")
+        )
+        assert encode_door_open_during_video("SB000006", "SB100001", 1) == expected
 
 
 class TestDecodeRtpHeader:
