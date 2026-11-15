@@ -387,30 +387,22 @@ class TestCallbackRegistration:
 
 class TestAsyncOpenDoor:
     @pytest.mark.asyncio
-    async def test_always_delegates_to_open_door(self):
-        """async_open_door always delegates to door.open_door — even with a video session active.
-
-        The door sequence (OPEN + CONFIRM → door_init → OPEN + CONFIRM) is the
-        field-proven one; door.open_door reuses the video session's CTPP channel
-        when the feed is active. The old during-video 0x1840 tap never opened
-        anything and is gone.
-        """
+    async def test_video_active_delegates_to_session(self):
+        """With the feed active, door open uses the PCAP in-call sequence."""
         coord = _make_coordinator(with_client=True)
         door = MagicMock()
         door.output_index = 0
+        door.apt_address = "SB100001"
 
         session = MagicMock()
         session.active = True
+        session.async_open_door_on_call = AsyncMock()
         coord._video_session = session
+        coord._config.apt_address = "SB000006"
 
-        with patch(
-            "custom_components.comelit_man.coordinator.open_door",
-            new_callable=AsyncMock,
-        ) as mock_open_door:
-            await coord.async_open_door(door)
+        await coord.async_open_door(door)
 
-        mock_open_door.assert_awaited_once_with(coord.host, coord.port, coord.token, coord._client, coord._config, door)
-        session.async_open_door_on_ctpp.assert_not_called()
+        session.async_open_door_on_call.assert_awaited_once_with("SB000006", "SB100001", 0)
 
     @pytest.mark.asyncio
     async def test_uses_open_door_when_no_video_session(self):

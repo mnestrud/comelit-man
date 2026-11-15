@@ -569,15 +569,22 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
     async def async_open_door(self, door: Door) -> None:
         """Open a door.
 
-        door.open_door() reuses whatever CTPP channel is already open — the
-        VIP listener's (notifications ON) or the video session's (feed
-        active) — and runs the field-proven OPEN + CONFIRM → door_init →
-        OPEN + CONFIRM sequence on it; with no channel open it opens a
-        transient one first. (The old special during-video 0x1840 tap never
-        opened anything in field tests and is gone.)
+        Two paths:
+
+        1. Video active — two OPEN_DOOR (0x1800) on the video CTPP channel
+           with the session's live call counter as token (PCAP-verified
+           official-app behaviour; no CONFIRM, no door_init mid-call).
+        2. No video — door.open_door(): reuses the VIP listener's CTPP
+           channel when open (fast path) or opens a transient one, and runs
+           the proven OPEN + CONFIRM → door_init → OPEN + CONFIRM sequence.
         """
         if not self._config or not self._client:
             raise RuntimeError("Not connected")
+        if self._video_session and self._video_session.active:
+            await self._video_session.async_open_door_on_call(
+                self._config.apt_address, door.apt_address, door.output_index
+            )
+            return
         try:
             await open_door(self.host, self.port, self.token, self._client, self._config, door)
         except DoorOpenError as err:

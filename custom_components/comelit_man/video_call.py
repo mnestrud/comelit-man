@@ -19,12 +19,14 @@ from .ctpp import ctpp_init_sequence
 from .exceptions import VideoCallError
 from .models import DeviceConfig
 from .protocol import (
+    MessageType,
     encode_answer_peer,
     encode_call_accepted,
     encode_call_ack,
     encode_call_init,
     encode_call_release,
     encode_call_response_ack,
+    encode_open_door,
     encode_stop_media_during_video,
     encode_rtpc2_ready,
     encode_rtpc_link,
@@ -1367,6 +1369,41 @@ class VideoCallSession:
             pass
         except Exception:
             _LOGGER.debug("TCP inbound media router error", exc_info=True)
+
+    async def async_open_door_on_call(
+        self,
+        apt_address: str,
+        door_apt_address: str,
+        output_index: int,
+    ) -> None:
+        """Open a door during the active video call (PCAP-verified sequence).
+
+        The official app, mid-call, sends two OPEN_DOOR (0x1800) messages on
+        the video CTPP channel with the session's call counter as token,
+        advanced by _CTR_INCR_BYTE5 between them — no CONFIRM, no door_init.
+        A fixed token is silently ignored by the panel while a call is up.
+        """
+        ctpp = self._client.get_channel("CTPP")
+        if ctpp is None or not self._active:
+            raise RuntimeError("No active video CTPP channel")
+        async with self._ctpp_lock:
+            for _ in range(2):
+                await self._client.send_binary(
+                    ctpp,
+                    encode_open_door(
+                        MessageType.OPEN_DOOR,
+                        apt_address,
+                        output_index,
+                        door_apt_address,
+                        counter=self._call_counter,
+                    ),
+                )
+                self._call_counter += _CTR_INCR_BYTE5
+        _LOGGER.info(
+            "Door open sent on video CTPP (relay=%d, counter=0x%08X)",
+            output_index,
+            self._call_counter,
+        )
 
     async def _auto_timeout_loop(self) -> None:
         """Automatically stop the session after VIDEO_SESSION_TIMEOUT."""

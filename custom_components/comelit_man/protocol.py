@@ -188,12 +188,22 @@ def encode_open_door(
     apt_address: str,
     output_index: int,
     door_apt_address: str,
+    counter: int | None = None,
 ) -> bytes:
-    """Encode an OPEN_DOOR or OPEN_DOOR_CONFIRM message (Phase B/D)."""
+    """Encode an OPEN_DOOR or OPEN_DOOR_CONFIRM message (Phase B/D).
+
+    ``counter``: when given, the 4-byte token carries the session's call
+    counter (PCAP-verified: during a video call the official app sends
+    OPEN_DOOR with the live call counter as token — a fixed token is
+    silently ignored by the panel mid-call).
+    """
     buf = bytearray()
     buf += struct.pack("<H", msg_type)
-    buf += bytes([0x5C, 0x8B])
-    buf += bytes([0x2C, 0x74, 0x00, 0x00])
+    if counter is not None:
+        buf += struct.pack("<I", counter)
+        buf += b"\x00\x00"
+    else:
+        buf += bytes([0x5C, 0x8B, 0x2C, 0x74, 0x00, 0x00])
     buf += bytes([0xFF, 0xFF, 0xFF, 0xFF])
     buf += _null_terminated(f"{apt_address}{output_index}")
     buf += _null_terminated(door_apt_address)

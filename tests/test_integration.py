@@ -430,7 +430,6 @@ async def test_video_then_door_open():
     from custom_components.comelit_man.auth import authenticate
     from custom_components.comelit_man.client import IconaBridgeClient
     from custom_components.comelit_man.config_reader import get_device_config
-    from custom_components.comelit_man.door import open_door as open_door_sequence
     from custom_components.comelit_man.rtsp_server import LocalRtspServer
     from custom_components.comelit_man.video_call import VideoCallSession
 
@@ -462,10 +461,10 @@ async def test_video_then_door_open():
                 pre_frames.append(payload)
         print(f"\n{len(pre_frames)} video frames before door open")
 
-        # Open the door on the already-open video CTPP channel (fast path)
+        # Open the door on the active video CTPP channel (PCAP in-call sequence)
         door = config.doors[0]
         print(f"Opening door '{door.name}' (output_index={door.output_index}) on CTPP")
-        await open_door_sequence(COMELIT_HOST, client.port, COMELIT_TOKEN, client, config, door)
+        await session.async_open_door_on_call(config.apt_address, door.apt_address, door.output_index)
         print(f"Door sequence sent — {door.name} triggered")
         print("Checking video continues...")
 

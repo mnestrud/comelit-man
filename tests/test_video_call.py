@@ -667,7 +667,76 @@ class TestInlineReestablish:
 
 
 # ---------------------------------------------------------------------------
-# Group A — _auto_timeout_loop
+# Group A — async_open_door_on_call (PCAP in-call door sequence)
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncOpenDoorOnCall:
+    """Tests for async_open_door_on_call — two OPEN_DOOR with the live counter."""
+
+    def _make_session(self, counter=0x526F5817):
+        session = VideoCallSession.__new__(VideoCallSession)
+        session._active = True
+        session._call_counter = counter
+        session._ctpp_lock = asyncio.Lock()
+        mock_client = MagicMock()
+        mock_client.send_binary = AsyncMock()
+        session._client = mock_client
+        return session
+
+    @pytest.mark.asyncio
+    async def test_sends_two_open_doors_with_live_counter(self):
+        """Byte-exact vs the PCAP: two 0x1800, counter advanced by BYTE5 between them."""
+        session = self._make_session(counter=0x526F5817)
+        session._client.get_channel = MagicMock(return_value=MagicMock())
+
+        await session.async_open_door_on_call("SB000003", "SB100001", 1)
+
+        assert session._client.send_binary.await_count == 2
+        first = session._client.send_binary.await_args_list[0].args[1]
+        second = session._client.send_binary.await_args_list[1].args[1]
+        # PCAP reference (during-call OPEN): 00 18 17 58 6f 52 00 00 ff ff ff ff
+        #   + "SB0000031\0" + "SB100001\0\0"
+        expected_first = (
+            struct.pack("<H", 0x1800)
+            + struct.pack("<I", 0x526F5817)
+            + b"\x00\x00"
+            + b"\xff\xff\xff\xff"
+            + b"SB0000031\x00"
+            + b"SB100001\x00\x00"
+        )
+        assert first == expected_first
+        assert struct.unpack_from("<I", second, 2)[0] == 0x536F5817  # + _CTR_INCR_BYTE5
+
+    @pytest.mark.asyncio
+    async def test_counter_advanced_after_send(self):
+        session = self._make_session(counter=0x10000000)
+        session._client.get_channel = MagicMock(return_value=MagicMock())
+
+        await session.async_open_door_on_call("SB000003", "SB100001", 1)
+
+        assert session._call_counter == 0x10000000 + 2 * _CTR_INCR_BYTE5
+
+    @pytest.mark.asyncio
+    async def test_raises_when_ctpp_none(self):
+        session = self._make_session()
+        session._client.get_channel = MagicMock(return_value=None)
+
+        with pytest.raises(RuntimeError, match="No active video CTPP channel"):
+            await session.async_open_door_on_call("SB000003", "SB100001", 1)
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_active(self):
+        session = self._make_session()
+        session._active = False
+        session._client.get_channel = MagicMock(return_value=MagicMock())
+
+        with pytest.raises(RuntimeError, match="No active video CTPP channel"):
+            await session.async_open_door_on_call("SB000003", "SB100001", 1)
+
+
+# ---------------------------------------------------------------------------
+# Group B — _auto_timeout_loop
 # ---------------------------------------------------------------------------
 
 
