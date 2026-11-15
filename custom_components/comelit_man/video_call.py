@@ -25,7 +25,6 @@ from .protocol import (
     encode_call_init,
     encode_call_release,
     encode_call_response_ack,
-    encode_door_open_during_video,
     encode_stop_media_during_video,
     encode_rtpc2_ready,
     encode_rtpc_link,
@@ -1368,25 +1367,6 @@ class VideoCallSession:
             pass
         except Exception:
             _LOGGER.debug("TCP inbound media router error", exc_info=True)
-
-    async def async_open_door_on_ctpp(self, our_addr: str, entrance_addr: str, relay_index: int) -> None:
-        """Open a door by sending the byte-verified strike on the active video CTPP channel.
-
-        Byte-verified against test_switch_cam.py ("DOOR OPEN ON CAM2"): a
-        single 0x1840/0x00A0 TAP with token 0 on the existing video channel —
-        no separate channel open, no 6-step sequence. (The earlier
-        0x1840/0x000D variant never struck the relay in field tests.)
-        """
-        ctpp = self._client.get_channel("CTPP")
-        if ctpp is None or not self._active:
-            raise RuntimeError("No active video CTPP channel")
-        async with self._ctpp_lock:
-            payload = encode_door_open_during_video(our_addr, entrance_addr, relay_index)
-            await self._client.send_binary(ctpp, payload)
-        _LOGGER.info(
-            "Door open sent on video CTPP (relay=%d)",
-            relay_index,
-        )
 
     async def _auto_timeout_loop(self) -> None:
         """Automatically stop the session after VIDEO_SESSION_TIMEOUT."""

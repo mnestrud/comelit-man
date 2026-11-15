@@ -667,60 +667,7 @@ class TestInlineReestablish:
 
 
 # ---------------------------------------------------------------------------
-# Group A — async_open_door_on_ctpp
-# ---------------------------------------------------------------------------
-
-
-class TestAsyncOpenDoorOnCtpp:
-    """Tests for async_open_door_on_ctpp — door open on the active video CTPP."""
-
-    def _make_session(self) -> VideoCallSession:
-        session = VideoCallSession.__new__(VideoCallSession)
-        session._active = True
-        session._call_counter = 0x10000000
-        session._ctpp_lock = asyncio.Lock()
-        mock_client = MagicMock()
-        mock_client.send_binary = AsyncMock()
-        session._client = mock_client
-        return session
-
-    @pytest.mark.asyncio
-    async def test_happy_path_sends_door_open(self):
-        """Happy path: sends the byte-verified strike payload (token 0, no counter bump)."""
-        session = self._make_session()
-        session._client.get_channel = MagicMock(return_value=MagicMock())
-
-        await session.async_open_door_on_ctpp("SB0000061", "SB100001", 0)
-
-        session._client.send_binary.assert_called_once()
-        payload = session._client.send_binary.call_args[0][1]
-        assert struct.unpack_from("<H", payload, 0)[0] == 0x1840
-        assert struct.unpack_from(">H", payload, 8)[0] == 0x00A0
-        # The strike uses token 0 — the call counter stays untouched.
-        assert session._call_counter == 0x10000000
-
-    @pytest.mark.asyncio
-    async def test_raises_when_ctpp_none(self):
-        """Raises RuntimeError when CTPP channel is not open."""
-        session = self._make_session()
-        session._client.get_channel = MagicMock(return_value=None)
-
-        with pytest.raises(RuntimeError, match="No active video CTPP channel"):
-            await session.async_open_door_on_ctpp("SB0000061", "SB100001", 0)
-
-    @pytest.mark.asyncio
-    async def test_raises_when_not_active(self):
-        """Raises RuntimeError when the session is not active."""
-        session = self._make_session()
-        session._active = False
-        session._client.get_channel = MagicMock(return_value=MagicMock())
-
-        with pytest.raises(RuntimeError, match="No active video CTPP channel"):
-            await session.async_open_door_on_ctpp("SB0000061", "SB100001", 0)
-
-
-# ---------------------------------------------------------------------------
-# Group B — _auto_timeout_loop
+# Group A — _auto_timeout_loop
 # ---------------------------------------------------------------------------
 
 

@@ -7,8 +7,10 @@ Per-door sequence:
     regular door:  OPEN + CONFIRM  →  door_init + drain 2 resps  →  OPEN + CONFIRM
     actuator:      actuator_init + drain 2 resps  →  actuator_open + actuator_confirm
 
-The during-call door-open path lives in video_call.py (single 0x1840/0x000D
-message on the video CTPP channel) and is NOT used here.
+Reuses whatever CTPP channel is already open (VIP listener / active video
+session); opens a transient one when none is. The old special during-video
+0x1840 tap (video_call.async_open_door_on_ctpp) never opened anything in
+field tests and has been removed.
 """
 
 from __future__ import annotations

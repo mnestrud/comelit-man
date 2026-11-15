@@ -418,9 +418,10 @@ async def test_rtsp_server_streams_video():
 async def test_video_then_door_open():
     """Start video, open a door mid-stream, verify video keeps flowing.
 
-    This exercises the highest-risk code path: async_open_door_on_ctpp
-    sends a 0x1840/0x000D on the live video CTPP channel without
-    interrupting the video session.
+    Uses the field-proven door.open_door() sequence (OPEN + CONFIRM →
+    door_init → OPEN + CONFIRM), which reuses the video session's open
+    CTPP channel. The old during-video 0x1840 tap never opened anything
+    in field tests and is gone.
     Wake the intercom screen before running.
     """
     if not COMELIT_TOKEN:
@@ -429,6 +430,7 @@ async def test_video_then_door_open():
     from custom_components.comelit_man.auth import authenticate
     from custom_components.comelit_man.client import IconaBridgeClient
     from custom_components.comelit_man.config_reader import get_device_config
+    from custom_components.comelit_man.door import open_door as open_door_sequence
     from custom_components.comelit_man.rtsp_server import LocalRtspServer
     from custom_components.comelit_man.video_call import VideoCallSession
 
@@ -460,13 +462,11 @@ async def test_video_then_door_open():
                 pre_frames.append(payload)
         print(f"\n{len(pre_frames)} video frames before door open")
 
-        # Open the door on the active CTPP channel
+        # Open the door on the already-open video CTPP channel (fast path)
         door = config.doors[0]
-        our_addr = f"{config.apt_address}{config.apt_subaddress}"
-        entrance_addr = config.caller_address or our_addr
         print(f"Opening door '{door.name}' (output_index={door.output_index}) on CTPP")
-        await session.async_open_door_on_ctpp(our_addr, entrance_addr, door.output_index)
-        print(f"Device ACKed relay open — {door.name} triggered")
+        await open_door_sequence(COMELIT_HOST, client.port, COMELIT_TOKEN, client, config, door)
+        print(f"Door sequence sent — {door.name} triggered")
         print("Checking video continues...")
 
         # Confirm video keeps flowing after the door open

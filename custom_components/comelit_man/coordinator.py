@@ -569,28 +569,21 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
     async def async_open_door(self, door: Door) -> None:
         """Open a door.
 
-        Three paths depending on what CTPP channel is currently open:
-
-        1. Video active — send a single 0x1840/0x000D on the video CTPP channel
-           (PCAP-verified Android app behaviour; no new channel or 6-step sequence).
-        2. VIP listener has CTPP open (notifications ON, no video) — reuse it,
-           fire OPEN_DOOR + CONFIRM directly (~30ms, no init overhead).
-        3. No CTPP open (notifications OFF) — open a transient CTPP channel,
-           run full init, send commands, close channel.
+        door.open_door() reuses whatever CTPP channel is already open — the
+        VIP listener's (notifications ON) or the video session's (feed
+        active) — and runs the field-proven OPEN + CONFIRM → door_init →
+        OPEN + CONFIRM sequence on it; with no channel open it opens a
+        transient one first. (The old special during-video 0x1840 tap never
+        opened anything in field tests and is gone.)
         """
         if not self._config or not self._client:
             raise RuntimeError("Not connected")
-        if self._video_session and self._video_session.active:
-            our_addr = f"{self._config.apt_address}{self._config.apt_subaddress}"
-            entrance_addr = self._config.caller_address or our_addr
-            await self._video_session.async_open_door_on_ctpp(our_addr, entrance_addr, door.output_index)
-        else:
-            try:
-                await open_door(self.host, self.port, self.token, self._client, self._config, door)
-            except DoorOpenError as err:
-                if isinstance(err.__cause__, AuthenticationError):
-                    self.config_entry.async_start_reauth(self.hass)
-                raise
+        try:
+            await open_door(self.host, self.port, self.token, self._client, self._config, door)
+        except DoorOpenError as err:
+            if isinstance(err.__cause__, AuthenticationError):
+                self.config_entry.async_start_reauth(self.hass)
+            raise
 
     async def async_start_video(
         self,
