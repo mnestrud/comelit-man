@@ -388,21 +388,22 @@ class TestCallbackRegistration:
 class TestAsyncOpenDoor:
     @pytest.mark.asyncio
     async def test_video_active_delegates_to_session(self):
-        """With the feed active, door open uses the PCAP in-call sequence."""
+        """With the feed active, door open uses the upstream 0x1840/0x000D in-call path."""
         coord = _make_coordinator(with_client=True)
         door = MagicMock()
-        door.output_index = 0
-        door.apt_address = "SB100001"
+        door.output_index = 1
 
         session = MagicMock()
         session.active = True
-        session.async_open_door_on_call = AsyncMock()
+        session.async_open_door_on_ctpp = AsyncMock()
         coord._video_session = session
-        coord._config.apt_address = "SB000006"
+        coord._config.apt_address = "SB000003"
+        coord._config.apt_subaddress = 4
+        coord._config.caller_address = "SB100001"
 
         await coord.async_open_door(door)
 
-        session.async_open_door_on_call.assert_awaited_once_with("SB000006", "SB100001", 0)
+        session.async_open_door_on_ctpp.assert_awaited_once_with("SB0000034", "SB100001", 1)
 
     @pytest.mark.asyncio
     async def test_uses_open_door_when_no_video_session(self):

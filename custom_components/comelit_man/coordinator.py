@@ -571,19 +571,19 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
 
         Two paths:
 
-        1. Video active — two OPEN_DOOR (0x1800) on the video CTPP channel
-           with the session's live call counter as token (PCAP-verified
-           official-app behaviour; no CONFIRM, no door_init mid-call).
+        1. Video active — a single 0x1840/0x000D on the video CTPP channel
+           with the live session counter (upstream PROTOCOL.md §6, restored
+           verbatim from 2af72a6 for field testing).
         2. No video — door.open_door(): reuses the VIP listener's CTPP
            channel when open (fast path) or opens a transient one, and runs
-           the proven OPEN + CONFIRM → door_init → OPEN + CONFIRM sequence.
+           the OPEN + CONFIRM → door_init → OPEN + CONFIRM sequence.
         """
         if not self._config or not self._client:
             raise RuntimeError("Not connected")
         if self._video_session and self._video_session.active:
-            await self._video_session.async_open_door_on_call(
-                self._config.apt_address, door.apt_address, door.output_index
-            )
+            our_addr = f"{self._config.apt_address}{self._config.apt_subaddress}"
+            entrance_addr = self._config.caller_address or our_addr
+            await self._video_session.async_open_door_on_ctpp(our_addr, entrance_addr, door.output_index)
             return
         try:
             await open_door(self.host, self.port, self.token, self._client, self._config, door)

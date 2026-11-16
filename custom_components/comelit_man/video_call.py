@@ -19,14 +19,13 @@ from .ctpp import ctpp_init_sequence
 from .exceptions import VideoCallError
 from .models import DeviceConfig
 from .protocol import (
-    MessageType,
     encode_answer_peer,
     encode_call_accepted,
     encode_call_ack,
     encode_call_init,
     encode_call_release,
     encode_call_response_ack,
-    encode_open_door,
+    encode_door_open_during_video,
     encode_stop_media_during_video,
     encode_rtpc2_ready,
     encode_rtpc_link,
@@ -1370,38 +1369,24 @@ class VideoCallSession:
         except Exception:
             _LOGGER.debug("TCP inbound media router error", exc_info=True)
 
-    async def async_open_door_on_call(
-        self,
-        apt_address: str,
-        door_apt_address: str,
-        output_index: int,
-    ) -> None:
-        """Open a door during the active video call (PCAP-verified sequence).
+    async def async_open_door_on_ctpp(self, our_addr: str, entrance_addr: str, relay_index: int) -> None:
+        """Open a door by sending 0x1840/0x000D on the active video CTPP channel.
 
-        The official app, mid-call, sends two OPEN_DOOR (0x1800) messages on
-        the video CTPP channel with the session's call counter as token,
-        advanced by _CTR_INCR_BYTE5 between them — no CONFIRM, no door_init.
-        A fixed token is silently ignored by the panel while a call is up.
+        Upstream PROTOCOL.md §6 (restored verbatim from 2af72a6): the Android
+        app sends this single message on the existing video CTPP channel — no
+        separate channel open, no 6-step sequence. The device ACKs with
+        0x1800/0x0000 and the relay activates.
         """
         ctpp = self._client.get_channel("CTPP")
         if ctpp is None or not self._active:
             raise RuntimeError("No active video CTPP channel")
         async with self._ctpp_lock:
-            for _ in range(2):
-                await self._client.send_binary(
-                    ctpp,
-                    encode_open_door(
-                        MessageType.OPEN_DOOR,
-                        apt_address,
-                        output_index,
-                        door_apt_address,
-                        counter=self._call_counter,
-                    ),
-                )
-                self._call_counter += _CTR_INCR_BYTE5
+            self._call_counter += _CTR_INCR_BYTE4
+            payload = encode_door_open_during_video(our_addr, entrance_addr, self._call_counter, relay_index)
+            await self._client.send_binary(ctpp, payload)
         _LOGGER.info(
             "Door open sent on video CTPP (relay=%d, counter=0x%08X)",
-            output_index,
+            relay_index,
             self._call_counter,
         )
 

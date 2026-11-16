@@ -461,10 +461,12 @@ async def test_video_then_door_open():
                 pre_frames.append(payload)
         print(f"\n{len(pre_frames)} video frames before door open")
 
-        # Open the door on the active video CTPP channel (PCAP in-call sequence)
+        # Open the door on the active video CTPP channel (upstream 0x1840/0x000D)
         door = config.doors[0]
         print(f"Opening door '{door.name}' (output_index={door.output_index}) on CTPP")
-        await session.async_open_door_on_call(config.apt_address, door.apt_address, door.output_index)
+        our_addr = f"{config.apt_address}{config.apt_subaddress}"
+        entrance_addr = config.caller_address or our_addr
+        await session.async_open_door_on_ctpp(our_addr, entrance_addr, door.output_index)
         print(f"Door sequence sent — {door.name} triggered")
         print("Checking video continues...")
 
