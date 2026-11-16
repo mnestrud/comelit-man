@@ -56,6 +56,23 @@ _CTR_INCR_BYTE5 = 0x01000000  # only byte[5] increments
 _CTR_INCR_BOTH = 0x01010000  # both byte[4] and byte[5] increment
 
 
+def _token_from_peer(peer_token: bytes, add_one: bool = True) -> bytes:
+    """Derive our next in-call token from the peer's last token.
+
+    Mirrors the field-verified chain used by the standalone call FSM
+    (test_switch_cam.py, PCAP-corroborated): clear bit7 of byte0, then
+    swap the high bytes — [b0 & 0x7F, b1, b3, b2 (+1)].
+    """
+    return bytes(
+        [
+            peer_token[0] & 0x7F,
+            peer_token[1],
+            peer_token[3],
+            (peer_token[2] + (1 if add_one else 0)) & 0xFF,
+        ]
+    )
+
+
 def _transform_device_ts(dev_ts: int) -> int:
     """Derive our 0x1800 ACK timestamp from the device's message timestamp.
 
@@ -741,7 +758,9 @@ class VideoCallSession:
         - 0x0003 / sub=0x000E: CALL_END triggered by door-open relay activation.
             PCAP-verified (camera_feed_with_open_door_local.pcap): same renewal
             sequence as the periodic CALL_END — NOT a bare ACK.
-        0x1800 device ACKs are silently ignored.
+        Device 0x1800/0x1820 frames are ACKed with the chained-token empty
+        0x1800 (clear bit7 + byte swap) — swallowing them makes the device
+        retransmit and abort (door open never completes).
         """
         try:
             while self._active:
@@ -844,8 +863,33 @@ class VideoCallSession:
                     _LOGGER.debug("CTPP monitor: ACKed 0x1860/0x%04X (transform)", action)
                     if action == 0x0001:  # IN_ALERTING — a ring arrived mid-call
                         self._forward_ring(resp)
-                elif msg_type == 0x1800:
-                    pass  # device ACK — no response needed
+                elif msg_type in (0x1800, 0x1820):
+                    # Device 0x1800/0x1820 mid-call. Observed 2026-11-16
+                    # (restored upstream 0x1840/0x000D door open): after our
+                    # door-open the device sends an empty 0x1800 with its own
+                    # token and RETRANSMITS it every ~100ms until ACKed —
+                    # swallowing it makes the device abort the operation
+                    # (relay never fires). Reply with the FSM's chained-token
+                    # empty 0x1800 (clear bit7 + byte swap, addrs our_full →
+                    # entrance), as the field-verified call FSM does after
+                    # every device frame.
+                    if len(resp) >= 6:
+                        tok = _token_from_peer(resp[2:6], add_one=True)
+                        frame = (
+                            struct.pack("<H", 0x1800)
+                            + tok
+                            + struct.pack(">H", 0)
+                            + b"\xff\xff\xff\xff"
+                            + our_addr.encode("ascii").ljust(10, b"\x00")[:10]
+                            + entrance_addr.encode("ascii").ljust(10, b"\x00")[:10]
+                        )
+                        await client.send_binary(ctpp, frame)
+                        _LOGGER.debug(
+                            "CTPP monitor: ACKed device 0x%04X ts=0x%08X with chained token 0x%08X",
+                            msg_type,
+                            struct.unpack("<I", resp[2:6])[0],
+                            struct.unpack("<I", tok)[0],
+                        )
                 elif msg_type == 0x18C0:
                     # A new ring while this session holds CTPP. Do NOT ACK —
                     # we have no valid counter state for the new call; the

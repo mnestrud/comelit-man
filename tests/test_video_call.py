@@ -226,6 +226,99 @@ class TestCtppMonitorLoop:
         assert session._call_counter == 0
 
     @pytest.mark.asyncio
+    async def test_device_1800_is_acked_with_chained_token(self):
+        """Device 0x1800 mid-call gets the chained-token empty 0x1800 reply.
+
+        Byte-exact vs the FSM chain (_token_from_peer): device ts bytes
+        [f2 51 6d ff] → our token [72 51 ff 6e] (clear bit7 + byte swap +1).
+        Observed live 2026-11-16: swallowing this frame made the device
+        retransmit ~100ms apart and abort the door open.
+        """
+        import struct
+
+        session = self._make_session()
+
+        sent_data = []
+        DEV_TS = 0xFF6D51F2
+        mock_client = MagicMock()
+        device_frame = struct.pack("<H", 0x1800) + struct.pack("<I", DEV_TS) + struct.pack(">H", 0)
+
+        call_count = 0
+
+        async def mock_read_response(channel):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return device_frame
+            session._active = False
+            raise TimeoutError()
+
+        mock_client.read_response = mock_read_response
+        mock_client.send_binary = AsyncMock(side_effect=lambda ch, data: sent_data.append(data))
+
+        await session._ctpp_monitor_loop(
+            mock_client,
+            MagicMock(),
+            "SB0000061",
+            "SB100001",
+            0x10000000,
+            rtpc1_server_id=0xABCD,
+            media_req_id=0x1234,
+        )
+
+        assert len(sent_data) == 1
+        expected = (
+            struct.pack("<H", 0x1800)
+            + bytes([0x72, 0x51, 0xFF, 0x6E])  # _token_from_peer([f2 51 6d ff])
+            + struct.pack(">H", 0)
+            + b"\xff\xff\xff\xff"
+            + b"SB0000061\x00"
+            + b"SB100001\x00\x00"
+        )
+        assert sent_data[0] == expected
+        # The session counter must not be touched by the ack
+        assert session._call_counter == 0
+
+    @pytest.mark.asyncio
+    async def test_device_1820_is_acked_like_1800(self):
+        """The device's 0x1820 variant gets the same chained-token reply."""
+        import struct
+
+        session = self._make_session()
+
+        sent_data = []
+        DEV_TS = 0xFF6D51F2
+        mock_client = MagicMock()
+        device_frame = struct.pack("<H", 0x1820) + struct.pack("<I", DEV_TS) + struct.pack(">H", 0)
+
+        call_count = 0
+
+        async def mock_read_response(channel):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return device_frame
+            session._active = False
+            raise TimeoutError()
+
+        mock_client.read_response = mock_read_response
+        mock_client.send_binary = AsyncMock(side_effect=lambda ch, data: sent_data.append(data))
+
+        await session._ctpp_monitor_loop(
+            mock_client,
+            MagicMock(),
+            "SB0000061",
+            "SB100001",
+            0x10000000,
+            rtpc1_server_id=0xABCD,
+            media_req_id=0x1234,
+        )
+
+        assert len(sent_data) == 1
+        assert struct.unpack_from("<H", sent_data[0], 0)[0] == 0x1800
+        assert struct.unpack_from("<I", sent_data[0], 2)[0] == 0x6EFF5172
+
+    @pytest.mark.asyncio
     async def test_ctpp_call_end_triggers_inline_reestablish(self):
         """0x1840/0x0003 CALL_END should trigger _inline_reestablish, not stop session."""
         import struct
@@ -364,40 +457,6 @@ class TestCtppMonitorLoop:
         assert reestablish_called
 
     @pytest.mark.asyncio
-    async def test_ctpp_device_acks_are_ignored(self):
-        """0x1800 device ACKs should not trigger any response."""
-        import struct
-
-        session = self._make_session()
-
-        sent_data = []
-
-        mock_client = MagicMock()
-        call_count = 0
-
-        async def mock_read_response(channel):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return struct.pack("<H", 0x1800) + struct.pack("<I", 0x12345678) + struct.pack(">H", 0x0000)
-            session._active = False
-            raise TimeoutError()
-
-        mock_client.read_response = mock_read_response
-        mock_client.send_binary = AsyncMock(side_effect=lambda ch, data: sent_data.append(data))
-
-        await session._ctpp_monitor_loop(
-            mock_client,
-            MagicMock(),
-            "SB0000061",
-            "SB100001",
-            0x10000000,
-            rtpc1_server_id=0xABCD,
-            media_req_id=0x1234,
-        )
-
-        assert len(sent_data) == 0  # no response to device ACKs
-
     @pytest.mark.asyncio
     async def test_ctpp_0x1860_message_is_bare_acked(self):
         """0x1860 messages in the monitor loop must be ACKed with transform(device_ts).
