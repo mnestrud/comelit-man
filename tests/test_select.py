@@ -73,6 +73,42 @@ class TestSelectOption:
         coordinator.async_toggle_camera_selection.assert_awaited_once()
 
 
+class TestSelectChoreography:
+    """Idle selections start a session first (the panel answers on cam1)."""
+
+    @pytest.mark.asyncio
+    async def test_idle_select_cam1_starts_video_without_toggle(self):
+        select, coordinator = _make_selector(labels={"cam1": "A", "cam2": "B"}, active_slot="cam1")
+        coordinator.slot_for_label.return_value = "cam1"
+        coordinator.video_session = None
+        coordinator.async_start_video = AsyncMock()
+        await select.async_select_option("A")
+        coordinator.async_start_video.assert_awaited_once_with(auto_timeout=True, by_user=True)
+        coordinator.async_toggle_camera_selection.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_idle_select_cam2_starts_video_then_toggles(self):
+        select, coordinator = _make_selector(labels={"cam1": "A", "cam2": "B"}, active_slot="cam1")
+        coordinator.slot_for_label.return_value = "cam2"
+        coordinator.video_session = None
+        coordinator.async_start_video = AsyncMock()
+        await select.async_select_option("B")
+        coordinator.async_start_video.assert_awaited_once()
+        coordinator.async_toggle_camera_selection.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_active_session_same_slot_is_noop(self):
+        select, coordinator = _make_selector(labels={"cam1": "A", "cam2": "B"}, active_slot="cam1")
+        coordinator.slot_for_label.return_value = "cam1"
+        session = MagicMock()
+        session.active = True
+        coordinator.video_session = session
+        coordinator.async_start_video = AsyncMock()
+        await select.async_select_option("A")
+        coordinator.async_start_video.assert_not_awaited()
+        coordinator.async_toggle_camera_selection.assert_not_awaited()
+
+
 class TestAttributes:
     def test_extra_state_attributes(self):
         select, _ = _make_selector(active_slot="cam1")

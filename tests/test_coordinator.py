@@ -76,6 +76,7 @@ def _make_coordinator(*, with_client: bool = False) -> ComelitLocalCoordinator:
     coordinator._camera_ssrc = None
     coordinator._active_camera_slot = None
     coordinator._camera_slot_mono = None
+    coordinator._camera_expectation = None
     coordinator._last_video_stop_mono = 0.0
     coordinator._auto_restart_timestamps = []
     coordinator._keepalive_task = None
@@ -1916,6 +1917,36 @@ class TestOnVideoSsrc:
         coord._on_video_ssrc(0x11111111)
         assert coord._active_camera_slot == "cam1"
 
+    @pytest.mark.asyncio
+    async def test_expectation_anchors_first_unseen_ssrc(self):
+        """Outbound starts answer on cam1 — the expectation anchors the slot."""
+        coord = _make_ssrc_coordinator()
+        coord._active_camera_slot = "cam2"  # stale display from a previous session
+        coord._camera_expectation = "cam1"
+        coord._on_video_ssrc(0x44444444)
+        assert coord._active_camera_slot == "cam1"
+        assert coord._camera_slots[0x44444444] == "cam1"
+        # Consumed on first use — a later SSRC falls back to the rules.
+        assert coord._camera_expectation is None
+
+    @pytest.mark.asyncio
+    async def test_expectation_advance_anchors_cam2(self):
+        """A toggle made while the previous call is held expects the advance."""
+        coord = _make_ssrc_coordinator()
+        coord._active_camera_slot = "cam1"
+        coord._camera_expectation = "cam2"
+        coord._on_video_ssrc(0x55555555)
+        assert coord._active_camera_slot == "cam2"
+
+    def test_known_ssrc_overrides_expectation(self):
+        coord = _make_ssrc_coordinator()
+        coord._camera_slots[0x11111111] = "cam1"
+        coord._camera_expectation = "cam2"
+        coord._on_video_ssrc(0x11111111)
+        assert coord._active_camera_slot == "cam1"
+        # Consumed even when the map answered first.
+        assert coord._camera_expectation is None
+
     def test_same_ssrc_does_not_fire_state_change(self):
         coord = _make_ssrc_coordinator()
         coord._on_video_ssrc(0x11111111)
@@ -1944,6 +1975,33 @@ class TestOnVideoSsrc:
 
 class TestToggleCameraSelection:
     @pytest.mark.asyncio
+    async def test_toggle_with_active_session_arms_advance(self):
+        """A call made while the previous one is held advances the relay."""
+        coord = _make_ssrc_coordinator()
+        coord._active_camera_slot = "cam1"
+        session = MagicMock()
+        session.active = True
+        coord._video_session = session
+        coord.async_stop_video = AsyncMock()
+        coord.async_start_video = AsyncMock(return_value=None)
+        await coord.async_toggle_camera_selection()
+        coord.async_stop_video.assert_awaited_once()
+        coord.async_start_video.assert_awaited_once_with(auto_timeout=True, by_user=True, force_restart=True)
+        assert coord._camera_expectation == "cam2"
+
+    @pytest.mark.asyncio
+    async def test_toggle_without_session_arms_cam1(self):
+        """From the panel's natural state a fresh call answers on cam1."""
+        coord = _make_ssrc_coordinator()
+        coord._active_camera_slot = "cam1"
+        coord._video_session = None
+        coord.async_start_video = AsyncMock(return_value=None)
+        result = await coord.async_toggle_camera_selection()
+        coord.async_start_video.assert_awaited_once_with(auto_timeout=True, by_user=True, force_restart=True)
+        assert coord._camera_expectation == "cam1"
+        assert result == "cam1"
+
+    @pytest.mark.asyncio
     async def test_toggle_restarts_video_and_returns_slot(self):
         coord = _make_ssrc_coordinator()
         coord.async_start_video = AsyncMock(return_value=None)
@@ -1958,6 +2016,61 @@ class TestToggleCameraSelection:
         coord._config = None
         with pytest.raises(RuntimeError, match="Not configured"):
             await coord.async_toggle_camera_selection()
+
+
+class TestOutboundCameraAnchor:
+    @pytest.mark.asyncio
+    async def test_anchor_arms_cam1_and_corrects_display(self):
+        coord = _make_ssrc_coordinator()
+        coord._active_camera_slot = "cam2"
+        coord._arm_outbound_camera_expectation()
+        assert coord._camera_expectation == "cam1"
+        assert coord._active_camera_slot == "cam1"
+
+    @pytest.mark.asyncio
+    async def test_anchor_keeps_existing_expectation(self):
+        """The toggle path armed an advance — a plain start must not clobber it."""
+        coord = _make_ssrc_coordinator()
+        coord._camera_expectation = "cam2"
+        coord._arm_outbound_camera_expectation()
+        assert coord._camera_expectation == "cam2"
+
+
+class TestCameraIdleRevert:
+    @pytest.fixture(autouse=True)
+    def _no_delay(self, monkeypatch):
+        import custom_components.comelit_man.coordinator as coord_mod
+
+        monkeypatch.setattr(coord_mod, "CAMERA_IDLE_REVERT_DELAY", 0.0)
+
+    @pytest.mark.asyncio
+    async def test_revert_sets_cam1_when_idle(self):
+        coord = _make_ssrc_coordinator()
+        coord._active_camera_slot = "cam2"
+        coord._notify_video_state_change = AsyncMock()
+        await coord._camera_idle_revert()
+        assert coord._active_camera_slot == "cam1"
+        coord._notify_video_state_change.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_revert_skips_when_session_active(self):
+        coord = _make_ssrc_coordinator()
+        coord._active_camera_slot = "cam2"
+        session = MagicMock()
+        session.active = True
+        coord._video_session = session
+        coord._notify_video_state_change = AsyncMock()
+        await coord._camera_idle_revert()
+        assert coord._active_camera_slot == "cam2"
+        coord._notify_video_state_change.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_revert_noop_when_already_cam1(self):
+        coord = _make_ssrc_coordinator()
+        coord._active_camera_slot = "cam1"
+        coord._notify_video_state_change = AsyncMock()
+        await coord._camera_idle_revert()
+        coord._notify_video_state_change.assert_not_awaited()
 
 
 class TestCameraLabels:

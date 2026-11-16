@@ -34,15 +34,15 @@ async def async_setup_entry(
 class ComelitCameraSelector(ComelitEntity, SelectEntity):
     """Select which entrance camera (and door) the panel streams and opens.
 
-    The panel routes its two physical cameras (and the door strike) through
-    a selector relay that advances on every new call — there is no direct
-    "pick camera N" command. Selecting an option therefore restarts the
-    video session at most once: if the requested camera is already active
-    nothing happens, otherwise one toggle advances the relay. Which physical
-    camera is streaming is identified by its RTP SSRC; the user labels the
-    two slots ("urbanización"/"casa") via the options flow, since the relay
-    position — and thus the camera↔door mapping — is not stable across
-    power cuts.
+    Panel routing model (field-observed 2026-11-16): rings route the relay
+    to whichever panel called; fresh outbound calls always answer on cam1
+    (the panel's natural state); only a call made while the previous one is
+    still held advances the relay to the other camera. Selecting an option
+    therefore starts a session if none is running and toggles at most once.
+    Which physical camera is streaming is identified by its RTP SSRC
+    (fresh per call — the origin expectation anchors it); the user labels
+    the two slots ("urbanización"/"casa") via the options flow, since the
+    camera↔door mapping is not stable across power cuts.
     """
 
     _attr_translation_key = "camera_selector"
@@ -72,14 +72,31 @@ class ComelitCameraSelector(ComelitEntity, SelectEntity):
         return self.coordinator.camera_labels().get(slot)
 
     async def async_select_option(self, option: str) -> None:
-        """Switch to the requested camera with at most one selector toggle."""
+        """Reach the requested camera with at most one selector toggle.
+
+        Panel model (field-observed 2026-11-16): from its natural state the
+        panel answers every fresh call on cam1, and only a call made while
+        the previous one is still held advances the relay. So reaching the
+        non-natural camera needs a live session first — start one, and if
+        the panel answered on the requested camera we are done, otherwise
+        one toggle advances the relay.
+        """
         slot = self.coordinator.slot_for_label(option)
         if slot is None:
             _LOGGER.warning("Unknown camera option: %s", option)
             return
-        if self.coordinator.active_camera_slot == slot:
+        session = self.coordinator.video_session
+        if (
+            self.coordinator.active_camera_slot == slot
+            and session is not None
+            and session.active
+        ):
             _LOGGER.debug("Camera %s (%s) already selected", option, slot)
             return
+        if session is None or not session.active:
+            await self.coordinator.async_start_video(auto_timeout=True, by_user=True)
+            if self.coordinator.active_camera_slot == slot:
+                return
         await self.coordinator.async_toggle_camera_selection()
 
     @property

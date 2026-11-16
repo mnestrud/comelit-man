@@ -60,6 +60,10 @@ RELAY_SETTLE_COOLDOWN = 1.5
 # video SSRC after a start/toggle, and how often to poll the active slot.
 CAMERA_SWITCH_TIMEOUT = 12.0
 CAMERA_WAIT_POLL = 0.25
+# The panel's natural state routes camera 1: after its call lease expires
+# (the same ~120 s window that produces missed_call) the relay returns
+# there, so the selector display reverts to cam1 once the panel idles out.
+CAMERA_IDLE_REVERT_DELAY = 120.0
 
 
 def _assign_camera_slot(seen: dict[int, str], active: str | None, ssrc: int) -> str:
@@ -176,8 +180,15 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         # user-facing labels live in entry options.
         self._camera_slots: dict[int, str] = {}  # video ssrc -> slot
         self._camera_ssrc: int | None = None
-        self._active_camera_slot: str | None = None
+        # Panel routing state. cam1 is the panel's natural/default camera:
+        # fresh outbound calls always answer on it, and the relay returns
+        # there when the panel idles out (field-observed 2026-11-16).
+        self._active_camera_slot: str | None = "cam1"
         self._camera_slot_mono: float | None = None  # last slot change (monotonic)
+        # Slot the first video SSRC of the session about to start should be
+        # assigned ("cam1" for outbound starts, the advance for toggles).
+        # Consumed by _on_video_ssrc on the session's first SSRC.
+        self._camera_expectation: str | None = None
         self._last_video_stop_mono: float = 0.0  # hardware settling timestamp
         self._auto_restart_timestamps: list[float] = []  # rate-limit auto-restarts
 
@@ -434,12 +445,23 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         """Track which camera is streaming from the video RTP SSRC.
 
         Called by the active session's RtpReceiver whenever the video SSRC
-        changes (including the first video packet of a session). The panel's
-        selector relay advances on every new call and each of its two cameras
-        encodes with a distinct SSRC, so a new SSRC means the other camera —
-        and the other door — became active.
+        changes (including the first video packet of a session). The panel
+        re-arms its encoder per call, so SSRCs are effectively unique per
+        session and the learned map almost never hits — the slot for a new
+        SSRC comes from the session's origin expectation when armed
+        (outbound starts answer on cam1; a toggle made while the previous
+        call is still held advances the relay), falling back to the
+        alternating guess for inbound rings, whose camera we cannot know
+        in advance (the panel routes the relay to whichever panel called).
         """
-        new_slot = _assign_camera_slot(self._camera_slots, self._active_camera_slot, ssrc)
+        known = self._camera_slots.get(ssrc)
+        if known is not None:
+            new_slot = known
+        elif self._camera_expectation is not None:
+            new_slot = self._camera_expectation
+        else:
+            new_slot = _assign_camera_slot(self._camera_slots, self._active_camera_slot, ssrc)
+        self._camera_expectation = None
         self._camera_ssrc = ssrc
         if new_slot != self._active_camera_slot:
             self._camera_slots[ssrc] = new_slot
@@ -452,21 +474,45 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 "comelit-camera-slot-change",
             )
 
-    async def async_toggle_camera_selection(self) -> str | None:
-        """Advance the entrance panel's camera/door selector relay.
+    def _arm_outbound_camera_expectation(self) -> None:
+        """Arm the first-SSRC expectation for an outbound (non-toggle) start.
 
-        The panel switches between its two physical cameras — routing the
-        door strike accordingly — on every new call. Stopping the current
-        session and starting a fresh one advances the selector; the newly
-        active camera is identified by its RTP SSRC once video flows.
+        The panel answers a fresh call on its natural camera (cam1) — the
+        relay cannot be advanced from idle with a single call. The display
+        is corrected to cam1 immediately so the dropdown matches what the
+        user is about to see.
+        """
+        if self._camera_expectation is None:
+            self._camera_expectation = "cam1"
+        if self._active_camera_slot != "cam1":
+            self._active_camera_slot = "cam1"
+            self._camera_slot_mono = time.monotonic()
+            _LOGGER.info("Camera selector: outbound start — panel answers on cam1 (natural state)")
+
+    async def async_toggle_camera_selection(self) -> str | None:
+        """Advance (or re-anchor) the entrance panel's camera/door routing.
+
+        Panel model (field-observed 2026-11-16): a call made while the
+        previous one is still held advances the selector relay to the other
+        camera — that is how camera switching works. A fresh call from the
+        panel's natural state answers on cam1 (the manual-start case); the
+        relay cannot be advanced from idle with a single call.
 
         Returns the active slot after the toggle ("cam1"/"cam2"), or None
         if the new camera's SSRC hasn't been seen yet.
         """
         if not self._config:
             raise RuntimeError("Not configured")
+        pre = self._active_camera_slot
+        had_session = self._video_session is not None and self._video_session.active
         if self._video_session is not None:
             await self.async_stop_video()
+        if had_session:
+            # Call held live → the panel advances the relay to the other camera.
+            self._camera_expectation = {"cam1": "cam2", "cam2": "cam1"}.get(pre)
+        else:
+            # From the natural state a fresh call answers on cam1.
+            self._camera_expectation = "cam1" if pre in ("cam1", "cam2") else None
         await self.async_start_video(auto_timeout=True, by_user=True, force_restart=True)
         return self._active_camera_slot
 
@@ -679,6 +725,14 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
 
             t0 = time.monotonic()
             _LOGGER.info("Video session starting (CTPP setup)")
+            if not force_restart:
+                # Outbound start (manual button, auto-restart, open_entrance):
+                # the panel answers a fresh call on its natural camera (cam1)
+                # — observed on every manual start. Arm BEFORE session.start():
+                # the readiness gate awaits the first video NAL, so the SSRC
+                # hook fires inside it. The toggle path (force_restart=True)
+                # armed its own advance expectation.
+                self._arm_outbound_camera_expectation()
             session = VideoCallSession(
                 self._client,
                 self._config,
@@ -724,6 +778,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 await self._notify_video_state_change()
                 return session
             except Exception:
+                self._camera_expectation = None
                 await self._ensure_vip_listener()
                 raise
 
@@ -1142,7 +1197,34 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         # start_video will stop VIP again immediately anyway.
         if not self._video_start_lock.locked():
             await self._ensure_vip_listener()
+        # A stale first-SSRC expectation must not leak into the next session.
+        self._camera_expectation = None
+        # Once the panel idles out (~120 s lease, the missed_call window) its
+        # relay returns to cam1 — the selector display follows (fire-and-
+        # forget; the task re-checks that no session is active before touching
+        # the slot, so a toggle started meanwhile is not disturbed).
+        self.config_entry.async_create_background_task(
+            self.hass, self._camera_idle_revert(), "comelit-camera-idle-revert"
+        )
         await self._notify_video_state_change()
+
+    async def _camera_idle_revert(self) -> None:
+        """Revert the selector display to cam1 once the panel idles out.
+
+        The panel's natural state routes camera 1: fresh outbound calls
+        always answer there, and the relay returns to it when the call
+        lease expires (the same window that produces missed_call).
+        """
+        await asyncio.sleep(CAMERA_IDLE_REVERT_DELAY)
+        if self._video_start_lock.locked():
+            return
+        if self._video_session is not None and self._video_session.active:
+            return
+        if self._active_camera_slot != "cam1":
+            self._active_camera_slot = "cam1"
+            self._camera_slot_mono = time.monotonic()
+            _LOGGER.info("Camera selector: panel idle — display reverts to cam1 (natural state)")
+            await self._notify_video_state_change()
 
     @property
     def video_session(self) -> VideoCallSession | None:
