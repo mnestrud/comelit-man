@@ -749,7 +749,7 @@ class TestAsyncOpenDoorOnCtpp:
         session = self._make_session(counter=0x12345678)
         session._client.get_channel = MagicMock(return_value=MagicMock())
 
-        await session.async_open_door_on_ctpp("SB0000034", "SB100001", 1)
+        await session.async_open_door_on_ctpp("SB0000031", "SB100001", 1)
 
         assert session._client.send_binary.await_count == 1
         body = session._client.send_binary.await_args_list[0].args[1]
@@ -764,7 +764,7 @@ class TestAsyncOpenDoorOnCtpp:
             + b"SB100001\x00\x00"
             + struct.pack("<I", 1)
             + b"\xff\xff\xff\xff"
-            + b"SB0000034\x00"
+            + b"SB0000031\x00"
             + b"SB100001\x00\x00"
         )
         assert body == expected
@@ -775,7 +775,7 @@ class TestAsyncOpenDoorOnCtpp:
         session = self._make_session(counter=0x10000000)
         session._client.get_channel = MagicMock(return_value=MagicMock())
 
-        await session.async_open_door_on_ctpp("SB0000034", "SB100001", 1)
+        await session.async_open_door_on_ctpp("SB0000031", "SB100001", 1)
 
         assert session._call_counter == 0x10000000 + _CTR_INCR_BYTE4
 
@@ -785,7 +785,7 @@ class TestAsyncOpenDoorOnCtpp:
         session._client.get_channel = MagicMock(return_value=None)
 
         with pytest.raises(RuntimeError, match="No active video CTPP channel"):
-            await session.async_open_door_on_ctpp("SB0000034", "SB100001", 1)
+            await session.async_open_door_on_ctpp("SB0000031", "SB100001", 1)
 
     @pytest.mark.asyncio
     async def test_raises_when_not_active(self):
@@ -794,7 +794,7 @@ class TestAsyncOpenDoorOnCtpp:
         session._client.get_channel = MagicMock(return_value=MagicMock())
 
         with pytest.raises(RuntimeError, match="No active video CTPP channel"):
-            await session.async_open_door_on_ctpp("SB0000034", "SB100001", 1)
+            await session.async_open_door_on_ctpp("SB0000031", "SB100001", 1)
 
 
 # ---------------------------------------------------------------------------
@@ -2460,7 +2460,7 @@ class TestTeardownMessages:
     a fresh call_init that advances the physical selector relay.
     """
 
-    MK_TAP_OUR = "SB0000034"
+    MK_TAP_OUR = "SB0000031"
     MK_TAP_PEER = "SB100001"
 
     @staticmethod
@@ -2631,7 +2631,7 @@ class TestCallEndFloodGuard:
 
         session._client.read_response = read_response
         await session._ctpp_monitor_loop(
-            session._client, MagicMock(), "SB0000034", "SB100001", 0x10000000,
+            session._client, MagicMock(), "SB0000031", "SB100001", 0x10000000,
             rtpc1_server_id=0xABCD, media_req_id=0x1234,
         )
         session._inline_reestablish.assert_not_awaited()
@@ -2652,7 +2652,7 @@ class TestCallEndFloodGuard:
 
         session._client.read_response = read_response
         await session._ctpp_monitor_loop(
-            session._client, MagicMock(), "SB0000034", "SB100001", 0x10000000,
+            session._client, MagicMock(), "SB0000031", "SB100001", 0x10000000,
             rtpc1_server_id=0xABCD, media_req_id=0x1234,
         )
         # First CALL_END re-establishes; the next three are skipped and the

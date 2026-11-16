@@ -399,12 +399,12 @@ class TestAsyncOpenDoor:
         session.async_open_door_on_ctpp = AsyncMock()
         coord._video_session = session
         coord._config.apt_address = "SB000003"
-        coord._config.apt_subaddress = 4
+        coord._config.apt_subaddress = 1
         coord._config.caller_address = "SB100001"
 
         await coord.async_open_door(door)
 
-        session.async_open_door_on_ctpp.assert_awaited_once_with("SB0000034", "SB100001", 1)
+        session.async_open_door_on_ctpp.assert_awaited_once_with("SB0000031", "SB100001", 1)
 
     @pytest.mark.asyncio
     async def test_uses_open_door_when_no_video_session(self):
