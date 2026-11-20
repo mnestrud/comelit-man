@@ -55,6 +55,20 @@ _CTR_INCR_BYTE4 = 0x00010000  # only byte[4] increments
 _CTR_INCR_BYTE5 = 0x01000000  # only byte[5] increments
 _CTR_INCR_BOTH = 0x01010000  # both byte[4] and byte[5] increment
 
+# Byte[4] of the counter sits at bits 16-23. When it starts at 0xF0 or above
+# the next +0x00010000 increment carries into byte[5]; the panel then stops
+# acknowledging and keeps retransmitting its codec frame until the exchange
+# times out (field log 2026-11-19: "Codec exchange did not reach
+# call-accepted state"). Session start skips that window.
+_COUNTER_WRAP_WINDOW = 0xF0
+
+
+def _skip_counter_wrap(counter: int) -> int:
+    """Return ``counter`` shifted out of the byte-4 wrap window if needed."""
+    if ((counter >> 16) & 0xFF) >= _COUNTER_WRAP_WINDOW:
+        return (counter + _CTR_INCR_BYTE4) & 0xFFFFFFFF
+    return counter
+
 
 def _token_from_peer(peer_token: bytes, add_one: bool = True) -> bytes:
     """Derive our next in-call token from the peer's last token.
@@ -371,7 +385,7 @@ class VideoCallSession:
             # call_ts are generated from int(time.time()) within the same second,
             # they'll be identical. We add 1 to the low byte to force a different
             # session ID while keeping the same counter starting point (high 16 bits).
-            call_ts = (init_ts + 1) & 0xFFFFFFFF
+            call_ts = _skip_counter_wrap((init_ts + 1) & 0xFFFFFFFF)
             call_init = encode_call_init(our_addr, entrance_addr, call_ts)
             await client.send_binary(ctpp, call_init)
 

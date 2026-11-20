@@ -14,7 +14,33 @@ from custom_components.comelit_man.video_call import (
     _CTR_INCR_BYTE4,
     _CTR_INCR_BYTE5,
     VideoCallSession,
+    _skip_counter_wrap,
 )
+
+
+class TestCounterWrapGuard:
+    """Session start must skip the byte-4 wrap window.
+
+    When byte 4 of the counter is at 0xF0 or above, the next +0x00010000
+    increment carries into byte 5. The panel then stops ACKing and keeps
+    retransmitting its codec frame, so the call is never accepted
+    (field log 2026-11-19).
+    """
+
+    def test_leaves_counter_with_headroom_untouched(self):
+        assert _skip_counter_wrap(0x12345678) == 0x12345678
+
+    def test_skips_window_at_boundary(self):
+        assert _skip_counter_wrap(0x12F05678) == 0x12F15678
+
+    def test_skips_window_above_boundary(self):
+        assert _skip_counter_wrap(0x12FF5678) == 0x13005678
+
+    def test_just_below_window_is_untouched(self):
+        assert _skip_counter_wrap(0x12EF5678) == 0x12EF5678
+
+    def test_result_stays_inside_32_bits(self):
+        assert _skip_counter_wrap(0xFFFF0001) == 0x00000001
 
 
 class TestCounterIncrementConstants:
