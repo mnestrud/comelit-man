@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import time
 from datetime import timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Coroutine
 
 import aiohttp
 
@@ -25,10 +26,18 @@ from .auth import authenticate
 from .channels import ChannelType
 from .client import IconaBridgeClient
 from .config_reader import get_device_config
-from .const import CONF_ENABLE_NOTIFICATIONS, DOMAIN
+from .const import (
+    CONF_CAMERA_LABEL_1,
+    CONF_CAMERA_LABEL_2,
+    CONF_ENABLE_NOTIFICATIONS,
+    DEFAULT_CAMERA_LABEL_1,
+    DEFAULT_CAMERA_LABEL_2,
+    DOMAIN,
+)
 from .ctpp import _CTR_INCR_BOTH, ctpp_init_sequence
 from .door import open_door
 from .exceptions import AuthenticationError, DoorOpenError
+from .go2rtc_helper import get_go2rtc
 from .models import DeviceConfig, Door, PushEvent
 from .push import register_push, send_push_keepalive
 from .rtsp_server import LocalRtspServer
@@ -45,6 +54,42 @@ RING_DEDUP_WINDOW = 120.0
 # A device 0x1840/0x0000 (idle) counts as a missed call only when it follows
 # a ring this recently; otherwise it is video-teardown / CTPP-init tail.
 MISSED_CALL_WINDOW = 45.0
+# Hardware settling cooldown between video sessions (seconds).
+RELAY_SETTLE_COOLDOWN = 1.5
+
+# open_entrance choreography: how long to wait for the (new) camera's first
+# video SSRC after a start/toggle, and how often to poll the active slot.
+CAMERA_SWITCH_TIMEOUT = 12.0
+CAMERA_WAIT_POLL = 0.25
+# The panel's natural state routes camera 1: after its call lease expires
+# (the same ~120 s window that produces missed_call) the relay returns
+# there, so the selector display reverts to cam1 once the panel idles out.
+CAMERA_IDLE_REVERT_DELAY = 120.0
+
+
+def _assign_camera_slot(seen: dict[int, str], active: str | None, ssrc: int) -> str:
+    """Map a video SSRC to a camera slot ("cam1"/"cam2").
+
+    Pure function of the learned mapping and the active slot so the policy
+    is easy to unit test. Rules:
+    - Known SSRC keeps its slot (same camera re-selected).
+    - First-ever SSRC takes cam1.
+    - Unseen SSRC takes the slot opposite to the currently active one — the
+      panel alternates cameras on every new call, and after a power cut both
+      SSRCs change, so "the other one than before" is the best available
+      guess for which physical camera is now streaming.
+    """
+    known = seen.get(ssrc)
+    if known is not None:
+        return known
+    if not seen:
+        return "cam1"
+    if active == "cam1":
+        return "cam2"
+    if active == "cam2":
+        return "cam1"
+    used = set(seen.values())
+    return "cam2" if "cam1" in used else "cam1"
 
 
 class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
@@ -79,6 +124,9 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         self._config: DeviceConfig | None = None
         self._video_session: VideoCallSession | None = None
         self._video_stopped_by_user: bool = False
+        # Door-open stop-after-delay task (button entity); re-presses cancel
+        # the previous timer so a later strike never races an earlier teardown.
+        self._pending_stop_video_task: asyncio.Task[None] | None = None
         # Prevents concurrent async_start_video calls from racing each other.
         # The device can only handle one CTPP negotiation at a time; a second
         # concurrent call would conflict and fail ~35s later with a UDPM timeout.
@@ -128,6 +176,25 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         # — without it, picture-entity locks to the transport it picked
         # at first stream_source() call and never upgrades from MJPEG.
         self._on_video_state_change: dict[Callable[[], Awaitable[None]], None] = {}
+        # Camera selector tracking. The entrance panel routes two physical
+        # cameras (and the door strike) through a selector relay that
+        # advances on every new call; each camera encodes RTP with its own
+        # SSRC, so the SSRC identifies which camera — and therefore which
+        # door — is currently active. Slots are "cam1"/"cam2" and the
+        # user-facing labels live in entry options.
+        self._camera_slots: dict[int, str] = {}  # video ssrc -> slot
+        self._camera_ssrc: int | None = None
+        # Panel routing state. cam1 is the panel's natural/default camera:
+        # fresh outbound calls always answer on it, and the relay returns
+        # there when the panel idles out (field-observed 2026-11-16).
+        self._active_camera_slot: str | None = "cam1"
+        self._camera_slot_mono: float | None = None  # last slot change (monotonic)
+        # Slot the first video SSRC of the session about to start should be
+        # assigned ("cam1" for outbound starts, the advance for toggles).
+        # Consumed by _on_video_ssrc on the session's first SSRC.
+        self._camera_expectation: str | None = None
+        self._last_video_stop_mono: float = 0.0  # hardware settling timestamp
+        self._auto_restart_timestamps: list[float] = []  # rate-limit auto-restarts
 
     @property
     def device_config(self) -> DeviceConfig | None:
@@ -344,6 +411,213 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             except Exception:
                 _LOGGER.exception("Error in video state change callback")
 
+    @property
+    def active_camera_slot(self) -> str | None:
+        """Return the currently active camera slot ("cam1"/"cam2"), or None."""
+        return self._active_camera_slot
+
+    @property
+    def camera_ssrc(self) -> int | None:
+        """Return the last video RTP SSRC seen, or None when not streaming."""
+        return self._camera_ssrc
+
+    @property
+    def camera_slot_map(self) -> dict[int, str]:
+        """Return the learned video-SSRC -> camera-slot mapping."""
+        return dict(self._camera_slots)
+
+    @property
+    def camera_slot_changed_at(self) -> float | None:
+        """Return the monotonic time of the last camera-slot change."""
+        return self._camera_slot_mono
+
+    def camera_labels(self) -> dict[str, str]:
+        """Return the user-facing label for each camera slot (from options)."""
+        return {
+            "cam1": self.config_entry.options.get(CONF_CAMERA_LABEL_1) or DEFAULT_CAMERA_LABEL_1,
+            "cam2": self.config_entry.options.get(CONF_CAMERA_LABEL_2) or DEFAULT_CAMERA_LABEL_2,
+        }
+
+    def slot_for_label(self, label: str) -> str | None:
+        """Return the camera slot whose user label matches, or None."""
+        for slot, slot_label in self.camera_labels().items():
+            if slot_label == label:
+                return slot
+        return None
+
+    def _on_video_ssrc(self, ssrc: int) -> None:
+        """Track which camera is streaming from the video RTP SSRC.
+
+        Called by the active session's RtpReceiver whenever the video SSRC
+        changes (including the first video packet of a session). The panel
+        re-arms its encoder per call, so SSRCs are effectively unique per
+        session and the learned map almost never hits — the slot for a new
+        SSRC comes from the session's origin expectation when armed
+        (outbound starts answer on cam1; a toggle made while the previous
+        call is still held advances the relay), falling back to the
+        alternating guess for inbound rings, whose camera we cannot know
+        in advance (the panel routes the relay to whichever panel called).
+        """
+        known = self._camera_slots.get(ssrc)
+        if known is not None:
+            new_slot = known
+        elif self._camera_expectation is not None:
+            new_slot = self._camera_expectation
+        else:
+            new_slot = _assign_camera_slot(self._camera_slots, self._active_camera_slot, ssrc)
+        self._camera_expectation = None
+        self._camera_ssrc = ssrc
+        if new_slot != self._active_camera_slot:
+            self._camera_slots[ssrc] = new_slot
+            self._active_camera_slot = new_slot
+            self._camera_slot_mono = time.monotonic()
+            _LOGGER.info("Camera selector: active camera is now %s (ssrc=0x%08X)", new_slot, ssrc)
+            self.config_entry.async_create_background_task(
+                self.hass,
+                self._notify_video_state_change(),
+                "comelit-camera-slot-change",
+            )
+
+    def _arm_outbound_camera_expectation(self) -> None:
+        """Arm the first-SSRC expectation for an outbound (non-toggle) start.
+
+        The panel answers a fresh call on its natural camera (cam1) — the
+        relay cannot be advanced from idle with a single call. The display
+        is corrected to cam1 immediately so the dropdown matches what the
+        user is about to see.
+        """
+        if self._camera_expectation is None:
+            self._camera_expectation = "cam1"
+        if self._active_camera_slot != "cam1":
+            self._active_camera_slot = "cam1"
+            self._camera_slot_mono = time.monotonic()
+            _LOGGER.info("Camera selector: outbound start — panel answers on cam1 (natural state)")
+
+    async def async_toggle_camera_selection(self) -> str | None:
+        """Advance (or re-anchor) the entrance panel's camera/door routing.
+
+        Panel model (field-observed 2026-11-16): a call made while the
+        previous one is still held advances the selector relay to the other
+        camera — that is how camera switching works. A fresh call from the
+        panel's natural state answers on cam1 (the manual-start case); the
+        relay cannot be advanced from idle with a single call.
+
+        Returns the active slot after the toggle ("cam1"/"cam2"), or None
+        if the new camera's SSRC hasn't been seen yet.
+        """
+        if not self._config:
+            raise RuntimeError("Not configured")
+        pre = self._active_camera_slot
+        had_session = self._video_session is not None and self._video_session.active
+        if self._video_session is not None:
+            await self.async_stop_video()
+        if had_session:
+            # Call held live → the panel advances the relay to the other camera.
+            self._camera_expectation = {"cam1": "cam2", "cam2": "cam1"}.get(pre)
+        else:
+            # From the natural state a fresh call answers on cam1.
+            self._camera_expectation = "cam1" if pre in ("cam1", "cam2") else None
+        await self.async_start_video(auto_timeout=True, by_user=True, force_restart=True)
+        return self._active_camera_slot
+
+    async def _wait_for_active_camera_slot(
+        self,
+        target: str | None = None,
+        timeout: float = CAMERA_SWITCH_TIMEOUT,
+    ) -> str | None:
+        """Wait for the active camera slot to be known (and match target if given).
+
+        The slot is assigned by _on_video_ssrc when the first video packet of
+        the (new) session arrives. With ``target`` set, resolves only when the
+        routed camera matches; returns None on timeout.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            slot = self._active_camera_slot
+            if slot is not None and (target is None or slot == target):
+                return slot
+            await asyncio.sleep(CAMERA_WAIT_POLL)
+        return self._active_camera_slot if target is None else None
+
+    async def async_open_entrance(
+        self, label: str, *, stop_after: bool = False, relay: int | None = None
+    ) -> None:
+        """Open the door routed to the entrance identified by a camera label.
+
+        v2 choreography — make sure the panel's physical selector relay routes
+        the requested camera/door pair before firing the door relay, so "abrir
+        urbanización" can never strike the wrong door:
+
+        1. Resolve ``label`` to a camera slot via the configured labels.
+        2. Ensure a video session is running and its camera is identified.
+        3. While the active slot differs from the target: advance the selector
+           (one stop + force-restart call = one relay click) and wait for the
+           new camera's SSRC. Bounded to 3 advances (two slots + margin) so a
+           misbehaving panel cannot hammer the relay.
+        4. Fire the door relay on the active call (0x1840/0x000D when video is
+           flowing; the standard open path otherwise).
+        5. ``stop_after`` ends the session; by default it stays on (its own
+           120 s timeout applies) so you can keep watching the entrance.
+        """
+        if not self._config or not self._client:
+            raise RuntimeError("Not connected")
+        target = self.slot_for_label(label)
+        if target is None:
+            raise RuntimeError(f"Unknown entrance label: {label!r}")
+
+        session = self._video_session
+        if session is None or not session.active:
+            await self.async_start_video(auto_timeout=True, by_user=True)
+            if await self._wait_for_active_camera_slot(timeout=CAMERA_SWITCH_TIMEOUT) is None:
+                raise RuntimeError(
+                    "Camera did not start streaming — cannot determine the active entrance"
+                )
+
+        for attempt in range(3):
+            if self._active_camera_slot == target:
+                break
+            _LOGGER.info(
+                "open_entrance: advancing selector towards %s (attempt %d, active=%s)",
+                label,
+                attempt + 1,
+                self._active_camera_slot,
+            )
+            await self.async_toggle_camera_selection()
+            if await self._wait_for_active_camera_slot(target=target) is not None:
+                break
+        else:
+            raise RuntimeError(
+                f"Selector did not reach {label!r} — active camera is {self._active_camera_slot}"
+            )
+
+        doors = self._config.doors
+        if not doors:
+            raise RuntimeError("No doors configured on the panel")
+        door = doors[0]
+        if len(doors) > 1:
+            matches = [d for d in doors if label.lower() in (d.name or "").lower()]
+            if matches:
+                door = matches[0]
+            else:
+                _LOGGER.warning(
+                    "open_entrance: %d doors and none named %r — opening the first",
+                    len(doors),
+                    label,
+                )
+        if relay is None:
+            await self.async_open_door(door)
+        else:
+            await self.async_open_door(door, relay=relay)
+        _LOGGER.info(
+            "open_entrance: door relay fired for %r (camera %s, relay=%s)",
+            label,
+            target,
+            relay if relay is not None else door.output_index,
+        )
+
+        if stop_after:
+            await self.async_stop_video()
+
     def _on_push_event(self, event: PushEvent) -> None:
         """Dispatch a push event to all registered callbacks."""
         for cb in list(self._push_callbacks):
@@ -352,33 +626,43 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             except Exception:
                 _LOGGER.exception("Error in push callback")
 
-    async def async_open_door(self, door: Door) -> None:
+    async def async_open_door(self, door: Door, *, relay: int | None = None) -> None:
         """Open a door.
 
-        Three paths depending on what CTPP channel is currently open:
+        Two paths:
 
-        1. Video active — send a single 0x1840/0x000D on the video CTPP channel
-           (PCAP-verified Android app behaviour; no new channel or 6-step sequence).
-        2. VIP listener has CTPP open (notifications ON, no video) — reuse it,
-           fire OPEN_DOOR + CONFIRM directly (~30ms, no init overhead).
-        3. No CTPP open (notifications OFF) — open a transient CTPP channel,
-           run full init, send commands, close channel.
+        1. Video active — a single 0x1840/0x000D on the video CTPP channel
+           with the live session counter (upstream PROTOCOL.md §6, restored
+           verbatim from 2af72a6 for field testing).
+        2. No video — door.open_door(): reuses the VIP listener's CTPP
+           channel when open (fast path) or opens a transient one, and runs
+           the OPEN + CONFIRM → door_init → OPEN + CONFIRM sequence.
+
+        ``relay`` overrides the door's output index in the strike frame
+        (field-test knob for the second entrance's relay).
         """
         if not self._config or not self._client:
             raise RuntimeError("Not connected")
+        if relay is not None:
+            door = dataclasses.replace(door, output_index=relay)
         if self._video_session and self._video_session.active:
             our_addr = f"{self._config.apt_address}{self._config.apt_subaddress}"
             entrance_addr = self._config.caller_address or our_addr
             await self._video_session.async_open_door_on_ctpp(our_addr, entrance_addr, door.output_index)
-        else:
-            try:
-                await open_door(self.host, self.port, self.token, self._client, self._config, door)
-            except DoorOpenError as err:
-                if isinstance(err.__cause__, AuthenticationError):
-                    self.config_entry.async_start_reauth(self.hass)
-                raise
+            return
+        try:
+            await open_door(self.host, self.port, self.token, self._client, self._config, door)
+        except DoorOpenError as err:
+            if isinstance(err.__cause__, AuthenticationError):
+                self.config_entry.async_start_reauth(self.hass)
+            raise
 
-    async def async_start_video(self, auto_timeout: bool = True, by_user: bool = False) -> VideoCallSession:
+    async def async_start_video(
+        self,
+        auto_timeout: bool = True,
+        by_user: bool = False,
+        force_restart: bool = False,
+    ) -> VideoCallSession:
         """Start a video call session.
 
         Concurrent calls are dropped — the device can only negotiate one
@@ -393,6 +677,8 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                      since stopped video (prevents a stale async_create_task
                      from overriding a user stop and causing an infinite
                      go2rtc reconnect loop).
+            force_restart: Force tearing down and recreating an active session
+                           (used by camera selector toggle).
         """
         if not self._config:
             raise RuntimeError("Not configured")
@@ -403,7 +689,17 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 return self._video_session
             raise RuntimeError("Video start already in progress")
 
+        # If video is already streaming and active, do not tear it down and restart.
+        # Starting a second session when one is already flowing causes the physical
+        # entrance panel relay to cycle unnecessarily and desynchronizes video.
+        if not force_restart and self._video_session is not None and self._video_session.active:
+            _LOGGER.info("Video session already active and flowing — skipping duplicate start")
+            return self._video_session
+
         async with self._video_start_lock:
+            if not force_restart and self._video_session is not None and self._video_session.active:
+                return self._video_session
+
             if not self._client:
                 raise RuntimeError("Not connected")
 
@@ -430,6 +726,13 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             self._video_stopped_by_user = False
             await self.async_stop_video()
 
+            # Enforce hardware settling cooldown so the physical relay doesn't get hammered
+            elapsed = time.monotonic() - self._last_video_stop_mono
+            if elapsed < RELAY_SETTLE_COOLDOWN:
+                wait_time = RELAY_SETTLE_COOLDOWN - elapsed
+                _LOGGER.debug("Hardware relay settling cooldown: waiting %.2fs", wait_time)
+                await asyncio.sleep(wait_time)
+
             # Pause the VIP listener task so it doesn't consume CTPP messages
             # meant for the video session. The CTPP channel itself stays open
             # and will be reused by the video session directly (no rename needed).
@@ -441,6 +744,14 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
 
             t0 = time.monotonic()
             _LOGGER.info("Video session starting (CTPP setup)")
+            if not force_restart:
+                # Outbound start (manual button, auto-restart, open_entrance):
+                # the panel answers a fresh call on its natural camera (cam1)
+                # — observed on every manual start. Arm BEFORE session.start():
+                # the readiness gate awaits the first video NAL, so the SSRC
+                # hook fires inside it. The toggle path (force_restart=True)
+                # armed its own advance expectation.
+                self._arm_outbound_camera_expectation()
             session = VideoCallSession(
                 self._client,
                 self._config,
@@ -466,6 +777,13 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 _LOGGER.info("Video session ready in %.1fs", time.monotonic() - t0)
                 if self._rtsp_server and session.rtp_receiver:
                     session.rtp_receiver.attach_backchannel_queue(self._rtsp_server.backchannel_queue)
+                if session.rtp_receiver is not None:
+                    # The readiness gate awaited the first video NAL, so the
+                    # SSRC is already known — seed the slot tracking now and
+                    # keep the hook for mid-session changes.
+                    session.rtp_receiver.on_video_ssrc = self._on_video_ssrc
+                    if session.rtp_receiver.video_ssrc is not None:
+                        self._on_video_ssrc(session.rtp_receiver.video_ssrc)
                 self._video_session = session
                 self._video_ready_event.set()
                 # Unblock PLAY handlers that have been waiting inside the RTSP
@@ -479,6 +797,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 await self._notify_video_state_change()
                 return session
             except Exception:
+                self._camera_expectation = None
                 await self._ensure_vip_listener()
                 raise
 
@@ -505,11 +824,22 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         RuntimeError from that path is caught here to avoid HA logging an
         unhandled task exception for a normal, expected situation.
         """
+        now = time.monotonic()
+        self._auto_restart_timestamps = [t for t in self._auto_restart_timestamps if now - t < 60.0]
+        if len(self._auto_restart_timestamps) >= 3:
+            _LOGGER.warning(
+                "Auto-restart suppressed: 3 restarts occurred within 60s. "
+                "Stopping video session to protect hardware relay."
+            )
+            await self.async_stop_video()
+            return
+
         watchers = self._rtsp_server.client_count if self._rtsp_server else 0
         if watchers == 0:
             _LOGGER.info("Video session ended with no viewers — not restarting")
             await self.async_stop_video()
             return
+        self._auto_restart_timestamps.append(now)
         try:
             await self.async_start_video()
         except RuntimeError as err:
@@ -655,6 +985,10 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
 
             if self._rtsp_server and session.rtp_receiver:
                 session.rtp_receiver.attach_backchannel_queue(self._rtsp_server.backchannel_queue)
+            if session.rtp_receiver is not None:
+                session.rtp_receiver.on_video_ssrc = self._on_video_ssrc
+                if session.rtp_receiver.video_ssrc is not None:
+                    self._on_video_ssrc(session.rtp_receiver.video_ssrc)
             self._video_session = session
             self._video_ready_event.set()
             if self._rtsp_server:
@@ -702,9 +1036,11 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         # source flag is unnecessary with that negotiation in place.
         src = self._rtsp_url
         try:
-            session = async_get_clientsession(self.hass)
+            session, go2rtc_url = get_go2rtc(
+                self.hass, async_get_clientsession(self.hass)
+            )
             async with session.put(
-                "http://127.0.0.1:1984/api/streams",
+                f"{go2rtc_url}/api/streams",
                 params={"name": name, "src": src},
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
@@ -727,9 +1063,11 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         """Remove our stream registration from go2rtc on shutdown."""
         name = f"comelit_man_{self.config_entry.entry_id}"
         with contextlib.suppress(Exception):
-            session = async_get_clientsession(self.hass)
+            session, go2rtc_url = get_go2rtc(
+                self.hass, async_get_clientsession(self.hass)
+            )
             async with session.delete(
-                "http://127.0.0.1:1984/api/streams",
+                f"{go2rtc_url}/api/streams",
                 params={"name": name},
                 timeout=aiohttp.ClientTimeout(total=5),
             ):
@@ -749,6 +1087,25 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
     def request_video_stop(self) -> None:
         """Mark that the user explicitly requested video to stop."""
         self._video_stopped_by_user = True
+
+    def restart_stop_video_delay(
+        self, delay_coro: Coroutine[Any, Any, None]
+    ) -> None:
+        """Arm the door-open stop-after-delay task, cancelling a pending one.
+
+        A repeated door-open press must cancel the earlier press's pending
+        teardown: with several presses in quick succession the first timer
+        used to expire mid-strike of a later press and killed the session
+        0.35 s after its door-open frame (field log 2026-11-17 21:13).
+        """
+        pending = self._pending_stop_video_task
+        if pending is not None and not pending.done():
+            pending.cancel()
+        self._pending_stop_video_task = (
+            self.config_entry.async_create_background_task(
+                self.hass, delay_coro, "comelit-stop-video-delay"
+            )
+        )
 
     def _start_keepalive(self) -> None:
         """Start the background keepalive task (cancels any previous one)."""
@@ -866,6 +1223,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                 _LOGGER.exception("Error in stop-video callback")
 
         await session.stop(reason="user stopped")
+        self._last_video_stop_mono = time.monotonic()
         # Block future PLAYs until the next session is ready, and
         # kick any remaining RTSP clients (e.g. go2rtc) so they
         # reconnect fresh against a stream that already has video.
@@ -877,7 +1235,34 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         # start_video will stop VIP again immediately anyway.
         if not self._video_start_lock.locked():
             await self._ensure_vip_listener()
+        # A stale first-SSRC expectation must not leak into the next session.
+        self._camera_expectation = None
+        # Once the panel idles out (~120 s lease, the missed_call window) its
+        # relay returns to cam1 — the selector display follows (fire-and-
+        # forget; the task re-checks that no session is active before touching
+        # the slot, so a toggle started meanwhile is not disturbed).
+        self.config_entry.async_create_background_task(
+            self.hass, self._camera_idle_revert(), "comelit-camera-idle-revert"
+        )
         await self._notify_video_state_change()
+
+    async def _camera_idle_revert(self) -> None:
+        """Revert the selector display to cam1 once the panel idles out.
+
+        The panel's natural state routes camera 1: fresh outbound calls
+        always answer there, and the relay returns to it when the call
+        lease expires (the same window that produces missed_call).
+        """
+        await asyncio.sleep(CAMERA_IDLE_REVERT_DELAY)
+        if self._video_start_lock.locked():
+            return
+        if self._video_session is not None and self._video_session.active:
+            return
+        if self._active_camera_slot != "cam1":
+            self._active_camera_slot = "cam1"
+            self._camera_slot_mono = time.monotonic()
+            _LOGGER.info("Camera selector: panel idle — display reverts to cam1 (natural state)")
+            await self._notify_video_state_change()
 
     @property
     def video_session(self) -> VideoCallSession | None:

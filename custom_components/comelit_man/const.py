@@ -12,6 +12,15 @@ CONF_CREATE_USER = "create_dedicated_user"
 DEFAULT_PORT = 64100
 DEFAULT_HTTP_PORT = 8080
 
+# User-facing labels for the entrance panel's two cameras. The panel routes
+# two physical cameras (and the door strike) through a selector relay that
+# advances on every new call; which camera shows which door depends on the
+# relay's position, so labels are left to the user to configure.
+CONF_CAMERA_LABEL_1 = "camera_1_label"
+CONF_CAMERA_LABEL_2 = "camera_2_label"
+DEFAULT_CAMERA_LABEL_1 = "Camera 1"
+DEFAULT_CAMERA_LABEL_2 = "Camera 2"
+
 # Increment applied to our CTPP init timestamp to derive registration-renewal
 # ACK timestamps.  PCAP-verified on the 6701W (firmware 2.x).  Community notes
 # for other Comelit models report the same value for the 6742W, and one source

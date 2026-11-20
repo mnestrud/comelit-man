@@ -19,7 +19,6 @@ from custom_components.comelit_man.protocol import (
     HEADER_SIZE,
     MessageType,
     decode_rtp_header,
-    encode_door_open_during_video,
     encode_header,
 )
 
@@ -78,35 +77,8 @@ def _open_channel(client: IconaBridgeClient, name: str = "TEST", ch_id: int = 42
 
 
 # ---------------------------------------------------------------------------
-# protocol.py — encode_door_open_during_video, decode_rtp_header
+# protocol.py — decode_rtp_header
 # ---------------------------------------------------------------------------
-
-
-class TestEncodeDoorDuringVideo:
-    def test_returns_bytes(self):
-        result = encode_door_open_during_video(
-            our_addr="SB000006",
-            entrance_addr="SB100001",
-            call_counter=0x00010101,
-            relay_index=1,
-        )
-        assert isinstance(result, bytes)
-
-    def test_starts_with_1840(self):
-        result = encode_door_open_during_video("SB000006", "SB100001", 0, 1)
-        msg_type = struct.unpack_from("<H", result, 0)[0]
-        assert msg_type == 0x1840
-
-    def test_relay_index_encoded(self):
-        result = encode_door_open_during_video("SB000006", "SB100001", 0, 5)
-        # buf layout: 0x1840(2) + counter(4) + ACTION(2) + 0x002D(2) + entr_b(10) = 20
-        relay = struct.unpack_from("<I", result, 20)[0]
-        assert relay == 5
-
-    def test_addresses_present_in_payload(self):
-        result = encode_door_open_during_video("SB000006", "SB100001", 0, 1)
-        assert b"SB000006" in result
-        assert b"SB100001" in result
 
 
 class TestDecodeRtpHeader:

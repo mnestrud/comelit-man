@@ -28,6 +28,7 @@ from .camera_utils import get_rtsp_url
 from .const import DOMAIN, MANUFACTURER
 from .coordinator import ComelitLocalConfigEntry, ComelitLocalCoordinator
 from .entity import ComelitEntity
+from .go2rtc_helper import get_go2rtc
 from .models import Camera as CameraModel
 from .models import PushEvent
 from .placeholder import PLACEHOLDER_JPEG
@@ -239,10 +240,12 @@ class ComelitIntercomCamera(ComelitEntity, Camera):
         WebRTC candidate" and killed the session (observed live 2026-08-27).
         """
         name = f"comelit_man_{self._entry_id}"
-        session = async_get_clientsession(self.hass)
+        session, go2rtc_url = get_go2rtc(
+            self.hass, async_get_clientsession(self.hass)
+        )
         try:
             ws = await session.ws_connect(
-                f"http://127.0.0.1:1984/api/ws?src={name}",
+                f"{go2rtc_url}/api/ws?src={name}",
                 timeout=aiohttp.ClientWSTimeout(ws_close=5.0),
             )
         except Exception as err:

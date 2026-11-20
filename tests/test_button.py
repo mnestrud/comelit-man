@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -11,6 +12,7 @@ from custom_components.comelit_man.button import (
     ComelitDoorButton,
     ComelitStartVideoButton,
     ComelitStopVideoButton,
+    ComelitSwitchCameraButton,
 )
 from custom_components.comelit_man.models import Door
 
@@ -90,7 +92,7 @@ class TestComelitDoorButton:
 
         await btn.async_press()
 
-        btn.coordinator.config_entry.async_create_background_task.assert_not_called()
+        btn.coordinator.restart_stop_video_delay.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_press_schedules_delayed_stop_when_session_active(self):
@@ -103,10 +105,10 @@ class TestComelitDoorButton:
         # Capture and close the coroutine so it doesn't leak
         created_coros = []
 
-        def capture_task(hass, coro, name):
+        def capture_delay(coro):
             created_coros.append(coro)
 
-        btn.coordinator.config_entry.async_create_background_task = capture_task
+        btn.coordinator.restart_stop_video_delay = MagicMock(side_effect=capture_delay)
 
         await btn.async_press()
 
@@ -152,7 +154,7 @@ class TestComelitDoorButton:
         btn.coordinator.video_session = session
 
         # Silence the scheduled background task
-        btn.coordinator.config_entry.async_create_background_task = lambda hass, coro, name: coro.close()
+        btn.coordinator.restart_stop_video_delay = MagicMock()
 
         btn.coordinator.request_video_stop = MagicMock()
 
@@ -170,6 +172,41 @@ class TestComelitDoorButton:
             await btn._stop_video_after_delay(10)
 
         btn.coordinator.async_stop_video.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_repeat_press_cancels_pending_stop_timer(self):
+        """Re-pressing the door button cancels the earlier press's timer.
+
+        With the old arm-only logic, press #1's 10 s timer expired 0.35 s
+        after press #3 and tore the session down mid-strike (field log
+        2026-11-17 21:13: the third press's door-open never fired the relay).
+        """
+        from custom_components.comelit_man.coordinator import ComelitLocalCoordinator
+
+        fake = MagicMock()
+        fake.hass = MagicMock()
+        fake.config_entry = MagicMock()
+        created = []
+
+        def fake_create(hass, coro, name):
+            created.append(coro)
+            return MagicMock(done=MagicMock(return_value=False))
+
+        fake.config_entry.async_create_background_task = fake_create
+
+        coro1 = asyncio.sleep(0)  # placeholder coroutines
+        ComelitLocalCoordinator.restart_stop_video_delay(fake, coro1)
+        task1 = fake._pending_stop_video_task
+
+        coro2 = asyncio.sleep(0)
+        ComelitLocalCoordinator.restart_stop_video_delay(fake, coro2)
+
+        task1.cancel.assert_called_once()
+        assert fake._pending_stop_video_task is not task1
+
+        coro1.close()
+        coro2.close()
+        fake._pending_stop_video_task.close()
 
 
 # ---------------------------------------------------------------------------
@@ -250,12 +287,13 @@ class TestButtonSetupEntry:
         entry.entry_id = "entry_abc"
         added: list = []
         await async_setup_entry(MagicMock(), entry, lambda ents: added.extend(ents))
-        # 1 door button + start video + stop video + answer doorbell = 4
-        assert len(added) == 4
+        # 1 door button + start video + stop video + answer doorbell + switch camera = 5
+        assert len(added) == 5
         assert isinstance(added[0], ComelitDoorButton)
         assert isinstance(added[1], ComelitStartVideoButton)
         assert isinstance(added[2], ComelitStopVideoButton)
         assert isinstance(added[3], ComelitAnswerDoorbellButton)
+        assert isinstance(added[4], ComelitSwitchCameraButton)
 
     @pytest.mark.asyncio
     async def test_setup_entry_no_config_adds_nothing(self):
@@ -309,3 +347,27 @@ class TestComelitAnswerDoorbellButton:
         btn = _make_answer_button()
         btn.coordinator.async_answer_inbound = AsyncMock(side_effect=RuntimeError("no session"))
         await btn.async_press()  # must not raise
+
+
+def _make_switch_button() -> ComelitSwitchCameraButton:
+    """Create a ComelitSwitchCameraButton with a mocked coordinator."""
+    coordinator = MagicMock()
+    coordinator.async_toggle_camera_selection = AsyncMock(return_value="cam2")
+
+    btn = ComelitSwitchCameraButton.__new__(ComelitSwitchCameraButton)
+    btn.coordinator = coordinator
+    return btn
+
+
+class TestComelitSwitchCameraButton:
+    @pytest.mark.asyncio
+    async def test_press_toggles_selector(self):
+        btn = _make_switch_button()
+        await btn.async_press()
+        btn.coordinator.async_toggle_camera_selection.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_press_does_not_raise_on_exception(self):
+        btn = _make_switch_button()
+        btn.coordinator.async_toggle_camera_selection = AsyncMock(side_effect=RuntimeError("boom"))
+        await btn.async_press()  # must not propagate

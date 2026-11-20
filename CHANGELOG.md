@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.6.0
+
+### New features
+
+- **Camera/door selector** — multi-door/multi-camera panels: `select.comelit_*_camera_selector` routes the entrance's camera/relay to the other door mid-session (SSRC-tracked; relay-protected with settle cooldown and anti-cycle guards) plus a `switch_camera` button
+- **`open_entrance` service** — choreographs "route the camera to the chosen entrance, then fire its relay" in one call; the intercom card gets quick-open chips (`open_options`) driving it
+- **WebRTC via HA-managed go2rtc** — signaling goes through HA's authenticated unix-socket go2rtc session where available, with legacy TCP fallback
+- **Protocol-compliant call teardown** — RELEASE + stop-media on session stop; CALL_END re-establish guards stop the relay-clicking loop after camera switches
+
+### Bug fixes
+
+- **Camera selector reflects the panel's real routing** — rings route the relay to the caller's panel, fresh outbound calls always answer on cam1 (the panel's natural state), and only a call made while the previous one is held advances the relay. The selector now anchors cam1 on manual starts, toggles only from a held session, and reverts its display to cam1 after the panel idles out (~120 s) instead of showing a stale slot
+- **Door strike during an active video call now works** — sends the app's in-call `0x1840/0x000D` door-open with the live session counter, and the CTPP monitor now ACKs the device's `0x1800/0x1820` frames with the chained token instead of swallowing them (the device retransmits and aborts otherwise). Verified on a 6701W: relay fires on every press
+- **open_entrance service handler binding** — `hass` is bound via `functools.partial` so the service registers correctly
+
 ## 1.5.1
 
 ### Bug fixes

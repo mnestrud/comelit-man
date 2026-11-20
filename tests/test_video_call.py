@@ -14,7 +14,33 @@ from custom_components.comelit_man.video_call import (
     _CTR_INCR_BYTE4,
     _CTR_INCR_BYTE5,
     VideoCallSession,
+    _skip_counter_wrap,
 )
+
+
+class TestCounterWrapGuard:
+    """Session start must skip the byte-4 wrap window.
+
+    When byte 4 of the counter is at 0xF0 or above, the next +0x00010000
+    increment carries into byte 5. The panel then stops ACKing and keeps
+    retransmitting its codec frame, so the call is never accepted
+    (field log 2026-11-19).
+    """
+
+    def test_leaves_counter_with_headroom_untouched(self):
+        assert _skip_counter_wrap(0x12345678) == 0x12345678
+
+    def test_skips_window_at_boundary(self):
+        assert _skip_counter_wrap(0x12F05678) == 0x12F15678
+
+    def test_skips_window_above_boundary(self):
+        assert _skip_counter_wrap(0x12FF5678) == 0x13005678
+
+    def test_just_below_window_is_untouched(self):
+        assert _skip_counter_wrap(0x12EF5678) == 0x12EF5678
+
+    def test_result_stays_inside_32_bits(self):
+        assert _skip_counter_wrap(0xFFFF0001) == 0x00000001
 
 
 class TestCounterIncrementConstants:
@@ -226,6 +252,99 @@ class TestCtppMonitorLoop:
         assert session._call_counter == 0
 
     @pytest.mark.asyncio
+    async def test_device_1800_is_acked_with_chained_token(self):
+        """Device 0x1800 mid-call gets the chained-token empty 0x1800 reply.
+
+        Byte-exact vs the FSM chain (_token_from_peer): device ts bytes
+        [f2 51 6d ff] → our token [72 51 ff 6e] (clear bit7 + byte swap +1).
+        Observed live 2026-11-16: swallowing this frame made the device
+        retransmit ~100ms apart and abort the door open.
+        """
+        import struct
+
+        session = self._make_session()
+
+        sent_data = []
+        DEV_TS = 0xFF6D51F2
+        mock_client = MagicMock()
+        device_frame = struct.pack("<H", 0x1800) + struct.pack("<I", DEV_TS) + struct.pack(">H", 0)
+
+        call_count = 0
+
+        async def mock_read_response(channel):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return device_frame
+            session._active = False
+            raise TimeoutError()
+
+        mock_client.read_response = mock_read_response
+        mock_client.send_binary = AsyncMock(side_effect=lambda ch, data: sent_data.append(data))
+
+        await session._ctpp_monitor_loop(
+            mock_client,
+            MagicMock(),
+            "SB0000061",
+            "SB100001",
+            0x10000000,
+            rtpc1_server_id=0xABCD,
+            media_req_id=0x1234,
+        )
+
+        assert len(sent_data) == 1
+        expected = (
+            struct.pack("<H", 0x1800)
+            + bytes([0x72, 0x51, 0xFF, 0x6E])  # _token_from_peer([f2 51 6d ff])
+            + struct.pack(">H", 0)
+            + b"\xff\xff\xff\xff"
+            + b"SB0000061\x00"
+            + b"SB100001\x00\x00"
+        )
+        assert sent_data[0] == expected
+        # The session counter must not be touched by the ack
+        assert session._call_counter == 0
+
+    @pytest.mark.asyncio
+    async def test_device_1820_is_acked_like_1800(self):
+        """The device's 0x1820 variant gets the same chained-token reply."""
+        import struct
+
+        session = self._make_session()
+
+        sent_data = []
+        DEV_TS = 0xFF6D51F2
+        mock_client = MagicMock()
+        device_frame = struct.pack("<H", 0x1820) + struct.pack("<I", DEV_TS) + struct.pack(">H", 0)
+
+        call_count = 0
+
+        async def mock_read_response(channel):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return device_frame
+            session._active = False
+            raise TimeoutError()
+
+        mock_client.read_response = mock_read_response
+        mock_client.send_binary = AsyncMock(side_effect=lambda ch, data: sent_data.append(data))
+
+        await session._ctpp_monitor_loop(
+            mock_client,
+            MagicMock(),
+            "SB0000061",
+            "SB100001",
+            0x10000000,
+            rtpc1_server_id=0xABCD,
+            media_req_id=0x1234,
+        )
+
+        assert len(sent_data) == 1
+        assert struct.unpack_from("<H", sent_data[0], 0)[0] == 0x1800
+        assert struct.unpack_from("<I", sent_data[0], 2)[0] == 0x6EFF5172
+
+    @pytest.mark.asyncio
     async def test_ctpp_call_end_triggers_inline_reestablish(self):
         """0x1840/0x0003 CALL_END should trigger _inline_reestablish, not stop session."""
         import struct
@@ -364,40 +483,6 @@ class TestCtppMonitorLoop:
         assert reestablish_called
 
     @pytest.mark.asyncio
-    async def test_ctpp_device_acks_are_ignored(self):
-        """0x1800 device ACKs should not trigger any response."""
-        import struct
-
-        session = self._make_session()
-
-        sent_data = []
-
-        mock_client = MagicMock()
-        call_count = 0
-
-        async def mock_read_response(channel):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return struct.pack("<H", 0x1800) + struct.pack("<I", 0x12345678) + struct.pack(">H", 0x0000)
-            session._active = False
-            raise TimeoutError()
-
-        mock_client.read_response = mock_read_response
-        mock_client.send_binary = AsyncMock(side_effect=lambda ch, data: sent_data.append(data))
-
-        await session._ctpp_monitor_loop(
-            mock_client,
-            MagicMock(),
-            "SB0000061",
-            "SB100001",
-            0x10000000,
-            rtpc1_server_id=0xABCD,
-            media_req_id=0x1234,
-        )
-
-        assert len(sent_data) == 0  # no response to device ACKs
-
     @pytest.mark.asyncio
     async def test_ctpp_0x1860_message_is_bare_acked(self):
         """0x1860 messages in the monitor loop must be ACKed with transform(device_ts).
@@ -667,17 +752,17 @@ class TestInlineReestablish:
 
 
 # ---------------------------------------------------------------------------
-# Group A — async_open_door_on_ctpp
+# Group A — async_open_door_on_ctpp (upstream in-call door open, 0x1840/0x000D)
 # ---------------------------------------------------------------------------
 
 
 class TestAsyncOpenDoorOnCtpp:
-    """Tests for async_open_door_on_ctpp — door open on the active video CTPP."""
+    """Tests for async_open_door_on_ctpp — single 0x1840/0x000D with the live counter."""
 
-    def _make_session(self) -> VideoCallSession:
+    def _make_session(self, counter=0x526F5817):
         session = VideoCallSession.__new__(VideoCallSession)
         session._active = True
-        session._call_counter = 0x10000000
+        session._call_counter = counter
         session._ctpp_lock = asyncio.Lock()
         mock_client = MagicMock()
         mock_client.send_binary = AsyncMock()
@@ -685,34 +770,57 @@ class TestAsyncOpenDoorOnCtpp:
         return session
 
     @pytest.mark.asyncio
-    async def test_happy_path_sends_door_open(self):
-        """Happy path: sends door-open payload and increments counter."""
-        session = self._make_session()
+    async def test_sends_single_1840_000d_with_live_counter(self):
+        """Byte-exact vs upstream PROTOCOL.md §6: one 0x1840/0x000D, counter +BYTE4 first."""
+        session = self._make_session(counter=0x12345678)
         session._client.get_channel = MagicMock(return_value=MagicMock())
 
-        await session.async_open_door_on_ctpp("SB0000061", "SB100001", 0)
+        await session.async_open_door_on_ctpp("SB0000031", "SB100001", 1)
 
-        session._client.send_binary.assert_called_once()
+        assert session._client.send_binary.await_count == 1
+        body = session._client.send_binary.await_args_list[0].args[1]
+        # Upstream encoder (2af72a6), 48 bytes:
+        #   [0x1840 LE16][counter LE32][000D BE16][002D BE16]
+        #   [entrance 10][relay LE32][FF*4][our 10][entrance 10]
+        expected = (
+            struct.pack("<H", 0x1840)
+            + struct.pack("<I", 0x12355678)  # counter + _CTR_INCR_BYTE4 (0x00010000)
+            + struct.pack(">H", 0x000D)
+            + struct.pack(">H", 0x002D)
+            + b"SB100001\x00\x00"
+            + struct.pack("<I", 1)
+            + b"\xff\xff\xff\xff"
+            + b"SB0000031\x00"
+            + b"SB100001\x00\x00"
+        )
+        assert body == expected
+        assert len(body) == 48
+
+    @pytest.mark.asyncio
+    async def test_counter_advanced_after_send(self):
+        session = self._make_session(counter=0x10000000)
+        session._client.get_channel = MagicMock(return_value=MagicMock())
+
+        await session.async_open_door_on_ctpp("SB0000031", "SB100001", 1)
+
         assert session._call_counter == 0x10000000 + _CTR_INCR_BYTE4
 
     @pytest.mark.asyncio
     async def test_raises_when_ctpp_none(self):
-        """Raises RuntimeError when CTPP channel is not open."""
         session = self._make_session()
         session._client.get_channel = MagicMock(return_value=None)
 
         with pytest.raises(RuntimeError, match="No active video CTPP channel"):
-            await session.async_open_door_on_ctpp("SB0000061", "SB100001", 0)
+            await session.async_open_door_on_ctpp("SB0000031", "SB100001", 1)
 
     @pytest.mark.asyncio
     async def test_raises_when_not_active(self):
-        """Raises RuntimeError when the session is not active."""
         session = self._make_session()
         session._active = False
         session._client.get_channel = MagicMock(return_value=MagicMock())
 
         with pytest.raises(RuntimeError, match="No active video CTPP channel"):
-            await session.async_open_door_on_ctpp("SB0000061", "SB100001", 0)
+            await session.async_open_door_on_ctpp("SB0000031", "SB100001", 1)
 
 
 # ---------------------------------------------------------------------------
@@ -2367,3 +2475,213 @@ class TestInboundMediaRouter:
         rtpc1.response_queue = MagicMock()
         rtpc1.response_queue.get_nowait = MagicMock(side_effect=RuntimeError("boom"))
         await VideoCallSession._tcp_inbound_media_router(MagicMock(), rtpc1, MagicMock(), receiver)
+
+
+class TestTeardownMessages:
+    """Protocol-level call teardown (RELEASE + stop audio/video).
+
+    Byte-verified against test_switch_cam.py end_call() — the sequence the
+    official app sends when ending a call. Without it the device keeps the
+    call orphaned and floods CALL_END, each inline re-establishment running
+    a fresh call_init that advances the physical selector relay.
+    """
+
+    MK_TAP_OUR = "SB0000031"
+    MK_TAP_PEER = "SB100001"
+
+    @staticmethod
+    def _mk_tap_body(opcode: int, token: int, payload: bytes, dst: str, src: str) -> bytes:
+        """Reference implementation of test_switch_cam.py mk_tap() body."""
+        buf = struct.pack("<H", opcode) + struct.pack("<I", token)
+        buf += struct.pack(">H", len(payload) & 0x7FF) + payload
+        buf += b"\x00" * ((4 - len(payload) % 4) % 4)
+        buf += b"\xff\xff\xff\xff"
+        buf += dst.encode().ljust(10, b"\x00")[:10]
+        buf += src.encode().ljust(10, b"\x00")[:10]
+        return bytes(buf)
+
+    def _mk_session(self, *, counter: int = 0x01000000, inbound: bool = False, is_open: bool = True):
+        session = VideoCallSession.__new__(VideoCallSession)
+        session._active = True
+        session._client = MagicMock()
+        ctpp = MagicMock()
+        ctpp.is_open = is_open
+        session._client.get_channel.return_value = ctpp
+        session._client.send_binary = AsyncMock()
+        session._ctpp_lock = asyncio.Lock()
+        session._call_counter = counter
+        session._our_addr = self.MK_TAP_OUR
+        session._peer_addr = self.MK_TAP_PEER
+        session._is_inbound = inbound
+        session._release_sent = False
+        return session
+
+    @pytest.mark.asyncio
+    async def test_sends_release_stop_audio_stop_video(self):
+        from custom_components.comelit_man.protocol import (
+            encode_call_release,
+            encode_stop_media_during_video,
+        )
+
+        session = self._mk_session(counter=0x01000000)
+        await session._send_teardown_messages()
+
+        assert session._client.send_binary.await_count == 3
+        payloads = [c.args[1] for c in session._client.send_binary.await_args_list]
+        expected_counter = 0x01000000
+        for payload in payloads:
+            # Each message consumes a fresh counter (test used _next_token()).
+            expected_counter = (expected_counter + _CTR_INCR_BYTE4) & 0xFFFFFFFF
+            assert struct.unpack_from("<I", payload, 2)[0] == expected_counter
+
+        # RELEASE: exact bytes match the mk_tap reference
+        ref_release = self._mk_tap_body(
+            0x1840, 0x01000000 + _CTR_INCR_BYTE4, b"\x00\x0e\x00", self.MK_TAP_OUR, self.MK_TAP_PEER
+        )
+        assert payloads[0] == ref_release
+        assert encode_call_release(self.MK_TAP_OUR, self.MK_TAP_PEER, 0x01000000 + _CTR_INCR_BYTE4) == ref_release
+
+        # Stop audio: TAP 0x1840 / action 0x0011 subtype 0x98 / ctrl 8009
+        ref_stop_audio = self._mk_tap_body(
+            0x1840,
+            0x01000000 + 2 * _CTR_INCR_BYTE4,
+            b"\x00\x11\x98\x02" + struct.pack("<I", 0) + struct.pack("<H", 8009),
+            self.MK_TAP_OUR,
+            self.MK_TAP_PEER,
+        )
+        assert payloads[1] == ref_stop_audio
+        assert encode_stop_media_during_video(
+            self.MK_TAP_OUR, self.MK_TAP_PEER, 0x01000000 + 2 * _CTR_INCR_BYTE4, video=False
+        ) == ref_stop_audio
+
+        # Stop video: TAP 0x1860 / action 0x0011 subtype 0x94 / ctrl 8010
+        ref_stop_video = self._mk_tap_body(
+            0x1860,
+            0x01000000 + 3 * _CTR_INCR_BYTE4,
+            b"\x00\x11\x94\x02" + struct.pack("<I", 0) + struct.pack("<H", 8010),
+            self.MK_TAP_OUR,
+            self.MK_TAP_PEER,
+        )
+        assert payloads[2] == ref_stop_video
+        assert session._release_sent is True
+
+    @pytest.mark.asyncio
+    async def test_inbound_sessions_do_not_release(self):
+        session = self._mk_session(inbound=True)
+        await session._send_teardown_messages()
+        session._client.send_binary.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_skips_when_never_established(self):
+        session = self._mk_session(counter=0)
+        await session._send_teardown_messages()
+        session._client.send_binary.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_skips_when_channel_closed(self):
+        session = self._mk_session(is_open=False)
+        await session._send_teardown_messages()
+        session._client.send_binary.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_only_sends_once(self):
+        session = self._mk_session()
+        await session._send_teardown_messages()
+        await session._send_teardown_messages()
+        assert session._client.send_binary.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_send_failure_does_not_raise(self):
+        session = self._mk_session()
+        session._client.send_binary = AsyncMock(side_effect=OSError("dead socket"))
+        await session._send_teardown_messages()  # must not raise
+        assert session._release_sent is True
+
+    @pytest.mark.asyncio
+    async def test_cleanup_sends_teardown_before_tasks_cancelled(self):
+        session = self._mk_session()
+        order = []
+        session._client.send_binary = AsyncMock(side_effect=lambda ch, data: order.append("send"))
+        session._timeout_task = None
+        session._tcp_task = None
+        session._ctpp_task = None
+        session._rtp_receiver = None
+        session._rtsp_server = None
+        session._external_rtsp = False
+        session._owns_ctpp = False
+        session._device_rtpc_req_id = 0
+
+        async def fake_stop_rtsp():
+            order.append("cancel")
+
+        with patch.object(type(session), "_send_teardown_messages", autospec=True) as fake:
+            fake.side_effect = lambda self: order.append("teardown") or asyncio.sleep(0)
+            await session._cleanup()
+        assert order[0] == "teardown"
+
+
+class TestCallEndFloodGuard:
+    """CALL_ENDs faster than the ~30 s lease renewal must not re-establish."""
+
+    def _mk_session(self, on_call_end=None):
+        session = VideoCallSession.__new__(VideoCallSession)
+        session._active = True
+        session._client = MagicMock()
+        session._client.read_response = AsyncMock(side_effect=TimeoutError())
+        session._client.send_binary = AsyncMock()
+        session._ctpp_lock = asyncio.Lock()
+        session._call_counter = 0
+        session._on_call_end = on_call_end
+        session._on_timeout = None
+        session._answer_handoff = None
+        return session
+
+    @staticmethod
+    def _call_end_body(sub: int = 0x000E) -> bytes:
+        return struct.pack("<H", 0x1840) + struct.pack("<I", 0x12345678) + struct.pack(">H", 0x0003) + struct.pack(">H", sub)
+
+    @pytest.mark.asyncio
+    async def test_ignores_call_end_after_release(self):
+        session = self._mk_session()
+        session._release_sent = True
+        session._inline_reestablish = AsyncMock(return_value=0x10000000)
+
+        responses = [self._call_end_body(), None]
+
+        async def read_response(channel):
+            r = responses.pop(0) if responses else None
+            if r is None:
+                session._active = False
+                raise TimeoutError()
+            return r
+
+        session._client.read_response = read_response
+        await session._ctpp_monitor_loop(
+            session._client, MagicMock(), "SB0000031", "SB100001", 0x10000000,
+            rtpc1_server_id=0xABCD, media_req_id=0x1234,
+        )
+        session._inline_reestablish.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_flood_ends_session_after_three_skips(self):
+        ended = []
+        session = self._mk_session(on_call_end=lambda: ended.append(1))
+        session._inline_reestablish = AsyncMock(return_value=0x10000000)
+
+        responses = [self._call_end_body() for _ in range(4)]  # 1 renew + 3 skips
+
+        async def read_response(channel):
+            if not responses:
+                session._active = False
+                raise TimeoutError()
+            return responses.pop(0)
+
+        session._client.read_response = read_response
+        await session._ctpp_monitor_loop(
+            session._client, MagicMock(), "SB0000031", "SB100001", 0x10000000,
+            rtpc1_server_id=0xABCD, media_req_id=0x1234,
+        )
+        # First CALL_END re-establishes; the next three are skipped and the
+        # session ends instead of looping (each re-establish = relay click).
+        assert session._inline_reestablish.await_count == 1
+        assert ended == [1]

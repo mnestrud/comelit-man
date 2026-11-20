@@ -12,6 +12,9 @@
       },
       "answer_doorbell": {
         "name": "Answer Doorbell"
+      },
+      "switch_camera": {
+        "name": "Switch Camera/Door"
       }
     },
     "camera": {
@@ -49,6 +52,11 @@
       "ring_count": {
         "name": "Ring count"
       }
+    },
+    "select": {
+      "camera_selector": {
+        "name": "Entrance Camera"
+      }
     }
   },
   "options": {
@@ -56,10 +64,14 @@
       "init": {
         "title": "Comelit Intercom Options",
         "data": {
-          "enable_notifications": "Enable doorbell notifications"
+          "enable_notifications": "Enable doorbell notifications",
+          "camera_1_label": "Label for camera 1",
+          "camera_2_label": "Label for camera 2"
         },
         "data_description": {
-          "enable_notifications": "Receive doorbell ring and missed call events from the intercom"
+          "enable_notifications": "Receive doorbell ring and missed call events from the intercom",
+          "camera_1_label": "Name shown for the first camera slot (e.g. \"Urbanization\"). The panel routes two cameras and two doors through a selector relay that advances on every call, so label these slots to match your installation.",
+          "camera_2_label": "Name shown for the second camera slot (e.g. \"House\"). See camera 1."
         }
       }
     }
@@ -157,6 +169,26 @@
     "auth_failed": {
       "title": "Authentication failed",
       "description": "Comelit Man cannot connect to {name} — the token is invalid or expired. Go to Settings → Integrations → Comelit Man and choose Re-authenticate."
+    }
+  },
+  "services": {
+    "open_entrance": {
+      "name": "Open entrance",
+      "description": "Make sure the entrance panel's camera/door selector routes the requested destination, then fire the door relay.",
+      "fields": {
+        "label": {
+          "name": "Destination",
+          "description": "Camera label identifying the destination (one of the camera selector options)."
+        },
+        "stop_after": {
+          "name": "Stop video after",
+          "description": "End the video session right after the door relay fires."
+        },
+        "config_entry_id": {
+          "name": "Config entry",
+          "description": "Target a specific Comelit entry when several are configured."
+        }
+      }
     }
   }
 }

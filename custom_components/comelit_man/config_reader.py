@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -43,6 +44,11 @@ def _parse_config(data: dict[str, Any]) -> DeviceConfig:
     config.apt_subaddress = vip.get("apt-subaddress", 0)
 
     user_params = vip.get("user-parameters", {})
+    # Full raw dump (DEBUG): the second entrance's address, if the panel
+    # exposes one, lives in one of these books (cam2 door-open investigation).
+    _LOGGER.debug(
+        "Raw user-parameters: %s", json.dumps(user_params, ensure_ascii=False)
+    )
 
     # Parse caller address from entrance-address-book (indoor/app unit address)
     entrance_book = user_params.get("entrance-address-book", [])

@@ -39,6 +39,7 @@ def _make_config() -> DeviceConfig:
 def _make_coordinator(*, with_client: bool = False) -> ComelitLocalCoordinator:
     """Create a coordinator with all HA dependencies mocked out."""
     hass = MagicMock()
+    hass.data = {}  # no HA-managed go2rtc by default → legacy fallback path
     coordinator = ComelitLocalCoordinator.__new__(ComelitLocalCoordinator)
     coordinator.hass = hass
     coordinator.host = "127.0.0.1"
@@ -71,6 +72,13 @@ def _make_coordinator(*, with_client: bool = False) -> ComelitLocalCoordinator:
     coordinator._push_callbacks = {}
     coordinator._on_stop_video = {}
     coordinator._on_video_state_change = {}
+    coordinator._camera_slots = {}
+    coordinator._camera_ssrc = None
+    coordinator._active_camera_slot = None
+    coordinator._camera_slot_mono = None
+    coordinator._camera_expectation = None
+    coordinator._last_video_stop_mono = 0.0
+    coordinator._auto_restart_timestamps = []
     coordinator._keepalive_task = None
     coordinator._connection_lost = False
     coordinator._ctpp_init_ts = 0
@@ -380,23 +388,23 @@ class TestCallbackRegistration:
 
 class TestAsyncOpenDoor:
     @pytest.mark.asyncio
-    async def test_uses_video_session_when_active(self):
-        """async_open_door delegates to video session when one is active."""
+    async def test_video_active_delegates_to_session(self):
+        """With the feed active, door open uses the upstream 0x1840/0x000D in-call path."""
         coord = _make_coordinator(with_client=True)
         door = MagicMock()
-        door.output_index = 0
+        door.output_index = 1
 
         session = MagicMock()
         session.active = True
         session.async_open_door_on_ctpp = AsyncMock()
         coord._video_session = session
-        coord._config.apt_address = "SB000006"
+        coord._config.apt_address = "SB000003"
         coord._config.apt_subaddress = 1
-        coord._config.caller_address = None
+        coord._config.caller_address = "SB100001"
 
         await coord.async_open_door(door)
 
-        session.async_open_door_on_ctpp.assert_awaited_once()
+        session.async_open_door_on_ctpp.assert_awaited_once_with("SB0000031", "SB100001", 1)
 
     @pytest.mark.asyncio
     async def test_uses_open_door_when_no_video_session(self):
@@ -1846,3 +1854,539 @@ class TestCoordinatorRemainingPaths:
 
         with pytest.raises(UpdateFailed, match="without a device configuration"):
             await coord._async_update_data()
+
+
+# ---------------------------------------------------------------------------
+# Camera selector (SSRC tracking + toggle)
+# ---------------------------------------------------------------------------
+
+
+def _make_ssrc_coordinator() -> ComelitLocalCoordinator:
+    """Coordinator preconfigured for camera-slot tracking tests."""
+    coord = _make_coordinator()
+    coord._camera_slots = {}
+    coord._camera_ssrc = None
+    coord._active_camera_slot = None
+    coord._camera_slot_mono = None
+    return coord
+
+
+class TestAssignCameraSlot:
+    def test_first_ssrc_takes_cam1(self):
+        from custom_components.comelit_man.coordinator import _assign_camera_slot
+
+        assert _assign_camera_slot({}, None, 0x11111111) == "cam1"
+
+    def test_known_ssrc_keeps_slot(self):
+        from custom_components.comelit_man.coordinator import _assign_camera_slot
+
+        seen = {0x11111111: "cam2"}
+        assert _assign_camera_slot(seen, "cam2", 0x11111111) == "cam2"
+
+    def test_unseen_ssrc_takes_opposite_of_active(self):
+        from custom_components.comelit_man.coordinator import _assign_camera_slot
+
+        seen = {0x11111111: "cam1"}
+        assert _assign_camera_slot(seen, "cam1", 0x22222222) == "cam2"
+        seen2 = {0x22222222: "cam2"}
+        assert _assign_camera_slot(seen2, "cam2", 0x11111111) == "cam1"
+
+    def test_unseen_ssrc_without_active_uses_unused_slot(self):
+        from custom_components.comelit_man.coordinator import _assign_camera_slot
+
+        seen = {0x11111111: "cam2"}
+        assert _assign_camera_slot(seen, None, 0x33333333) == "cam1"
+
+
+class TestOnVideoSsrc:
+    def test_first_ssrc_sets_cam1_and_fires_task(self):
+        coord = _make_ssrc_coordinator()
+        coord._on_video_ssrc(0x11111111)
+        assert coord._active_camera_slot == "cam1"
+        assert coord._camera_ssrc == 0x11111111
+        assert coord._camera_slots == {0x11111111: "cam1"}
+
+    @pytest.mark.asyncio
+    async def test_alternating_ssrcs_swap_slots(self):
+        coord = _make_ssrc_coordinator()
+        coord._on_video_ssrc(0x11111111)
+        coord._on_video_ssrc(0x22222222)
+        assert coord._active_camera_slot == "cam2"
+        assert coord._camera_slots[0x22222222] == "cam2"
+        # Same SSRC again → the camera is known, no reassignment.
+        coord._on_video_ssrc(0x11111111)
+        assert coord._active_camera_slot == "cam1"
+
+    @pytest.mark.asyncio
+    async def test_expectation_anchors_first_unseen_ssrc(self):
+        """Outbound starts answer on cam1 — the expectation anchors the slot."""
+        coord = _make_ssrc_coordinator()
+        coord._active_camera_slot = "cam2"  # stale display from a previous session
+        coord._camera_expectation = "cam1"
+        coord._on_video_ssrc(0x44444444)
+        assert coord._active_camera_slot == "cam1"
+        assert coord._camera_slots[0x44444444] == "cam1"
+        # Consumed on first use — a later SSRC falls back to the rules.
+        assert coord._camera_expectation is None
+
+    @pytest.mark.asyncio
+    async def test_expectation_advance_anchors_cam2(self):
+        """A toggle made while the previous call is held expects the advance."""
+        coord = _make_ssrc_coordinator()
+        coord._active_camera_slot = "cam1"
+        coord._camera_expectation = "cam2"
+        coord._on_video_ssrc(0x55555555)
+        assert coord._active_camera_slot == "cam2"
+
+    def test_known_ssrc_overrides_expectation(self):
+        coord = _make_ssrc_coordinator()
+        coord._camera_slots[0x11111111] = "cam1"
+        coord._camera_expectation = "cam2"
+        coord._on_video_ssrc(0x11111111)
+        assert coord._active_camera_slot == "cam1"
+        # Consumed even when the map answered first.
+        assert coord._camera_expectation is None
+
+    def test_same_ssrc_does_not_fire_state_change(self):
+        coord = _make_ssrc_coordinator()
+        coord._on_video_ssrc(0x11111111)
+        fired = []
+
+        async def fake_notify():
+            fired.append(True)
+
+        coord._notify_video_state_change = fake_notify
+        coord._on_video_ssrc(0x11111111)  # same SSRC → no change
+        assert not fired
+
+    def test_changed_slot_schedules_state_notification(self):
+        coord = _make_ssrc_coordinator()
+        calls = []
+
+        def fake_task(_hass, coro, name):
+            calls.append(name)
+            coro.close()
+
+        coord.config_entry.async_create_background_task.side_effect = fake_task
+        coord._on_video_state_change = {}
+        coord._on_video_ssrc(0x11111111)
+        assert calls == ["comelit-camera-slot-change"]
+
+
+class TestToggleCameraSelection:
+    @pytest.mark.asyncio
+    async def test_toggle_with_active_session_arms_advance(self):
+        """A call made while the previous one is held advances the relay."""
+        coord = _make_ssrc_coordinator()
+        coord._active_camera_slot = "cam1"
+        session = MagicMock()
+        session.active = True
+        coord._video_session = session
+        coord.async_stop_video = AsyncMock()
+        coord.async_start_video = AsyncMock(return_value=None)
+        await coord.async_toggle_camera_selection()
+        coord.async_stop_video.assert_awaited_once()
+        coord.async_start_video.assert_awaited_once_with(auto_timeout=True, by_user=True, force_restart=True)
+        assert coord._camera_expectation == "cam2"
+
+    @pytest.mark.asyncio
+    async def test_toggle_without_session_arms_cam1(self):
+        """From the panel's natural state a fresh call answers on cam1."""
+        coord = _make_ssrc_coordinator()
+        coord._active_camera_slot = "cam1"
+        coord._video_session = None
+        coord.async_start_video = AsyncMock(return_value=None)
+        result = await coord.async_toggle_camera_selection()
+        coord.async_start_video.assert_awaited_once_with(auto_timeout=True, by_user=True, force_restart=True)
+        assert coord._camera_expectation == "cam1"
+        assert result == "cam1"
+
+    @pytest.mark.asyncio
+    async def test_toggle_restarts_video_and_returns_slot(self):
+        coord = _make_ssrc_coordinator()
+        coord.async_start_video = AsyncMock(return_value=None)
+        coord._active_camera_slot = "cam2"
+        result = await coord.async_toggle_camera_selection()
+        coord.async_start_video.assert_awaited_once_with(auto_timeout=True, by_user=True, force_restart=True)
+        assert result == "cam2"
+
+    @pytest.mark.asyncio
+    async def test_toggle_requires_config(self):
+        coord = _make_ssrc_coordinator()
+        coord._config = None
+        with pytest.raises(RuntimeError, match="Not configured"):
+            await coord.async_toggle_camera_selection()
+
+
+class TestOutboundCameraAnchor:
+    @pytest.mark.asyncio
+    async def test_anchor_arms_cam1_and_corrects_display(self):
+        coord = _make_ssrc_coordinator()
+        coord._active_camera_slot = "cam2"
+        coord._arm_outbound_camera_expectation()
+        assert coord._camera_expectation == "cam1"
+        assert coord._active_camera_slot == "cam1"
+
+    @pytest.mark.asyncio
+    async def test_anchor_keeps_existing_expectation(self):
+        """The toggle path armed an advance — a plain start must not clobber it."""
+        coord = _make_ssrc_coordinator()
+        coord._camera_expectation = "cam2"
+        coord._arm_outbound_camera_expectation()
+        assert coord._camera_expectation == "cam2"
+
+
+class TestCameraIdleRevert:
+    @pytest.fixture(autouse=True)
+    def _no_delay(self, monkeypatch):
+        import custom_components.comelit_man.coordinator as coord_mod
+
+        monkeypatch.setattr(coord_mod, "CAMERA_IDLE_REVERT_DELAY", 0.0)
+
+    @pytest.mark.asyncio
+    async def test_revert_sets_cam1_when_idle(self):
+        coord = _make_ssrc_coordinator()
+        coord._active_camera_slot = "cam2"
+        coord._notify_video_state_change = AsyncMock()
+        await coord._camera_idle_revert()
+        assert coord._active_camera_slot == "cam1"
+        coord._notify_video_state_change.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_revert_skips_when_session_active(self):
+        coord = _make_ssrc_coordinator()
+        coord._active_camera_slot = "cam2"
+        session = MagicMock()
+        session.active = True
+        coord._video_session = session
+        coord._notify_video_state_change = AsyncMock()
+        await coord._camera_idle_revert()
+        assert coord._active_camera_slot == "cam2"
+        coord._notify_video_state_change.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_revert_noop_when_already_cam1(self):
+        coord = _make_ssrc_coordinator()
+        coord._active_camera_slot = "cam1"
+        coord._notify_video_state_change = AsyncMock()
+        await coord._camera_idle_revert()
+        coord._notify_video_state_change.assert_not_awaited()
+
+
+class TestCameraLabels:
+    def test_labels_default(self):
+        coord = _make_ssrc_coordinator()
+        labels = coord.camera_labels()
+        assert labels == {"cam1": "Camera 1", "cam2": "Camera 2"}
+
+    def test_labels_from_options(self):
+        coord = _make_ssrc_coordinator()
+        coord.config_entry.options = {
+            "enable_notifications": True,
+            "camera_1_label": "Urbanización",
+            "camera_2_label": "Casa",
+        }
+        assert coord.camera_labels() == {"cam1": "Urbanización", "cam2": "Casa"}
+        assert coord.slot_for_label("Casa") == "cam2"
+        assert coord.slot_for_label("unknown") is None
+
+
+class TestVideoStartGuards:
+    """Duplicate-start guard + force_restart (camera selector toggle)."""
+
+    @pytest.mark.asyncio
+    async def test_start_video_returns_active_session_without_restart(self):
+        coord = _make_coordinator(with_client=True)
+        coord._video_start_lock = asyncio.Lock()
+        session = MagicMock()
+        session.active = True
+        coord._video_session = session
+        result = await coord.async_start_video()
+        assert result is session
+
+    @pytest.mark.asyncio
+    async def test_start_video_proceeds_when_session_inactive(self):
+        coord = _make_coordinator()
+        coord._video_start_lock = asyncio.Lock()
+        session = MagicMock()
+        session.active = False
+        coord._video_session = session
+        with pytest.raises(RuntimeError, match="Not connected"):
+            await coord.async_start_video()
+
+    @pytest.mark.asyncio
+    async def test_start_video_force_restart_bypasses_active_guard(self):
+        coord = _make_coordinator()
+        coord._video_start_lock = asyncio.Lock()
+        session = MagicMock()
+        session.active = True
+        coord._video_session = session
+        with pytest.raises(RuntimeError, match="Not connected"):
+            await coord.async_start_video(force_restart=True)
+
+    @pytest.mark.asyncio
+    async def test_toggle_stops_active_session_first(self):
+        coord = _make_ssrc_coordinator()
+        session = MagicMock()
+        coord._video_session = session
+        coord.async_stop_video = AsyncMock()
+        coord.async_start_video = AsyncMock()
+        await coord.async_toggle_camera_selection()
+        coord.async_stop_video.assert_awaited_once()
+        coord.async_start_video.assert_awaited_once_with(auto_timeout=True, by_user=True, force_restart=True)
+
+    @pytest.mark.asyncio
+    async def test_stop_video_records_settle_timestamp(self):
+        coord = _make_ssrc_coordinator()
+        session = MagicMock()
+        session.stop = AsyncMock()
+        coord._video_session = session
+        coord._rtsp_server = None
+        coord._pending_inbound_ring = None
+        coord._on_stop_video = {}
+        coord._video_start_lock = asyncio.Lock()
+        coord._ensure_vip_listener = AsyncMock()
+        coord._notify_video_state_change = AsyncMock()
+        await coord.async_stop_video()
+        assert coord._last_video_stop_mono > 0
+
+    @pytest.mark.asyncio
+    async def test_start_video_enforces_settle_cooldown(self):
+        import time as time_mod
+
+        coord = _make_coordinator(with_client=True)
+        coord._video_start_lock = asyncio.Lock()
+        coord._last_video_stop_mono = time_mod.monotonic()  # stopped just now
+        coord._vip_listener = None
+        mock_session = MagicMock()
+        mock_session.start = AsyncMock()
+        with (
+            patch("custom_components.comelit_man.coordinator.VideoCallSession", return_value=mock_session),
+            patch("custom_components.comelit_man.coordinator.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            await coord.async_start_video()
+        mock_sleep.assert_awaited()
+
+
+class TestAutoRestartRateLimit:
+    @pytest.mark.asyncio
+    async def test_rate_limit_stops_after_three_restarts_in_60s(self):
+        import time as time_mod
+
+        coord = _make_coordinator()
+        now = time_mod.monotonic()
+        coord._auto_restart_timestamps = [now - 5, now - 10, now - 20]
+        coord.async_stop_video = AsyncMock()
+        await coord._auto_restart_video()
+        coord.async_stop_video.assert_awaited_once()
+        assert len(coord._auto_restart_timestamps) == 3  # nothing appended
+
+    @pytest.mark.asyncio
+    async def test_restart_appends_timestamp_when_allowed(self):
+        coord = _make_coordinator(with_client=True)
+        coord._rtsp_server = MagicMock()
+        coord._rtsp_server.client_count = 1
+        before = len(coord._auto_restart_timestamps)
+        mock_session = MagicMock()
+        mock_session.start = AsyncMock()
+        with patch("custom_components.comelit_man.coordinator.VideoCallSession", return_value=mock_session):
+            await coord._auto_restart_video()
+        assert len(coord._auto_restart_timestamps) == before + 1
+
+    @pytest.mark.asyncio
+    async def test_old_timestamps_do_not_count(self):
+        import time as time_mod
+
+        coord = _make_coordinator()
+        now = time_mod.monotonic()
+        coord._auto_restart_timestamps = [now - 61, now - 70, now - 80]
+        coord._rtsp_server = MagicMock()
+        coord._rtsp_server.client_count = 0  # no watchers → clean stop path
+        coord.async_stop_video = AsyncMock()
+        await coord._auto_restart_video()
+        coord.async_stop_video.assert_awaited_once()  # from the no-watcher path
+        assert len(coord._auto_restart_timestamps) == 0  # expired ones pruned
+
+
+class TestHaManagedGo2rtc:
+    """get_go2rtc prefers HA's managed instance (unix socket + auth)."""
+
+    @pytest.mark.asyncio
+    async def test_register_uses_ha_managed_session_and_url(self):
+        from custom_components.comelit_man.go2rtc_helper import DATA_GO2RTC
+
+        coord = _make_coordinator()
+        coord._rtsp_url = "rtsp://127.0.0.1:8557/intercom"
+        unix_session = MagicMock()
+        resp = MagicMock()
+        resp.status = 200
+        resp.__aenter__ = AsyncMock(return_value=resp)
+        resp.__aexit__ = AsyncMock(return_value=False)
+        unix_session.put = MagicMock(return_value=resp)
+        unix_session.put.assert_not_called()  # sanity
+        coord.hass.data = {
+            DATA_GO2RTC: MagicMock(session=unix_session, url="http://unix:/tmp/go2rtc.sock:"),
+        }
+
+        with patch(
+            "custom_components.comelit_man.coordinator.async_get_clientsession",
+            return_value=MagicMock(),
+        ):
+            await coord._register_go2rtc_stream()
+
+        unix_session.put.assert_called_once()
+        url = unix_session.put.call_args.args[0]
+        assert url.startswith("http://unix:/tmp/go2rtc.sock:")
+
+    @pytest.mark.asyncio
+    async def test_get_go2rtc_falls_back_without_config(self):
+        from custom_components.comelit_man.go2rtc_helper import LEGACY_API_URL, get_go2rtc
+
+        session = MagicMock()
+        got_session, url = get_go2rtc(MagicMock(data={}), session)
+        assert got_session is session
+        assert url == LEGACY_API_URL
+
+    @pytest.mark.asyncio
+    async def test_get_go2rtc_prefers_managed_config(self):
+        from custom_components.comelit_man.go2rtc_helper import DATA_GO2RTC, get_go2rtc
+
+        managed = MagicMock(session="s1", url="http://unix:/run/g2/")
+        got_session, url = get_go2rtc(MagicMock(data={DATA_GO2RTC: managed}), "fallback")
+        assert got_session == "s1"
+        assert url == "http://unix:/run/g2"
+
+    @pytest.mark.asyncio
+    async def test_get_go2rtc_ignores_config_without_session(self):
+        from custom_components.comelit_man.go2rtc_helper import DATA_GO2RTC, LEGACY_API_URL, get_go2rtc
+
+        got_session, url = get_go2rtc(MagicMock(data={DATA_GO2RTC: MagicMock(session=None)}), "fallback")
+        assert got_session == "fallback"
+        assert url == LEGACY_API_URL
+
+
+class TestOpenEntrance:
+    """v2 open_entrance choreography: route the selector, then fire the door."""
+
+    def _prepare(self, *, slot="cam1", session_active=True, doors=None, labels=True):
+        from custom_components.comelit_man import coordinator as coord_mod
+
+        coord = _make_coordinator(with_client=True)
+        if labels:
+            coord.config_entry.options = {
+                "enable_notifications": True,
+                "camera_1_label": "Urbanización",
+                "camera_2_label": "Casa",
+            }
+        session = MagicMock()
+        session.active = session_active
+        coord._video_session = session
+        coord._active_camera_slot = slot
+        coord._config.doors = doors if doors is not None else [MagicMock()]
+        coord.async_start_video = AsyncMock()
+        coord.async_stop_video = AsyncMock()
+        coord.async_toggle_camera_selection = AsyncMock(
+            side_effect=lambda: coord._active_camera_slot  # unchanged by default
+        )
+        coord.async_open_door = AsyncMock()
+        coord._poll_patch = patch.object(coord_mod, "CAMERA_WAIT_POLL", 0.01)
+        coord._timeout_patch = patch.object(coord_mod, "CAMERA_SWITCH_TIMEOUT", 0.05)
+        coord._poll_patch.start()
+        coord._timeout_patch.start()
+        return coord
+
+    @pytest.mark.asyncio
+    async def test_unknown_label_raises(self):
+        coord = self._prepare()
+        with pytest.raises(RuntimeError, match="Unknown entrance label"):
+            await coord.async_open_entrance("Despensa")
+        coord.async_open_door.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_not_connected_raises(self):
+        coord = self._prepare()
+        coord._client = None
+        with pytest.raises(RuntimeError, match="Not connected"):
+            await coord.async_open_entrance("Urbanización")
+
+    @pytest.mark.asyncio
+    async def test_already_routed_opens_directly(self):
+        coord = self._prepare(slot="cam1")
+        await coord.async_open_entrance("Urbanización")
+        coord.async_start_video.assert_not_awaited()
+        coord.async_toggle_camera_selection.assert_not_awaited()
+        coord.async_open_door.assert_awaited_once_with(coord._config.doors[0])
+
+    @pytest.mark.asyncio
+    async def test_starts_video_when_no_session(self):
+        coord = self._prepare(session_active=False)
+        # Start brings the session up and the first SSRC lands on cam1.
+        coord.async_start_video.side_effect = lambda **kw: setattr(
+            coord, "_active_camera_slot", "cam1"
+        )
+        await coord.async_open_entrance("Urbanización")
+        coord.async_start_video.assert_awaited_once()
+        coord.async_toggle_camera_selection.assert_not_awaited()
+        coord.async_open_door.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_switches_once_when_wrong_camera(self):
+        coord = self._prepare(slot="cam2")
+        coord.async_toggle_camera_selection.side_effect = lambda: setattr(
+            coord, "_active_camera_slot", "cam1"
+        )
+        await coord.async_open_entrance("Urbanización")
+        coord.async_toggle_camera_selection.assert_awaited_once()
+        coord.async_open_door.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_stuck_selector_raises_without_opening(self):
+        coord = self._prepare(slot="cam2")
+        with pytest.raises(RuntimeError, match="did not reach"):
+            await coord.async_open_entrance("Urbanización")
+        coord.async_open_door.assert_not_awaited()
+        assert coord.async_toggle_camera_selection.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_stop_after_ends_session(self):
+        coord = self._prepare(slot="cam2")
+        coord.async_toggle_camera_selection.side_effect = lambda: setattr(
+            coord, "_active_camera_slot", "cam1"
+        )
+        await coord.async_open_entrance("Urbanización", stop_after=True)
+        coord.async_stop_video.assert_awaited_once()
+        coord.async_open_door.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_session_and_no_video_raises(self):
+        coord = self._prepare(session_active=False, slot=None)
+        coord.async_start_video.side_effect = None  # slot stays None
+        with pytest.raises(RuntimeError, match="did not start streaming"):
+            await coord.async_open_entrance("Urbanización")
+        coord.async_open_door.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_doors_raises(self):
+        coord = self._prepare(slot="cam1", doors=[])
+        with pytest.raises(RuntimeError, match="No doors"):
+            await coord.async_open_entrance("Urbanización")
+
+    @pytest.mark.asyncio
+    async def test_matching_door_selected_by_label(self):
+        casa_door = MagicMock()
+        casa_door.name = "Puerta casa"
+        urban_door = MagicMock()
+        urban_door.name = "Portón urbanización"
+        coord = self._prepare(slot="cam1", doors=[urban_door, casa_door])
+        coord.async_toggle_camera_selection.side_effect = lambda: setattr(
+            coord, "_active_camera_slot", "cam2"
+        )
+        await coord.async_open_entrance("Casa")
+        coord.async_open_door.assert_awaited_once_with(casa_door)
+
+    @pytest.mark.asyncio
+    async def test_relay_override_reaches_open_door(self):
+        """An explicit relay override is forwarded to the strike frame."""
+        coord = self._prepare(slot="cam1")
+        await coord.async_open_entrance("Urbanización", relay=2)
+        coord.async_open_door.assert_awaited_once_with(coord._config.doors[0], relay=2)

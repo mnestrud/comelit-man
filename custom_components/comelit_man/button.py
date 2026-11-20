@@ -37,6 +37,7 @@ async def async_setup_entry(
         entities.append(ComelitStartVideoButton(coordinator, entry.entry_id))
         entities.append(ComelitStopVideoButton(coordinator, entry.entry_id))
         entities.append(ComelitAnswerDoorbellButton(coordinator, entry.entry_id))
+        entities.append(ComelitSwitchCameraButton(coordinator, entry.entry_id))
 
     async_add_entities(entities)
 
@@ -76,9 +77,7 @@ class ComelitDoorButton(ComelitEntity, ButtonEntity):
             # prevents _on_video_call_end from auto-restarting if the device
             # ends the call on its own during the delay window.
             self.coordinator.request_video_stop()
-            self.coordinator.config_entry.async_create_background_task(
-                self.hass, self._stop_video_after_delay(10), "comelit-stop-video-delay"
-            )
+            self.coordinator.restart_stop_video_delay(self._stop_video_after_delay(10))
 
     async def _stop_video_after_delay(self, delay: int) -> None:
         """Stop the video session after a delay (seconds).
@@ -118,6 +117,11 @@ class ComelitStartVideoButton(ComelitEntity, ButtonEntity):
         try:
             await self.coordinator.async_start_video(by_user=True)
             _LOGGER.debug("Video ready in %.1fs", time.monotonic() - t0)
+        except RuntimeError as err:
+            if "already in progress" in str(err) or "already active" in str(err):
+                _LOGGER.info("Intercom video start ignored: %s", err)
+                return
+            _LOGGER.exception("Failed to start intercom video after %.1fs", time.monotonic() - t0)
         except Exception:
             _LOGGER.exception("Failed to start intercom video after %.1fs", time.monotonic() - t0)
 
@@ -169,3 +173,42 @@ class ComelitAnswerDoorbellButton(ComelitEntity, ButtonEntity):
             await self.coordinator.async_answer_inbound()
         except Exception:
             _LOGGER.exception("Failed to answer doorbell")
+
+
+class ComelitSwitchCameraButton(ComelitEntity, ButtonEntity):
+    """Button entity to advance the entrance panel's camera/door selector.
+
+    The panel alternates between its two physical cameras (and routes the
+    door strike to the corresponding door) on every new call, so "switching"
+    is a full video-session restart. The `select.comelit_*_camera_selector`
+    entity shows which camera is active and offers the same toggle through
+    a proper stateful control.
+    """
+
+    _attr_translation_key = "switch_camera"
+
+    def __init__(
+        self,
+        coordinator: ComelitLocalCoordinator,
+        entry_id: str,
+    ) -> None:
+        """Initialize the switch camera button entity."""
+        super().__init__(coordinator, entry_id)
+        self._attr_unique_id = f"{entry_id}_switch_camera"
+
+    async def async_press(self) -> None:
+        """Toggle the camera/door selector when pressed."""
+        _LOGGER.info("Switching entrance camera/door (selector toggle)")
+        try:
+            slot = await self.coordinator.async_toggle_camera_selection()
+            if slot is None:
+                _LOGGER.info("Selector toggled — camera identification pending first video frame")
+            else:
+                _LOGGER.info("Selector toggled — active camera is now %s", slot)
+        except RuntimeError as err:
+            if "already in progress" in str(err):
+                _LOGGER.info("Camera switch ignored: %s", err)
+                return
+            _LOGGER.exception("Failed to switch entrance camera/door")
+        except Exception:
+            _LOGGER.exception("Failed to switch entrance camera/door")
