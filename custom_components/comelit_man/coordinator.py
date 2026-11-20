@@ -123,6 +123,9 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         self._config: DeviceConfig | None = None
         self._video_session: VideoCallSession | None = None
         self._video_stopped_by_user: bool = False
+        # Door-open stop-after-delay task (button entity); re-presses cancel
+        # the previous timer so a later strike never races an earlier teardown.
+        self._pending_stop_video_task: asyncio.Task[None] | None = None
         # Prevents concurrent async_start_video calls from racing each other.
         # The device can only handle one CTPP negotiation at a time; a second
         # concurrent call would conflict and fail ~35s later with a UDPM timeout.
@@ -1068,6 +1071,25 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
     def request_video_stop(self) -> None:
         """Mark that the user explicitly requested video to stop."""
         self._video_stopped_by_user = True
+
+    def restart_stop_video_delay(
+        self, delay_coro: Coroutine[Any, Any, None]
+    ) -> None:
+        """Arm the door-open stop-after-delay task, cancelling a pending one.
+
+        A repeated door-open press must cancel the earlier press's pending
+        teardown: with several presses in quick succession the first timer
+        used to expire mid-strike of a later press and killed the session
+        0.35 s after its door-open frame (field log 2026-11-17 21:13).
+        """
+        pending = self._pending_stop_video_task
+        if pending is not None and not pending.done():
+            pending.cancel()
+        self._pending_stop_video_task = (
+            self.config_entry.async_create_background_task(
+                self.hass, delay_coro, "comelit-stop-video-delay"
+            )
+        )
 
     def _start_keepalive(self) -> None:
         """Start the background keepalive task (cancels any previous one)."""
