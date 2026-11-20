@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 import time
 from datetime import timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Coroutine
 
 import aiohttp
 
@@ -538,7 +539,9 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             await asyncio.sleep(CAMERA_WAIT_POLL)
         return self._active_camera_slot if target is None else None
 
-    async def async_open_entrance(self, label: str, *, stop_after: bool = False) -> None:
+    async def async_open_entrance(
+        self, label: str, *, stop_after: bool = False, relay: int | None = None
+    ) -> None:
         """Open the door routed to the entrance identified by a camera label.
 
         v2 choreography — make sure the panel's physical selector relay routes
@@ -601,8 +604,16 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
                     len(doors),
                     label,
                 )
-        await self.async_open_door(door)
-        _LOGGER.info("open_entrance: door relay fired for %r (camera %s)", label, target)
+        if relay is None:
+            await self.async_open_door(door)
+        else:
+            await self.async_open_door(door, relay=relay)
+        _LOGGER.info(
+            "open_entrance: door relay fired for %r (camera %s, relay=%s)",
+            label,
+            target,
+            relay if relay is not None else door.output_index,
+        )
 
         if stop_after:
             await self.async_stop_video()
@@ -615,7 +626,7 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
             except Exception:
                 _LOGGER.exception("Error in push callback")
 
-    async def async_open_door(self, door: Door) -> None:
+    async def async_open_door(self, door: Door, *, relay: int | None = None) -> None:
         """Open a door.
 
         Two paths:
@@ -626,9 +637,14 @@ class ComelitLocalCoordinator(DataUpdateCoordinator[DeviceConfig]):
         2. No video — door.open_door(): reuses the VIP listener's CTPP
            channel when open (fast path) or opens a transient one, and runs
            the OPEN + CONFIRM → door_init → OPEN + CONFIRM sequence.
+
+        ``relay`` overrides the door's output index in the strike frame
+        (field-test knob for the second entrance's relay).
         """
         if not self._config or not self._client:
             raise RuntimeError("Not connected")
+        if relay is not None:
+            door = dataclasses.replace(door, output_index=relay)
         if self._video_session and self._video_session.active:
             our_addr = f"{self._config.apt_address}{self._config.apt_subaddress}"
             entrance_addr = self._config.caller_address or our_addr

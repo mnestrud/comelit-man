@@ -93,6 +93,7 @@ OPEN_ENTRANCE_SCHEMA = vol.Schema(
     {
         vol.Required("label"): cv.string,
         vol.Optional("stop_after", default=False): cv.boolean,
+        vol.Optional("relay"): cv.positive_int,
         vol.Optional("config_entry_id"): cv.string,
     }
 )
@@ -120,7 +121,9 @@ async def _async_handle_open_entrance(hass: HomeAssistant, call: ServiceCall) ->
         raise HomeAssistantError("No loaded Comelit entries found")
     try:
         await targets[0].runtime_data.async_open_entrance(
-            call.data["label"], stop_after=call.data["stop_after"]
+            call.data["label"],
+            stop_after=call.data["stop_after"],
+            relay=call.data.get("relay"),
         )
     except RuntimeError as err:
         raise HomeAssistantError(str(err)) from err

@@ -2383,3 +2383,10 @@ class TestOpenEntrance:
         )
         await coord.async_open_entrance("Casa")
         coord.async_open_door.assert_awaited_once_with(casa_door)
+
+    @pytest.mark.asyncio
+    async def test_relay_override_reaches_open_door(self):
+        """An explicit relay override is forwarded to the strike frame."""
+        coord = self._prepare(slot="cam1")
+        await coord.async_open_entrance("Urbanización", relay=2)
+        coord.async_open_door.assert_awaited_once_with(coord._config.doors[0], relay=2)
